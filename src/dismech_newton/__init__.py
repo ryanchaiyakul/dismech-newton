@@ -1,2 +1,3 @@
-def hello() -> str:
-    return "Hello from dismech-newton!"
+from .solver import DiSMechSolver
+
+__all__ = ["DiSMechSolver"]

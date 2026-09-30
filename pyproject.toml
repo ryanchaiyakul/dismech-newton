@@ -1,20 +1,34 @@
 [project]
 name = "dismech-newton"
 version = "0.1.0"
-description = "DiSMech solver for NVIDIA Newton."
+description = "DiSMech solver in Newton."
 readme = "README.md"
 authors = [
     { name = "ryanchaiyakul", email = "ryanchaiyakul@gmail.com" }
 ]
-requires-python = ">=3.15"
-dependencies = []
+requires-python = ">=3.14"
+dependencies = [
+    "newton~=1.6.0",
+    "scipy>=1.14",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda13x>=14.2.0",
+    "nvmath-python[cu13]>=1.0",
+]
+viewer = [
+    "imgui-bundle>=1.92.900",
+    "pyglet>=2.1.6,<3",
+    "PyOpenGL>=3.1",
+    "pillow>=10",
+]
 
 [build-system]
-requires = ["uv_build>=0.10.0,<0.11.0"]
+requires = ["uv_build>=0.12.20,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.16.9",
-    "ty>=0.0.84",
+    "pytest>=9.1.1",
 ]

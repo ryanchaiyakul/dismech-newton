@@ -19,8 +19,8 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
     <th>Overhand knot</th>
   </tr>
   <tr>
-    <td><img src="docs/admm_plectoneme.webp" alt="Plectoneme" width="100%"></td>
-    <td><img src="docs/admm_knot.webp" alt="Overhand knot" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_plectoneme.webp" alt="Plectoneme" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_knot.webp" alt="Overhand knot" width="100%"></td>
   </tr>
   <tr>
     <td>A cable between two clamps is counter-twisted until it buckles into a plectoneme, held open by self-contact.<br>
@@ -33,8 +33,8 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
     <th>Cantilever</th>
   </tr>
   <tr>
-    <td><img src="docs/admm_flagella.webp" alt="Flagella bundling" width="100%"></td>
-    <td><img src="docs/admm_cantilever.webp" alt="Cantilever" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_flagella.webp" alt="Flagella bundling" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_cantilever.webp" alt="Cantilever" width="100%"></td>
   </tr>
   <tr>
     <td>Ten helical flagella spin in a viscous fluid and bundle, after <a href="https://arxiv.org/abs/2205.10309">Tong et al. (2022)</a>.<br>
@@ -46,7 +46,7 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
     <th colspan="2">Gradient Optimization</th>
   </tr>
   <tr>
-    <td colspan="2"><img src="docs/fit_stiffness.webp" alt="Fitting stiffness and damping by gradient" width="100%"></td>
+    <td colspan="2"><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/fit_stiffness.webp" alt="Fitting stiffness and damping by gradient" width="100%"></td>
   </tr>
   <tr>
     <td colspan="2">L-BFGS fits a cantilever's bending stiffness and damping to an observed motion, with gradients through the solver. Each iteration (green) beside the truth (grey), with its path on the loss landscape.<br>

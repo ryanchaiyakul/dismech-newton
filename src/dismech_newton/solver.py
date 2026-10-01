@@ -1,65 +1,89 @@
-"""Implicit discrete elastic rod solver (Newton-Raphson, direct solve)."""
-
-from collections.abc import Sequence
-from typing import Any
+"""Implicit discrete elastic rods: the theta method (implicit Euler to implicit midpoint), Newton-Raphson, cuDSS."""
 
 import warp as wp
 from newton import Contacts, Control, Model, State
 from newton.solvers import SolverBase
 
-from .builder import NAMESPACE, add_rod, fix_segment, register_custom_attributes
-from .frames import advance_edge_frames, pose_edge_proxies
-from .integrators import ImplicitEuler, IntegratorBase
-from .linear_solvers import get_linear_solver
-from .stencils import STENCILS, Stencil
-from .system import SymmetricCSR, dof_constants, flatten_state
+from .builder import add_rod, fix_segment, register_custom_attributes
+from .frames import (
+    advance_frames_kernel,
+    dof_constants,
+    flatten_state,
+    pose_proxies_kernel,
+)
+from .linear import CudssSolver, SymmetricCSR
+from .triplet import Triplets, linear_energy
+
+
+@wp.func
+def external_force(i: int, mass: wp.array[float], gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3]) -> float:
+    """``m g + particle_f`` on node DOF ``i = 3 * node + k``."""
+    n = i // 3
+    k = i - 3 * n
+    return mass[i] * gravity[0][k] + particle_f[n][k]
 
 
 @wp.kernel
-def _external_force_kernel(
-    mass: wp.array[float], gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3], residual: wp.array[float]
+def _predict_kernel(
+    fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], dt: float,
+    q_pred: wp.array[float], q: wp.array[float],
 ):
-    """``residual -= m g + particle_f``; one thread per node DOF ``i = 3 * node + k`` (none on twist)."""
+    """``q_pred = q0 + dt v0``, the initial guess; fixed DOFs keep their prescribed ``q0``."""
     i = wp.tid()
-    node = i // 3
-    k = i - 3 * node
-    residual[i] = residual[i] - (mass[i] * gravity[0][k] + particle_f[node][k])
-
-
-@wp.kernel
-def _hold_fixed_kernel(fixed: wp.array[wp.int32], q_ref: wp.array[float], q: wp.array[float]):
-    """Pin the fixed DOFs of the initial guess ``q`` to ``q_ref``."""
-    i = wp.tid()
+    q_pred[i] = q0[i] + dt * v0[i]
     if fixed[i] != 0:
-        q[i] = q_ref[i]
+        q[i] = q0[i]
+    else:
+        q[i] = q_pred[i]
 
 
 @wp.kernel
-def _constrain_kernel(
-    fixed: wp.array[wp.int32],
-    # outputs
-    residual: wp.array[float],
-    hess_indptr: wp.array[wp.int32],
-    hess_vals: wp.array[Any],
-):
-    """Dirichlet rows: zero residual, unit diagonal. Stencils never write to fixed rows or
-    columns, so only the diagonal needs setting."""
-    i = wp.tid()
-    if fixed[i] != 0:
-        residual[i] = 0.0
-        hess_vals[hess_indptr[i]] = type(hess_vals[0])(1.0)  # the diagonal leads each row
-
-
-@wp.kernel
-def _zero_fixed_kernel(fixed: wp.array[wp.int32], v: wp.array[float]):
+def _theta_kernel(fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], theta: float, dt: float,
+                  q: wp.array[float], v: wp.array[float]):
+    """From ``q_theta`` (an implicit Euler step ``h = theta dt``): ``q = q0 + (q_theta - q0) / theta`` and
+    ``v = v0 + (q_theta - q0 - h v0) / (theta^2 dt)``; ``theta = 1`` is implicit Euler itself."""
     i = wp.tid()
     if fixed[i] != 0:
         v[i] = 0.0
+        return
+    d = q[i] - q0[i]
+    q[i] = q0[i] + d / theta
+    v[i] = v0[i] + (d - theta * dt * v0[i]) / (theta * theta * dt)
+
+
+@wp.kernel
+def _inertia_kernel(
+    q: wp.array[float],
+    q_pred: wp.array[float],
+    mass: wp.array[float],
+    alpha: float,
+    fixed: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
+    num_node_dofs: int,
+    # outputs
+    residual: wp.array[float],
+    hess_indptr: wp.array[wp.int32],
+    hess_vals: wp.array[wp.float64],
+):
+    """Inertia ``M alpha (q - q_pred)`` minus external force; Dirichlet rows get a zero residual and a unit diagonal."""
+    i = wp.tid()
+    slot = hess_indptr[i]  # the diagonal leads each row
+    if fixed[i] != 0:
+        residual[i] = 0.0
+        hess_vals[slot] = wp.float64(1.0)
+        return
+    r = residual[i]
+    if i < num_node_dofs:
+        r = r - external_force(i, mass, gravity, particle_f)
+    k = mass[i] * alpha
+    residual[i] = r + k * (q[i] - q_pred[i])
+    hess_vals[slot] = hess_vals[slot] + wp.float64(k)
 
 
 @wp.kernel
 def _apply_step_kernel(dx: wp.array[float], q: wp.array[float], track: int, err: wp.array[float]):
-    """``q -= dx`` (``dx`` solves ``K dx = residual``); with ``track``, ``err = max |dx| / (1 + |q|)``."""
+    """``q -= dx``; with ``track``, ``err = max |dx| / (1 + |q|)``."""
     i = wp.tid()
     qi = q[i]
     d = dx[i]
@@ -68,37 +92,46 @@ def _apply_step_kernel(dx: wp.array[float], q: wp.array[float], track: int, err:
         wp.atomic_max(err, 0, wp.abs(d) / (1.0 + wp.abs(qi)))
 
 
+@wp.kernel
+def _stop_kernel(err: wp.array[float], tol: float, block: int, max_iterations: int,
+                 count: wp.array[wp.int32], go: wp.array[wp.int32]):
+    """After ``block`` more iterations: stop once every ``err`` is below ``tol`` or at ``max_iterations``."""
+    n = count[0] + block
+    count[0] = n
+    converged = int(1)
+    for i in range(err.shape[0]):
+        if err[i] >= tol:
+            converged = 0
+    if converged != 0 or n >= max_iterations:
+        go[0] = 0
+
+
 class DiSMechSolver(SolverBase):
     """Implicit discrete elastic rods, solved with Newton-Raphson.
 
-    Each step solves ``inertia(q) + dE/dq(q) - f_ext = 0`` for node positions
-    (``particle_q``) and edge twist angles (``dismech.edge_q``), iterating directly in
-    ``state_out``; ``state_in`` is the start-of-step snapshot. The inertia term comes from the
-    integrator (implicit Euler by default). Damping is strain-rate
-    viscosity, ``sigma += kd * d eps / dt``. External force is ``m * model.gravity[0]`` plus
-    ``state_in.particle_f`` on the nodes (clear it with ``state.clear_forces()``). Contacts and
-    controls are ignored.
+    Each step solves ``M (q - q_n - dt v_n) / dt^2 + dE/dq(q) - f_ext = 0`` for the node positions
+    and edge twist angles, iterating in ``state_out``. More generally it solves that for a step
+    ``theta dt``, which gives ``q_theta = (1 - theta) q_n + theta q_{n+1}`` of the (one-leg) theta method,
+    and extrapolates to ``q_{n+1}``. ``theta = 1`` is implicit Euler (first order, damps every mode);
+    ``theta = 1/2`` is implicit midpoint (second order, symplectic, no numerical damping), and a little
+    above 1/2 damps mostly the stiff, high-frequency modes. External force is ``m * model.gravity`` plus
+    ``state_in.particle_f``. Contacts and controls are ignored (see the ADMM subclass for contact). Fixed DOFs (:func:`fix_segment`)
+    are prescribed by writing ``state_in.dismech.q``. States are flattened on first use
+    (:func:`~dismech_newton.frames.flatten_state`).
 
-    States passed to :meth:`step` are flattened on first use (:func:`~dismech_newton.system.flatten_state`): they gain the flat DOF vectors
-    ``state.dismech.q`` / ``qd`` and ``particle_q``, ``edge_q`` and the velocity arrays become
-    views into them (see :mod:`dismech_newton.system`).
+    Subclasses replace :meth:`_build_system` and :meth:`_solve` (see
+    :class:`~dismech_newton.admm.ADMMDiSMechSolver`).
 
     Args:
-        model: Model built with :meth:`add_rod`.
-        integrator: Time integrator (:mod:`dismech_newton.integrators`); defaults to
-            :class:`~dismech_newton.integrators.ImplicitEuler`.
-        stencils: Elastic stencils (:mod:`dismech_newton.stencils`), instances of concrete
-            stencil classes (which fix the energy); defaults to one of every defined class the
-            model has rows of. Every class with rows in the model must be covered.
+        model: Model built with :meth:`add_rod`; must be on a CUDA device.
+        energy: Triplet energy (see :mod:`dismech_newton.triplet`).
         newton_iterations: Maximum Newton-Raphson iterations per step.
-        newton_tol: Stop when ``max |dq| / (1 + |q|) < newton_tol`` (absolute for small
-            coordinates, relative for large ones, which keeps it reachable in float32);
-            ``0`` always runs ``newton_iterations`` without host syncs (graph-capturable).
-        hessian_dtype: ``wp.float64`` (default) or ``wp.float32`` for the Hessian values and
-            the linear solve. Float32 halves the Hessian and the cuDSS factor and drops the
-            conversion buffers; the assembly is float32 regardless.
-        pose_proxies: Pose the capsule proxies (``state.body_q``) at the end of every step. Turn
-            it off when nothing draws them and call :meth:`update_proxies` when needed.
+        newton_tol: Stop when ``max |dq| / (1 + |q|) < newton_tol``; ``0`` always runs
+            ``newton_iterations``. The test runs on the device (``wp.capture_while``).
+        pose_proxies: Pose the capsule proxies (and set their velocities) at the end of every step;
+            otherwise call :meth:`update_proxies` when needed.
+        theta: Where in the step the forces are evaluated, in ``[1/2, 1]``: ``1`` implicit Euler,
+            ``1/2`` implicit midpoint.
     """
 
     register_custom_attributes = staticmethod(register_custom_attributes)
@@ -109,126 +142,131 @@ class DiSMechSolver(SolverBase):
         self,
         model: Model,
         *,
-        integrator: IntegratorBase | None = None,
-        stencils: Sequence[Stencil] | None = None,
+        energy=linear_energy,
         newton_iterations: int = 20,
         newton_tol: float = 1.0e-6,
-        hessian_dtype=wp.float64,
         pose_proxies: bool = True,
+        theta: float = 1.0,
     ):
         super().__init__(model)
-        self.integrator = integrator if integrator is not None else ImplicitEuler()
-        present = [cls for cls in STENCILS.values() if cls.rows(model) > 0]
-        if stencils is None:
-            self.stencils = [cls() for cls in present]
-        else:
-            self.stencils = list(stencils)
-            missing = {cls.name for cls in present} - {s.name for s in self.stencils}
-            if missing:
-                raise ValueError(f"model has stencils {sorted(missing)} that `stencils` does not cover")
+        if not 0.5 <= theta <= 1.0:
+            raise ValueError(f"theta must be in [1/2, 1], got {theta}")
+        self.theta = float(theta)
+        if not wp.get_device(model.device).is_cuda:
+            raise ValueError(f"{type(self).__name__} runs on CUDA")
         self.newton_iterations = newton_iterations
         self.newton_tol = newton_tol
         self.pose_proxies = pose_proxies
-        self.last_iterations = 0
+        self._count = wp.zeros(1, dtype=wp.int32, device=self.device)  # iterations of the last step
+        self._go = wp.zeros(1, dtype=wp.int32, device=self.device)  # loop condition
 
-        self.der = getattr(model, NAMESPACE)
-        dev = self.device
-        # Per-DOF constants of the flat vector (see :mod:`dismech_newton.system`).
+        self.der = model.dismech
         self.mass, self.fixed = dof_constants(model)
         self.num_dofs = self.mass.shape[0]
         self.num_node_dofs = 3 * model.particle_count
-        self._no_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=dev)  # for states without particle_f
-
-        # Stencils measure their rest strains here: the initial configuration is unstressed.
-        for stencil in self.stencils:
-            stencil.bind(model, self.fixed)
-
-        # Newton system: residual and the upper-triangle CSR Hessian (fixed pattern).
-        self.hessian = SymmetricCSR(self.num_dofs, [s.dofs() for s in self.stencils], dev, hessian_dtype)
-        self.residual = wp.zeros(self.num_dofs, dtype=float, device=dev)
-        self.dx = wp.zeros(self.num_dofs, dtype=float, device=dev)
-        self._err = wp.zeros(1, dtype=float, device=dev)
+        self.triplets = Triplets(model, self.fixed, energy)
+        self.q_pred = wp.zeros(self.num_dofs, dtype=float, device=self.device)
+        self.alpha = 0.0  # inertia weight 1 / dt^2
+        self._no_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self._no_velocity = wp.zeros(0, dtype=wp.spatial_vector, device=self.device)
         self._has_proxies = bool((self.der.edge_body.numpy() >= 0).any())
-        self._linear = get_linear_solver(self.hessian, dev)
-        self.integrator.bind(self.mass)
+        self._build_system()
 
-    def step(
-        self,
-        state_in: State,
-        state_out: State,
-        control: Control | None,
-        contacts: Contacts | None,
-        dt: float,
-    ) -> None:
+    def _build_system(self) -> None:
+        """Residual, upper-triangle CSR Hessian and its solver."""
+        self.hessian = SymmetricCSR(self.num_dofs, self.triplets.dofs(), self.device)
+        self.residual = wp.zeros(self.num_dofs, dtype=float, device=self.device)
+        self.dx = wp.zeros(self.num_dofs, dtype=float, device=self.device)
+        self._err = wp.zeros(1, dtype=float, device=self.device)
+        self._linear = CudssSolver(self.hessian)
+
+    def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
         dt = float(dt)
         flatten_state(state_in)
         flatten_state(state_out)
-        self._begin_step(state_in, state_out, dt)
-        self._newton_solve(state_in, state_out, dt)
-        self._end_step(state_in, state_out, dt)
-
-    def _begin_step(self, state_in: State, state_out: State, dt: float) -> None:
-        """Start-of-step strains and the Newton initial guess (in ``state_out``)."""
-        # Start-of-step strains, for rate-dependent energies.
-        for stencil in self.stencils:
-            stencil.begin_step(state_in)
         q_in, q = state_in.dismech.q, state_out.dismech.q
-        self.integrator.begin_step(q_in, state_in.dismech.qd, dt, q)
-        wp.launch(_hold_fixed_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in], outputs=[q], device=self.device)
+        h = self.theta * dt  # the implicit Euler step solved
+        self.alpha = 1.0 / (h * h)
+        self.triplets.begin_step(state_in)
+        wp.launch(_predict_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, h],
+                  outputs=[self.q_pred, q], device=self.device)
 
-    def _newton_solve(self, state_in: State, state_out: State, dt: float) -> None:
-        q = state_out.dismech.q
-        track = int(self.newton_tol > 0.0)
-        self.last_iterations = self.newton_iterations
-        for it in range(self.newton_iterations):
-            self._assemble(state_in, state_out, dt)
-            self._linear.solve(self.residual, self.dx)
-            self._err.zero_()
-            wp.launch(
-                _apply_step_kernel,
-                dim=self.num_dofs,
-                inputs=[self.dx, q, track, self._err],
-                device=self.device,
-            )
-            if track and float(self._err.numpy()[0]) < self.newton_tol:  # a 4-byte read
-                self.last_iterations = it + 1
-                break
+        self._solve(state_in, state_out, contacts, h)
 
-    def _assemble(self, state_in: State, state_out: State, dt: float) -> None:
-        """Residual and CSR Hessian at ``state_out``: elastic terms, external force, inertia, Dirichlet."""
-        self.residual.zero_()
-        self.hessian.vals.zero_()
-        for stencil in self.stencils:
-            stencil.assemble(state_in, state_out, self.residual, self.hessian, dt)
-        particle_f = state_in.particle_f if state_in.particle_f is not None else self._no_force
+        wp.launch(_theta_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, self.theta, dt],
+                  outputs=[q, state_out.dismech.qd], device=self.device)
         wp.launch(
-            _external_force_kernel,
-            dim=self.num_node_dofs,
-            inputs=[self.mass, self.model.gravity, particle_f],
-            outputs=[self.residual],
+            advance_frames_kernel,
+            dim=self.der.edge_length.shape[0],
+            inputs=[state_in.particle_q, state_out.particle_q, self.der.edge_node0, self.der.edge_node1,
+                    state_in.dismech.edge_d1_q],
+            outputs=[state_out.dismech.edge_d1_q],
             device=self.device,
         )
-        self.integrator.assemble(state_out.dismech.q, self.residual, self.hessian)
-        wp.launch(
-            _constrain_kernel,
-            dim=self.num_dofs,
-            inputs=[self.fixed],
-            outputs=[self.residual, self.hessian.indptr, self.hessian.vals],
-            device=self.device,
-        )
-
-    def _end_step(self, state_in: State, state_out: State, dt: float) -> None:
-        """Velocities, advanced reference frames, and (optionally) the kinematic proxies."""
-        s_out = state_out.dismech
-        self.integrator.end_step(s_out.q, s_out.qd)
-        wp.launch(_zero_fixed_kernel, dim=self.num_dofs, inputs=[self.fixed], outputs=[s_out.qd], device=self.device)
-        advance_edge_frames(self.der, state_in, state_out, self.device)
-        for stencil in self.stencils:
-            stencil.end_step(state_in, state_out)
+        self.triplets.end_step(state_in, state_out)
         if self.pose_proxies:
             self.update_proxies(state_out)
 
+    def _solve(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> None:
+        """Newton-Raphson on ``state_out.dismech.q``, starting from the initial guess."""
+        self._iterate(self._newton_iteration, self.newton_iterations, 1, self.newton_tol, self._err,
+                      state_in=state_in, state_out=state_out, dt=dt)
+
+    def _newton_iteration(self, state_in: State, state_out: State, dt: float) -> None:
+        q = state_out.dismech.q
+        self.residual.zero_()
+        self.hessian.vals.zero_()
+        self.triplets.assemble(state_in, state_out, self.residual, self.hessian, dt)
+        wp.launch(
+            _inertia_kernel,
+            dim=self.num_dofs,
+            inputs=[q, self.q_pred, self.mass, self.alpha, self.fixed, self.model.gravity,
+                    self._particle_f(state_in), self.num_node_dofs],
+            outputs=[self.residual, self.hessian.indptr, self.hessian.vals],
+            device=self.device,
+        )
+        self._linear.solve(self.residual, self.dx)
+        self._err.zero_()
+        wp.launch(_apply_step_kernel, dim=self.num_dofs, inputs=[self.dx, q, int(self.newton_tol > 0.0), self._err],
+                  device=self.device)
+
+    def _iterate(self, block, max_iterations: int, block_size: int, tol: float, err: wp.array, **kwargs) -> None:
+        """Run ``block(**kwargs)`` (``block_size`` iterations) until ``err < tol`` or ``max_iterations``,
+        testing on the device, so the loop can be graph-captured; ``tol = 0`` runs a fixed count."""
+        if tol <= 0.0:
+            for _ in range(-(-max_iterations // block_size)):
+                block(**kwargs)
+            self._count.fill_(max_iterations)
+            return
+
+        def body(**kw):
+            block(**kw)
+            wp.launch(_stop_kernel, dim=1, inputs=[err, tol, block_size, max_iterations],
+                      outputs=[self._count, self._go], device=self.device)
+
+        self._count.zero_()
+        self._go.fill_(1)
+        wp.capture_while(self._go, body, **kwargs)
+
+    @property
+    def last_iterations(self) -> int:
+        """Iterations of the last step (a device read)."""
+        return int(self._count.numpy()[0])
+
+    def _particle_f(self, state: State) -> wp.array:
+        return state.particle_f if state.particle_f is not None else self._no_force
+
     def update_proxies(self, state: State) -> None:
-        """Pose the capsule proxies (``state.body_q``) from ``state``'s rod configuration."""
-        if self._has_proxies and state.body_q is not None:
-            pose_edge_proxies(self.der, state, self.device)
+        """Pose the capsule proxies (``state.body_q``) and set their velocities (``state.body_qd``)."""
+        if not self._has_proxies or state.body_q is None:
+            return
+        body_qd = state.body_qd if state.body_qd is not None else self._no_velocity
+        d = self.der
+        wp.launch(
+            pose_proxies_kernel,
+            dim=d.edge_length.shape[0],
+            inputs=[state.particle_q, state.particle_qd, state.dismech.edge_q, state.dismech.edge_d1_q, d.edge_node0,
+                    d.edge_node1, d.edge_body, int(state.body_qd is not None)],
+            outputs=[state.body_q, body_qd],
+            device=self.device,
+        )

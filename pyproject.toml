@@ -1,16 +1,31 @@
 [project]
 name = "dismech-newton"
-version = "0.1.0"
-description = "DiSMech solver in Newton."
+version = "1.0.0"
+description = "Implicit discrete elastic rods (Newton-Raphson, and ADMM with contact and friction) for NVIDIA Newton."
 readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+keywords = ["discrete elastic rods", "rods", "simulation", "physics", "robotics", "newton", "warp", "gpu"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 authors = [
     { name = "ryanchaiyakul", email = "ryanchaiyakul@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
     "newton~=1.6.0",
     "scipy>=1.14",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ryanchaiyakul/dismech-newton"
+Issues = "https://github.com/ryanchaiyakul/dismech-newton/issues"
 
 [project.optional-dependencies]
 gpu = [

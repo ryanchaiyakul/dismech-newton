@@ -2,10 +2,11 @@
 
 ``M`` right-handed helical flagella hang from clamps on a regular polygon of side 0.03 m. Each
 clamped first edge lies on its helix axis and spins at ``omega``; the helices rotate in a viscous
-fluid (regularized Stokeslet segments, :mod:`stokes`, applied explicitly each step), wrap around one
-another and bundle, held apart by frictionless contact. Geometry and the clamp follow the paper's
-code (``world::rodGeometry``): a straight clamped edge, a 45-degree lead-in, then 4 helical turns,
-68 nodes. Parameters are the paper's; see ``PAPER``.
+fluid (regularized Stokeslet segments, :mod:`stokes`: one drag force per step, backward Euler in the
+drag), wrap around one another and bundle, held apart by contact (frictionless in the paper;
+``--mu`` adds friction).
+Geometry and the clamp follow the paper's code (``world::rodGeometry``): a straight clamped edge, a
+45-degree lead-in, then 4 helical turns, 68 nodes. Parameters are the paper's; see ``PAPER``.
 
 Two rods: our DER with ADMM (:class:`DERFlagella`), and Newton's VBD cable (:class:`VBDFlagella`),
 whose segments are rigid capsules; its drag is computed on the capsule joints and applied as wrenches.
@@ -21,7 +22,7 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from common import capsules, segment_distance, segment_dofs
+from common import segment_distance, segment_dofs
 from stokes import Stokeslets
 
 from dismech_newton import ADMMDiSMechSolver, flatten_state
@@ -41,6 +42,7 @@ PAPER = {
     "omega": 15.0,  # [rad / s]
     "dt": 1.0e-3,  # [s]
     "total_time": 250.0,  # [s]
+    "friction": 0.0,  # Coulomb mu between flagella (the paper's contact is frictionless)
 }
 
 TOP = 0.3  # height of the clamps [m]
@@ -157,8 +159,8 @@ def _capsule_wrench_kernel(
 
 
 class _Flagella:
-    """One step is: drag at the step's start (eager: cuSOLVER), then drive, collide and solve (a
-    CUDA graph, one per state parity)."""
+    """One step is: drag at the step's start (eager: cuSOLVER does not capture), then drive, collide
+    and solve (a CUDA graph, one per state parity)."""
 
     name = ""
 
@@ -211,6 +213,10 @@ class _Flagella:
         """``(count, nv, 3)`` node positions."""
         ...
 
+    def body_q(self) -> np.ndarray:
+        """Capsule poses, for replay in the viewer."""
+        ...
+
     def gaps(self) -> tuple[float, float]:
         """Closest approach between flagella, and within one (edges > 2 apart), in diameters."""
         x = self.nodes()
@@ -237,11 +243,11 @@ class _Flagella:
 
 
 class DERFlagella(_Flagella):
-    """Our DER, ADMM with frictionless contact."""
+    """Our DER, ADMM with contact."""
 
     name = "DER ADMM"
 
-    def __init__(self, count: int, p: dict = PAPER, **solver_options):
+    def __init__(self, count: int, p: dict = PAPER, *, implicit_drag: bool = True, **solver_options):
         super().__init__(count, p)
         h = p["radius"]
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -252,8 +258,10 @@ class DERFlagella(_Flagella):
             ADMMDiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
             self.rods.append(bodies)
         self.model = model = builder.finalize()
-        self.solver = ADMMDiSMechSolver(model, friction=0.0, **solver_options)
+        self.solver = ADMMDiSMechSolver(model, friction=p["friction"], **solver_options)
         self._iterations = self.solver._count
+        if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
+            self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
         self.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
                                                  speculative_contact_gap_max=2.0 * h, contact_matching="latest")
         self.contacts = self.pipeline.contacts()
@@ -278,6 +286,10 @@ class DERFlagella(_Flagella):
     def nodes(self):
         return self.state_0.particle_q.numpy().reshape(self.count, self.nv, 3)
 
+    def body_q(self):
+        self.solver.update_proxies(self.state_0)
+        return self.state_0.body_q.numpy()
+
 
 class VBDFlagella(_Flagella):
     """Newton's VBD cable: rigid capsules on rod joints, the clamp capsule kinematic."""
@@ -289,7 +301,7 @@ class VBDFlagella(_Flagella):
         self.substeps = substeps
         h = p["radius"]
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-        cfg = newton.ModelBuilder.ShapeConfig(density=p["density"], mu=0.0, ke=contact_ke, gap=h)
+        cfg = newton.ModelBuilder.ShapeConfig(density=p["density"], mu=p["friction"], ke=contact_ke, gap=h)
         self.rods, clamps = [], []
         for points in self.points:
             rod = _rod(points, p)
@@ -372,6 +384,9 @@ class VBDFlagella(_Flagella):
         self._update_nodes(self.state_0)
         return self._pos.numpy().reshape(self.count, self.nv, 3)
 
+    def body_q(self):
+        return self.state_0.body_q.numpy()
+
 
 SOLVERS = {"der": DERFlagella, "vbd": VBDFlagella}
 
@@ -380,7 +395,8 @@ class Example:
     def __init__(self, viewer, args=None):
         count = getattr(args, "flagella", 3) if args is not None else 3
         solver = getattr(args, "solver", "der") if args is not None else "der"
-        self.sim = SOLVERS[solver](count)
+        mu = getattr(args, "mu", PAPER["friction"]) if args is not None else PAPER["friction"]
+        self.sim = SOLVERS[solver](count, {**PAPER, "friction": mu})
         self.viewer = viewer
         self.frame_dt = 1.0 / 60.0
         self.steps_per_frame = max(1, round(self.frame_dt / self.sim.dt))
@@ -412,6 +428,7 @@ if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--flagella", type=int, default=3, help="number of flagella M")
     parser.add_argument("--solver", choices=tuple(SOLVERS), default="der")
+    parser.add_argument("--mu", type=float, default=PAPER["friction"], help="friction between flagella")
     parser.set_defaults(num_frames=600)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

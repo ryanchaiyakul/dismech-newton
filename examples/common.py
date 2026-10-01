@@ -1,4 +1,4 @@
-"""Helpers shared by the examples and ``scripts/compare.py``."""
+"""Helpers shared by the examples."""
 
 import newton
 import numpy as np

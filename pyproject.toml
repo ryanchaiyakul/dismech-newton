@@ -1,9 +1,9 @@
 [project]
 name = "dismech-newton"
-version = "1.0.0"
-description = "Implicit discrete elastic rods (Newton-Raphson, and ADMM with contact and friction) for NVIDIA Newton."
+version = "0.1.0"
+description = "Discrete Elastic Rods for NVIDIA Newton."
 readme = "README.md"
-license = "GPL-3.0-only"
+license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 keywords = ["discrete elastic rods", "rods", "simulation", "physics", "robotics", "newton", "warp", "gpu"]
 classifiers = [

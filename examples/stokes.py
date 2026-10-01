@@ -6,14 +6,56 @@ function of the force densities at every node of every rod, ``U = A f``, with ``
 start of each step ``A`` is built at the nodes' positions, ``8 pi eta A f = U`` is solved for the
 nodes' velocities (no slip), and ``F = -8 pi eta A^-1 U`` is applied explicitly for the step.
 
-As in the reference, ``A`` is factored by Cholesky from its lower triangle (Eigen's ``llt``), in
-double precision; here on the GPU with cuSOLVER.
+As in the reference, ``A`` is factored by Cholesky (Eigen's ``llt``); here with cuSOLVER, in single
+precision (the segment integrals are in double): ``A`` is well conditioned (``cond < 10^3`` in a
+tight bundle), single precision costs a relative ``~1e-6`` in ``F`` and is ten times faster than
+double on a consumer GPU. Assembly and solve run on Warp's stream with buffers allocated once and
+no host synchronization; cuSOLVER's ``spotrf`` does not capture in a CUDA graph, so the caller
+runs :meth:`Stokeslets.compute` eagerly.
+
+Explicit, the drag is stable only while ``dt R / m < 2`` in every mode, ``R = 8 pi eta A^-1``. In
+a tight bundle the free tips (half a node's mass) of neighbouring flagella reach ``dt R / m ~ 5``
+at the paper's 1 ms, and the drag at the tips flips sign and doubles each step. With :meth:`Stokeslets.implicit`,
+the drag is instead taken at the velocity the drag alone would leave after the step (backward Euler on
+the drag, split from the rest of the step): ``F = -R (M + dt R)^-1 M v``, i.e.
+``F = -S (S A S / (8 pi eta) + dt I)^-1 S v`` with ``S = M^(1/2)``, again one Cholesky solve. It is
+stable for any ``dt``, and the explicit drag where ``dt R / m << 1``.
 """
 
-import cupy as cp
-import cupyx.lapack
+import ctypes
+import sys
+
 import numpy as np
 import warp as wp
+from cupy.cuda import device as _cupy_device
+
+
+def _cusolver_library() -> ctypes.CDLL:
+    """The cuSOLVER that CuPy loaded, called directly with buffers allocated once (CuPy's ``posv``
+    copies ``A``, allocates and synchronizes on every call)."""
+    _cupy_device.get_cusolver_handle()  # makes CuPy load it
+    names = ("cusolver64_12.dll", "cusolver64_11.dll") if sys.platform == "win32" else ("libcusolver.so.12", "libcusolver.so.11")
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        c, p = ctypes.c_int, ctypes.c_void_p
+        lib.cusolverDnCreate.argtypes = [ctypes.POINTER(p)]
+        lib.cusolverDnSetStream.argtypes = [p, p]
+        lib.cusolverDnSpotrf_bufferSize.argtypes = [p, c, c, p, c, ctypes.POINTER(c)]
+        lib.cusolverDnSpotrf.argtypes = [p, c, c, p, c, p, c, p]
+        lib.cusolverDnSpotrs.argtypes = [p, c, c, c, p, c, p, c, p]
+        return lib
+    raise OSError("cuSOLVER not found")
+
+
+_LOWER = 0  # CUBLAS_FILL_MODE_LOWER
+
+
+def _check(status: int, what: str) -> None:
+    if status != 0:
+        raise RuntimeError(f"{what} failed with cuSOLVER status {status}")
 
 
 @wp.func
@@ -51,12 +93,16 @@ def _assemble_kernel(
     vel: wp.array[wp.vec3],
     nv: int,
     eps: wp.float64,
+    s: wp.array[float],
+    scale: float,
+    shift: float,
     # outputs
-    A: wp.array2d[wp.float64],
-    U: wp.array[wp.float64],
+    A: wp.array2d[float],
+    U: wp.array[float],
 ):
-    """Lower triangle of ``A``, block ``(i, k)`` for evaluation node ``i`` and force node ``k``:
-    ``M1`` of the segment starting at ``k`` plus ``M2`` of the segment ending at ``k``."""
+    """``S A S scale + shift I`` and ``S U``; block ``(i, k)`` of ``A`` for evaluation node ``i`` and
+    force node ``k`` is ``M1`` of the segment starting at ``k`` plus ``M2`` of the segment ending at ``k``.
+    Only the lower triangle is computed, and mirrored."""
     i, k = wp.tid()
     if k > i:
         return
@@ -74,18 +120,21 @@ def _assemble_kernel(
             r = 3 * i + a
             c = 3 * k + b
             if c <= r:
-                A[r, c] = block[a, b]
-                A[c, r] = block[a, b]  # mirror: Cholesky of the lower triangle
+                w = float(block[a, b]) * scale * s[r] * s[c]
+                if r == c:
+                    w += shift
+                A[r, c] = w
+                A[c, r] = w
     if k == 0:
         v = vel[i]
         for a in range(3):
-            U[3 * i + a] = wp.float64(v[a])
+            U[3 * i + a] = s[3 * i + a] * v[a]
 
 
 @wp.kernel
-def _force_kernel(f: wp.array[wp.float64], scale: wp.float64, force: wp.array[wp.vec3]):
+def _force_kernel(y: wp.array[float], s: wp.array[float], scale: float, force: wp.array[wp.vec3]):
     i = wp.tid()
-    force[i] = wp.vec3(wp.vec3d(f[3 * i], f[3 * i + 1], f[3 * i + 2]) * scale)
+    force[i] = scale * wp.vec3(s[3 * i] * y[3 * i], s[3 * i + 1] * y[3 * i + 1], s[3 * i + 2] * y[3 * i + 2])
 
 
 class Stokeslets:
@@ -94,18 +143,39 @@ class Stokeslets:
     def __init__(self, rods: int, nv: int, viscosity: float, epsilon: float, device):
         self.n, self.nv, self.device = rods * nv, nv, device
         self.viscosity, self.epsilon = viscosity, epsilon
-        self.A = wp.zeros((3 * self.n, 3 * self.n), dtype=wp.float64, device=device)
-        self.U = wp.zeros(3 * self.n, dtype=wp.float64, device=device)
+        n3 = 3 * self.n
+        self.A = wp.zeros((n3, n3), dtype=float, device=device)  # overwritten by its factor
+        self.U = wp.zeros(n3, dtype=float, device=device)  # the right-hand side, then the solution
         self.force = wp.zeros(self.n, dtype=wp.vec3, device=device)
-        self._stream = cp.cuda.ExternalStream(wp.get_stream(device).cuda_stream)
+        self._s = wp.ones(n3, dtype=float, device=device)
+        self._scale, self._shift, self._post = 1.0, 0.0, -8.0 * np.pi * viscosity  # explicit
+        self._lib = lib = _cusolver_library()
+        self._handle = ctypes.c_void_p()
+        _check(lib.cusolverDnCreate(ctypes.byref(self._handle)), "cusolverDnCreate")
+        lwork = ctypes.c_int()
+        _check(lib.cusolverDnSpotrf_bufferSize(self._handle, _LOWER, n3, self.A.ptr, n3, ctypes.byref(lwork)),
+               "spotrf_bufferSize")
+        self._work = wp.zeros(max(lwork.value, 1), dtype=float, device=device)
+        self._info = wp.zeros(1, dtype=wp.int32, device=device)  # nonzero if A is not positive definite
+
+    def implicit(self, mass: np.ndarray, dt: float) -> None:
+        """Take the drag implicitly over ``dt`` (see the module), ``mass`` per DOF (``3 rods nv``)."""
+        self._s.assign(np.sqrt(np.asarray(mass, dtype=np.float64)).astype(np.float32))
+        self._scale, self._shift, self._post = 1.0 / (8.0 * np.pi * self.viscosity), dt, -1.0
 
     def compute(self, pos: wp.array, vel: wp.array) -> wp.array:
-        """Nodal drag ``F = -8 pi eta A(pos)^-1 vel`` into ``self.force``."""
-        wp.launch(_assemble_kernel, dim=(self.n, self.n), inputs=[pos, vel, self.nv, wp.float64(self.epsilon)],
+        """Nodal drag ``F = -8 pi eta A(pos)^-1 vel`` (or its implicit form, see the module) into ``self.force``."""
+        n3 = 3 * self.n
+        wp.launch(_assemble_kernel, dim=(self.n, self.n),
+                  inputs=[pos, vel, self.nv, wp.float64(self.epsilon), self._s, self._scale, self._shift],
                   outputs=[self.A, self.U], device=self.device)
-        with self._stream:
-            f = cupyx.lapack.posv(cp.asarray(self.A), cp.asarray(self.U))
-            f = cp.ascontiguousarray(f.reshape(-1))
-            wp.launch(_force_kernel, dim=self.n, inputs=[wp.from_dlpack(f), wp.float64(-8.0 * np.pi * self.viscosity)],
-                      outputs=[self.force], device=self.device)
+        # A is symmetric: its row-major lower triangle is cuSOLVER's column-major upper, either will do.
+        lib = self._lib
+        _check(lib.cusolverDnSetStream(self._handle, wp.get_stream(self.device).cuda_stream), "setStream")
+        _check(lib.cusolverDnSpotrf(self._handle, _LOWER, n3, self.A.ptr, n3, self._work.ptr, self._work.shape[0],
+                                    self._info.ptr), "spotrf")
+        _check(lib.cusolverDnSpotrs(self._handle, _LOWER, n3, 1, self.A.ptr, n3, self.U.ptr, n3, self._info.ptr),
+               "spotrs")
+        wp.launch(_force_kernel, dim=self.n, inputs=[self.U, self._s, self._post], outputs=[self.force],
+                  device=self.device)
         return self.force

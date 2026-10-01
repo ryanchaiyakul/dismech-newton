@@ -3,7 +3,10 @@
 Contacts are Newton's, detected on the rod's capsule proxies. Each one is mapped back to the rod:
 the body-frame point on a capsule's axis gives the barycentric along its edge, Newton's normal is
 kept and the thickness is the sum of the two contact margins. A contact against a shape that is
-not a rod edge (ground, obstacle) is anchored at its world point on that shape.
+not a rod edge (ground, obstacle) is anchored at its world point on that shape. A rod-rod contact
+whose closest point lies on an end cap is moved to the edge of the chain that owns it (see
+:func:`_rehome`): the capsule chain is smooth at its joints, and a cap's tilted normal would brake
+anything sliding along the rod.
 
 Each active contact fixes, for the step, its barycentrics, the normal ``n`` and the start-of-step
 relative position ``c0``; its local variable is ``p = n (n . Cq - thickness) + (I - n n^T)(Cq - c0) + u``,
@@ -41,6 +44,82 @@ def _edge_bary(q: wp.array[float], n0: int, n1: int, p_body: wp.vec3) -> float:
     return wp.clamp(0.5 + p_body[2] / wp.length(node(q, n1) - node(q, n0)), 0.0, 1.0)
 
 
+@wp.func
+def _closest_st(p0: wp.vec3, p1: wp.vec3, q0: wp.vec3, q1: wp.vec3) -> wp.vec2:
+    """Barycentrics of the closest points of segments ``p0 p1`` and ``q0 q1``."""
+    d1 = p1 - p0
+    d2 = q1 - q0
+    r = p0 - q0
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    b = wp.dot(d1, d2)
+    c = wp.dot(d1, r)
+    f = wp.dot(d2, r)
+    den = a * e - b * b
+    s = float(0.0)
+    if den > 1.0e-12 * a * e:
+        s = wp.clamp((b * f - c * e) / den, 0.0, 1.0)
+    t = (b * s + f) / e
+    if t < 0.0:
+        t = 0.0
+        s = wp.clamp(-c / a, 0.0, 1.0)
+    elif t > 1.0:
+        t = 1.0
+        s = wp.clamp((b - c) / a, 0.0, 1.0)
+    return wp.vec2(s, t)
+
+
+@wp.func
+def _edge_st(q: wp.array[float], edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32], ea: int,
+             eb: int) -> wp.vec2:
+    return _closest_st(node(q, edge_node0[ea]), node(q, edge_node1[ea]), node(q, edge_node0[eb]),
+                       node(q, edge_node1[eb]))
+
+
+_REHOME_REACH = 4  # edges searched along the chain on each side of an end-cap contact
+
+
+@wp.func
+def _seg_dist(q: wp.array[float], edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32], e: int,
+              other: int, st: wp.vec2) -> float:
+    xa = (1.0 - st[0]) * node(q, edge_node0[e]) + st[0] * node(q, edge_node1[e])
+    xb = (1.0 - st[1]) * node(q, edge_node0[other]) + st[1] * node(q, edge_node1[other])
+    return wp.length(xa - xb)
+
+
+@wp.func
+def _rehome(q: wp.array[float], edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32],
+            edge_prev: wp.array[wp.int32], edge_next: wp.array[wp.int32], e: int, s: float, other: int) -> int:
+    """The edge that owns a contact found on edge ``e`` at barycentric ``s`` against edge ``other``.
+
+    A closest point on an end cap may belong to the smooth capsule chain elsewhere: the nearest edge
+    within reach whose own closest point is strictly interior owns it. Kept on the cap, its normal,
+    tilted along the chain and frozen for the step, reads as a bump to anything sliding past (a drag
+    that grows with the step's displacement). A convex corner, or ``other`` lying along the chain,
+    has no such edge and keeps the cap.
+    """
+    if s > 1.0e-4 and s < 1.0 - 1.0e-4:
+        return e
+    best = e
+    best_dist = _seg_dist(q, edge_node0, edge_node1, e, other, _edge_st(q, edge_node0, edge_node1, e, other))
+    for side in range(2):
+        n = e
+        for _k in range(_REHOME_REACH):
+            if side == 0:
+                n = edge_prev[n]
+            else:
+                n = edge_next[n]
+            if n < 0 or n == other:
+                break
+            st = _edge_st(q, edge_node0, edge_node1, n, other)
+            if st[0] > 1.0e-6 and st[0] < 1.0 - 1.0e-6:
+                dist = _seg_dist(q, edge_node0, edge_node1, n, other, st)
+                if dist < best_dist:
+                    best = n
+                    best_dist = dist
+    return best
+
+
 @wp.kernel
 def _convert_contacts_kernel(
     contact_count: wp.array[wp.int32],
@@ -59,6 +138,8 @@ def _convert_contacts_kernel(
     body_edge: wp.array[wp.int32],
     edge_node0: wp.array[wp.int32],
     edge_node1: wp.array[wp.int32],
+    edge_prev: wp.array[wp.int32],
+    edge_next: wp.array[wp.int32],
     q: wp.array[float],
     dof_fixed: wp.array[wp.int32],
     u_prev: wp.array[wp.vec3],
@@ -114,17 +195,32 @@ def _convert_contacts_kernel(
     if ea < 0 or (eb >= 0 and self_contact == 0):
         return
 
-    pair = wp.vec4i(edge_node0[ea], edge_node1[ea], -1, -1)
-    st = wp.vec2(_edge_bary(q, pair[0], pair[1], pa), 0.0)
+    st = wp.vec2(_edge_bary(q, edge_node0[ea], edge_node1[ea], pa), 0.0)
     xb = wp.vec3(0.0, 0.0, 0.0)
     if eb >= 0:
-        pair[2] = edge_node0[eb]
-        pair[3] = edge_node1[eb]
-        st[1] = _edge_bary(q, pair[2], pair[3], pb)
+        st[1] = _edge_bary(q, edge_node0[eb], edge_node1[eb], pb)
+        # Rod-rod: move a contact off an end cap onto the edge that owns it, then take the
+        # closest points and the normal of the edges themselves.
+        ea2 = _rehome(q, edge_node0, edge_node1, edge_prev, edge_next, ea, st[0], eb)
+        eb2 = _rehome(q, edge_node0, edge_node1, edge_prev, edge_next, eb, st[1], ea2)
+        if ea2 != ea or eb2 != eb:
+            ea = ea2
+            eb = eb2
+            st = _edge_st(q, edge_node0, edge_node1, ea, eb)
+            xa = (1.0 - st[0]) * node(q, edge_node0[ea]) + st[0] * node(q, edge_node1[ea])
+            xb = (1.0 - st[1]) * node(q, edge_node0[eb]) + st[1] * node(q, edge_node1[eb])
+            d = xa - xb
+            if wp.length(d) > 1.0e-9:
+                n = wp.normalize(d)
+            xb = wp.vec3(0.0, 0.0, 0.0)
     elif bb >= 0:
         xb = wp.transform_point(body_q[bb], pb)
     else:
         xb = pb
+    pair = wp.vec4i(edge_node0[ea], edge_node1[ea], -1, -1)
+    if eb >= 0:
+        pair[2] = edge_node0[eb]
+        pair[3] = edge_node1[eb]
     fixed = _node_fixed(dof_fixed, pair[0]) * _node_fixed(dof_fixed, pair[1])
     fixed = fixed * _node_fixed(dof_fixed, pair[2]) * _node_fixed(dof_fixed, pair[3])
     if fixed != 0:  # nothing can move: the dual would grow without bound
@@ -290,6 +386,14 @@ class ContactTerm:
         body_edge = np.full(max(model.body_count, 1), -1, dtype=np.int32)
         body_edge[edge_body[edge_body >= 0]] = np.nonzero(edge_body >= 0)[0]
         self._body_edge = wp.array(body_edge, dtype=wp.int32, device=self.device)
+        # Neighbouring edges of each edge along its rod (-1 at a free end).
+        node0, node1 = self.der.edge_node0.numpy(), self.der.edge_node1.numpy()
+        edge_ending = np.full(model.particle_count, -1, dtype=np.int32)
+        edge_ending[node1] = np.arange(len(node1))
+        edge_starting = np.full(model.particle_count, -1, dtype=np.int32)
+        edge_starting[node0] = np.arange(len(node0))
+        self._edge_prev = wp.array(edge_ending[node0], dtype=wp.int32, device=self.device)
+        self._edge_next = wp.array(edge_starting[node1], dtype=wp.int32, device=self.device)
         n_dofs = fixed.shape[0]
         self._load = wp.zeros(n_dofs, dtype=float, device=self.device)
         self._reach = wp.zeros(n_dofs, dtype=float, device=self.device)
@@ -339,7 +443,8 @@ class ContactTerm:
                 c.rigid_contact_count, c.rigid_contact_shape0, c.rigid_contact_shape1, c.rigid_contact_point0,
                 c.rigid_contact_point1, c.rigid_contact_normal, c.rigid_contact_margin0, c.rigid_contact_margin1,
                 match, c.contact_generation, self._seen_generation, self.model.shape_body, state_in.body_q,
-                self._body_edge, self.der.edge_node0, self.der.edge_node1, state_in.dismech.q, self.fixed,
+                self._body_edge, self.der.edge_node0, self.der.edge_node1, self._edge_prev, self._edge_next,
+                state_in.dismech.q, self.fixed,
                 self._u_prev, self._rho_prev, int(self.self_contact),
             ],
             outputs=[self.active, self.pairs, self.thickness, self.bary, self.normal, self.anchor, self.c0, self.u,

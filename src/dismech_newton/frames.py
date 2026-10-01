@@ -1,16 +1,90 @@
-"""Rod frame geometry: the math primitives and the end-of-step frame update.
+"""The flat DOF vector and rod frame geometry.
 
-Each edge has a unit tangent ``t`` (from its node positions) and a stored reference director
-``d1`` that is parallel-transported in time; the material directors ``(m1, m2)`` are that
-frame rotated by the edge twist angle. Strain kernels build on the primitives here;
-:func:`advance_edge_frames` brings the stored reference directors up to date and
-:func:`pose_edge_proxies` places the render-only capsule proxies.
+DOF ``3 * node + k`` is component ``k`` of ``particle_q[node]`` and DOF ``3 * N + edge`` is the
+twist angle ``edge_q[edge]``. A flattened state owns that vector as ``state.dismech.q`` (velocities
+``qd``), and ``particle_q``, ``edge_q`` and their velocities are views into it.
+
+Each edge has a unit tangent ``t`` (from its nodes) and a reference director ``d1`` that is
+parallel-transported in time; the material directors ``(m1, m2)`` are that frame rotated by the
+twist angle.
 """
 
+import numpy as np
 import warp as wp
-from newton import State
+from newton import Model, ParticleFlags, State
 
-# -- math primitives ----------------------------------------------------------------------
+# -- flat DOF vector ----------------------------------------------------------------------
+
+
+def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
+    """Per-DOF ``(mass, fixed)``: node mass / edge twist inertia, and the Dirichlet flag.
+
+    A node DOF is fixed when its particle is not ``ACTIVE``, a twist DOF when ``edge_fixed`` is set.
+    """
+    der = model.dismech
+    active = (model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) != 0
+    fixed = np.concatenate([np.repeat(~active, 3), der.edge_fixed.numpy() != 0])
+    mass = np.concatenate([np.repeat(model.particle_mass.numpy(), 3), der.edge_inertia.numpy()])
+    return (
+        wp.array(mass.astype(np.float32), dtype=float, device=model.device),
+        wp.array(fixed, dtype=wp.int32, device=model.device),
+    )
+
+
+def flatten_state(state: State) -> None:
+    """Make ``state`` own the flat vectors ``dismech.q`` / ``dismech.qd`` (idempotent).
+
+    ``particle_q``, ``edge_q``, ``particle_qd`` and ``edge_qd`` become views into them. Call it
+    before any CUDA graph capture; the solver does so on the first step.
+    """
+    ns = state.dismech
+    if getattr(ns, "q", None) is not None:
+        return
+    n = state.particle_q.shape[0]
+    nd = 3 * n
+    for flat_name, node_name, edge_name in (("q", "particle_q", "edge_q"), ("qd", "particle_qd", "edge_qd")):
+        flat = wp.zeros(nd + ns.edge_q.shape[0], dtype=float, device=state.particle_q.device)
+        nodes = flat[:nd].reshape((n, 3)).view(wp.vec3)
+        edges = flat[nd:]
+        nodes.assign(getattr(state, node_name))
+        edges.assign(getattr(ns, edge_name))
+        setattr(state, node_name, nodes)
+        setattr(ns, edge_name, edges)
+        setattr(ns, flat_name, flat)
+
+
+@wp.func
+def node(q: wp.array[float], n: int) -> wp.vec3:
+    """Position of node ``n`` in the flat DOF vector."""
+    return wp.vec3(q[3 * n], q[3 * n + 1], q[3 * n + 2])
+
+
+@wp.func
+def fixed_node(q: wp.array[float], fixed: wp.array[wp.int32], n: int) -> wp.vec3:
+    """The fixed components of node ``n`` (free ones zeroed)."""
+    out = wp.vec3()
+    for k in range(3):
+        if fixed[3 * n + k] != 0:
+            out[k] = q[3 * n + k]
+    return out
+
+
+@wp.func
+def scatter_node(rhs: wp.array[float], fixed: wp.array[wp.int32], n: int, v: wp.vec3):
+    """``rhs[node n] += v`` on its free components."""
+    for k in range(3):
+        if fixed[3 * n + k] == 0:
+            wp.atomic_add(rhs, 3 * n + k, v[k])
+
+
+@wp.func
+def scatter_dof(rhs: wp.array[float], fixed: wp.array[wp.int32], i: int, v: float):
+    """``rhs[i] += v`` unless DOF ``i`` is fixed."""
+    if fixed[i] == 0:
+        wp.atomic_add(rhs, i, v)
+
+
+# -- frame math ---------------------------------------------------------------------------
 
 
 @wp.func
@@ -45,9 +119,6 @@ def skew(a: wp.vec3) -> wp.mat33:
     # fmt: on
 
 
-# -- frames -------------------------------------------------------------------------------
-
-
 @wp.func
 def material_frame(d1: wp.vec3, t: wp.vec3, theta: float):
     """Material directors ``(m1, m2)``: reference frame ``(d1, t x d1)`` rotated by ``theta``."""
@@ -58,28 +129,17 @@ def material_frame(d1: wp.vec3, t: wp.vec3, theta: float):
 
 
 @wp.func
-def edge_reference_frame(
-    x0: wp.vec3, x1: wp.vec3, d1_old: wp.vec3, t_old: wp.vec3
-) -> tuple[wp.vec3, wp.vec3]:
-    """Current unit tangent and time-parallel-transported reference director."""
-    t = wp.normalize(x1 - x0)
-    return t, parallel_transport(d1_old, t_old, t)
-
-
-@wp.func
-def reference_twist(
-    d1e: wp.vec3, te: wp.vec3, d1f: wp.vec3, tf: wp.vec3, ref_twist_old: float
-) -> float:
+def reference_twist(d1e: wp.vec3, te: wp.vec3, d1f: wp.vec3, tf: wp.vec3, ref_twist_old: float) -> float:
     """Reference twist between two edges, unwrapped to be continuous in time."""
     angle = signed_angle(parallel_transport(d1e, te, tf), d1f, tf)
     return ref_twist_old + wrap_angle(angle - ref_twist_old)
 
 
-# -- end-of-step update -------------------------------------------------------------------
+# -- end-of-step kernels (one thread per edge) --------------------------------------------
 
 
 @wp.kernel
-def _advance_edge_frames_kernel(
+def advance_frames_kernel(
     node_q_prev: wp.array[wp.vec3],
     node_q: wp.array[wp.vec3],
     edge_node0: wp.array[wp.int32],
@@ -88,31 +148,38 @@ def _advance_edge_frames_kernel(
     # outputs
     edge_d1: wp.array[wp.vec3],
 ):
+    """Parallel-transport every reference director from the previous tangent to the current one."""
     e = wp.tid()
     n0 = edge_node0[e]
     n1 = edge_node1[e]
     t_prev = wp.normalize(node_q_prev[n1] - node_q_prev[n0])
-    _t, d1 = edge_reference_frame(node_q[n0], node_q[n1], edge_d1_prev[e], t_prev)
-    edge_d1[e] = d1
+    edge_d1[e] = parallel_transport(edge_d1_prev[e], t_prev, wp.normalize(node_q[n1] - node_q[n0]))
 
 
 @wp.kernel
-def _pose_proxies_kernel(
+def pose_proxies_kernel(
     node_q: wp.array[wp.vec3],
+    node_qd: wp.array[wp.vec3],
     edge_q: wp.array[float],
     edge_d1: wp.array[wp.vec3],
     edge_node0: wp.array[wp.int32],
     edge_node1: wp.array[wp.int32],
     edge_body: wp.array[wp.int32],
+    set_velocity: int,
     # outputs
     body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
 ):
+    """Pose every proxy (origin at the edge midpoint, +Z along the tangent, +X along ``m1``) and,
+    with ``set_velocity``, set its rigid velocity (midpoint velocity, edge rotation rate)."""
     e = wp.tid()
     body = edge_body[e]
     if body < 0:
         return
-    x0 = node_q[edge_node0[e]]
-    x1 = node_q[edge_node1[e]]
+    n0 = edge_node0[e]
+    n1 = edge_node1[e]
+    x0 = node_q[n0]
+    x1 = node_q[n1]
     t = wp.normalize(x1 - x0)
     m1, m2 = material_frame(edge_d1[e], t, edge_q[e])
     R = wp.mat33(
@@ -121,34 +188,8 @@ def _pose_proxies_kernel(
         m1[2], m2[2], t[2],
     )
     body_q[body] = wp.transform(0.5 * (x0 + x1), wp.quat_from_matrix(R))
-
-
-def advance_edge_frames(der, state_in: State, state_out: State, device) -> None:
-    """Parallel-transport every edge's reference director from ``state_in`` to ``state_out``.
-
-    ``der`` is the model's ``dismech`` namespace. Tangents are not stored; they are the
-    normalized node differences of each state's ``particle_q``.
-    """
-    wp.launch(
-        _advance_edge_frames_kernel,
-        dim=der.edge_length.shape[0],
-        inputs=[state_in.particle_q, state_out.particle_q, der.edge_node0, der.edge_node1, state_in.dismech.edge_d1_q],
-        outputs=[state_out.dismech.edge_d1_q],
-        device=device,
-    )
-
-
-def pose_edge_proxies(der, state: State, device) -> None:
-    """Pose the kinematic capsule proxies (``state.body_q``) from ``state``'s rod configuration.
-
-    Proxy frame: origin at the segment midpoint, local +Z along the tangent, +X along material
-    director m1. Edges without a proxy (``edge_body < 0``) are skipped. The proxies are
-    kinematic, so ``body_qd`` is never written.
-    """
-    wp.launch(
-        _pose_proxies_kernel,
-        dim=der.edge_length.shape[0],
-        inputs=[state.particle_q, state.dismech.edge_q, state.dismech.edge_d1_q, der.edge_node0, der.edge_node1, der.edge_body],
-        outputs=[state.body_q],
-        device=device,
-    )
+    if set_velocity != 0:
+        v0 = node_qd[n0]
+        v1 = node_qd[n1]
+        d = x1 - x0
+        body_qd[body] = wp.spatial_vector(0.5 * (v0 + v1), wp.cross(d, v1 - v0) / wp.dot(d, d))

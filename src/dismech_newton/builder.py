@@ -1,82 +1,62 @@
-"""Adding DER rods to a ``ModelBuilder`` and the ``dismech`` custom attributes they fill.
+"""Adding DER rods to a ``ModelBuilder``.
 
-Nodes are Newton particles (``particle_q``, ``particle_qd``, ``particle_mass``; a
-fixed node has ``ParticleFlags.ACTIVE`` cleared). Edges and triplets are custom
-frequencies holding what particles cannot (twist angle, reference director); each concrete
-stencil class (e.g. ``linear_triplet``) is a frequency of its own. Unless
-``proxies=False``, every edge also gets a kinematic, massless capsule proxy body (rendering
-only unless ``collide=True``); the solver poses it, it is not simulated. Each proxy costs
-Newton body and shape rows and a ``body_q`` entry in every state, so large rods that are not
-drawn should turn them off. Rest strains are not stored: the solver measures them from the
-initial configuration, so the rod starts unstressed. Edge tangents are not stored either;
-they follow from the node positions.
+Nodes are Newton particles (a fixed node has ``ParticleFlags.ACTIVE`` cleared); edges and triplets
+are ``dismech`` custom frequencies. Unless ``proxies=False``, every edge also gets a kinematic,
+massless capsule proxy body, posed by the solver, for rendering and collision. Rest strains are
+not stored: the solver measures them on the initial configuration.
 """
 
 import copy
-from typing import Literal
 
 import numpy as np
 import warp as wp
 from newton import Model, ModelBuilder, ParticleFlags, Rod
-from newton._src.core.types import Quat, Vec3
+from newton._src.core.types import Vec3
 
-from .stencils import NAMESPACE, LinearDampedTriplet, LinearTriplet, Stencil, TripletStencil
+from .strains import vec10f
 
+NAMESPACE = "dismech"
 _P = f"{NAMESPACE}:"
 
-# Edge attributes: (frequency, name, dtype, references). Stencil attributes (triplets, ...)
-# are declared by the stencils themselves.
-ATTRIBUTES: list[tuple[str, str, type, str | None]] = [
+# (frequency, name, dtype, references)
+ATTRIBUTES = [
     ("edge", "edge_inertia", float, None),
     ("edge", "edge_fixed", wp.int32, None),
     ("edge", "edge_node0", wp.int32, "particle"),
     ("edge", "edge_node1", wp.int32, "particle"),
     ("edge", "edge_body", wp.int32, "body"),
     ("edge", "edge_length", float, None),
+    ("triplet", "triplet_edge0", wp.int32, _P + "edge"),  # scalar int32, so merging builders offsets them
+    ("triplet", "triplet_edge1", wp.int32, _P + "edge"),
+    ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
 ]
 
 # Time-evolving state: (frequency, name, dtype).
-STATE_ATTRIBUTES: list[tuple[str, str, type]] = [
+STATE_ATTRIBUTES = [
     ("edge", "edge_q", float),  # material twist angle theta
     ("edge", "edge_qd", float),
     ("edge", "edge_d1_q", wp.vec3),  # time-parallel reference director
+    ("triplet", "triplet_ref_twist_q", float),
 ]
 
 
-def register_custom_attributes(builder: ModelBuilder, *stencils: type[Stencil]) -> None:
-    """Register the ``dismech`` attributes (edges, then each given stencil class's) on ``builder``.
-
-    Idempotent. Each concrete stencil class is its own frequency, so rods of different
-    classes can share a builder; :func:`add_rod` registers the class it uses.
-    """
-    builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="edge", namespace=NAMESPACE))
-    for stencil in stencils:
-        stencil.register(builder)
+def register_custom_attributes(builder: ModelBuilder) -> None:
+    """Register the ``dismech`` frequencies and attributes on ``builder`` (idempotent)."""
+    for name in ("edge", "triplet"):
+        builder.add_custom_frequency(ModelBuilder.CustomFrequency(name=name, namespace=NAMESPACE))
     for frequency, name, dtype, references in ATTRIBUTES:
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name=name,
-                dtype=dtype,
-                frequency=_P + frequency,
-                namespace=NAMESPACE,
-                references=references,
+                name=name, dtype=dtype, frequency=_P + frequency, namespace=NAMESPACE, references=references
             )
         )
     for frequency, name, dtype in STATE_ATTRIBUTES:
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
-                name=name,
-                dtype=dtype,
-                frequency=_P + frequency,
-                assignment=Model.AttributeAssignment.STATE,
+                name=name, dtype=dtype, frequency=_P + frequency, assignment=Model.AttributeAssignment.STATE,
                 namespace=NAMESPACE,
             )
         )
-
-
-def _rows(builder: ModelBuilder, name: str) -> int:
-    values = builder.custom_attributes[_P + name].values
-    return len(values) if values else 0
 
 
 def _resolve(explicit, rigidity, length, default, n: int) -> np.ndarray:
@@ -89,12 +69,7 @@ def _resolve(explicit, rigidity, length, default, n: int) -> np.ndarray:
 
 
 def fix_segment(builder: ModelBuilder, body: int | None = None, *, edge: int | None = None) -> None:
-    """Clamp a segment: both its nodes and its twist.
-
-    Name the segment by its proxy ``body`` or, for rods built with ``proxies=False``, by its
-    ``edge`` index (what :func:`add_rod` returns then). Clamping the first segment of a rod
-    gives a cantilever.
-    """
+    """Clamp a segment, both nodes and its twist, named by its proxy ``body`` or its ``edge`` index."""
     if (body is None) == (edge is None):
         raise ValueError("fix_segment: pass exactly one of `body` and `edge`")
     if edge is None:
@@ -116,7 +91,6 @@ def add_rod(
     bend_damping: float | None = None,
     twist_stiffness: float | None = None,
     twist_damping: float | None = None,
-    stencil: type[TripletStencil] | None = None,
     label: str | None = None,
     collide: bool = False,
     proxies: bool = True,
@@ -124,23 +98,13 @@ def add_rod(
 ) -> list[int]:
     """Add an ordered chain (open or closed) of DER segments.
 
-    Returns the proxy body indices, or, with ``proxies=False``, the (builder-global) edge
-    indices; :func:`fix_segment` takes either.
+    Returns the proxy body indices or, with ``proxies=False``, the edge indices.
 
-    Stiffness per entity: the explicit argument, else the rod's section
-    rigidity divided by the rest length (EA / l0 per edge, EI / L_dual and
-    GJ / L_dual per triplet), else a default (stretch 1e5, bend 0, twist =
-    bend). Damping is strain-rate viscosity in the same units; twist damping
-    defaults to bend damping. Mass comes from ``cfg.density``.
-
-    ``stencil`` is the concrete triplet class (and so the energy) of the rod's triplets (see
-    :mod:`dismech_newton.stencils`); by default :class:`LinearDampedTriplet` if any damping is
-    given and :class:`LinearTriplet` otherwise, so an undamped rod stores no damping. Rods of
-    different classes can share a builder.
-
-    The proxy capsules are render-only unless ``collide`` is set: ``finalize`` enumerates
-    every pair of colliding shapes (O(segments^2) host and device memory), and the solver
-    ignores contacts anyway.
+    Stiffness per entity: the explicit argument, else the rod's section rigidity divided by the
+    rest length (EA / l0 per edge, EI / L_dual and GJ / L_dual per triplet), else a default
+    (stretch 1e5, bend 0, twist = bend). Damping is strain-rate viscosity in the same units; twist
+    damping defaults to bend damping. Mass comes from ``cfg.density``. The proxies collide only
+    with ``collide`` (``finalize`` enumerates every colliding shape pair).
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
     if not Rod._is_ordered_chain_topology(len(points), edges):
@@ -172,7 +136,7 @@ def add_rod(
     d1 /= np.linalg.norm(d1, axis=1, keepdims=True)
     l_dual = 0.5 * (length[triplets[:, 0]] + length[triplets[:, 1]])
 
-    # -- stiffness, folded per triplet -----------------------------------------------
+    # -- stiffness and damping, folded per triplet -----------------------------------
     rigidities = rod._resolve_section_rigidities()
     ea, _, ei, gj = rigidities if rigidities is not None else (None,) * 4
     stretch_ke = _resolve(stretch_stiffness, ea, length, 1.0e5, n_e)
@@ -185,10 +149,10 @@ def add_rod(
     # An interior edge belongs to two triplets and shares its stretch between them.
     share = 1.0 / np.bincount(triplets.ravel(), minlength=n_e)[triplets]  # (T, 2)
     scale = length[triplets] ** 2 * share
-    k = np.column_stack((stretch_ke[triplets] * scale, bend_ke, bend_ke, twist_ke))
-    c = np.column_stack((stretch_kd[triplets] * scale, bend_kd, bend_kd, twist_kd))
-    if stencil is None:
-        stencil = LinearDampedTriplet if np.any(c) else LinearTriplet
+    params = np.column_stack(
+        (stretch_ke[triplets] * scale, bend_ke, bend_ke, twist_ke, stretch_kd[triplets] * scale, bend_kd, bend_kd,
+         twist_kd)
+    )
 
     # -- kinematic capsule proxies (body frame at the segment midpoint) ---------------
     bodies, shapes = [], []
@@ -216,8 +180,9 @@ def add_rod(
         builder.add_shape_collision_filter_pair(shapes[a], shapes[b])
 
     # -- attribute rows ---------------------------------------------------------------
-    register_custom_attributes(builder, stencil)
-    node0, edge0 = builder.particle_count, _rows(builder, "edge_length")
+    register_custom_attributes(builder)
+    edge_values = builder.custom_attributes[_P + "edge_length"].values
+    node0, edge0 = builder.particle_count, len(edge_values) if edge_values else 0
 
     # Lumped masses: each edge splits its mass between its nodes; twist inertia of a solid cylinder.
     edge_mass = cfg.density * np.pi * radius**2 * length
@@ -241,64 +206,51 @@ def add_rod(
                 _P + "edge_d1_q": wp.vec3(*d1[e].tolist()),
             }
         )
-    stencil.add_rows(builder, edge0, triplets, k, c)
+    for t in range(n_t):
+        builder.add_custom_values(
+            **{
+                _P + "triplet_edge0": edge0 + int(triplets[t, 0]),
+                _P + "triplet_edge1": edge0 + int(triplets[t, 1]),
+                _P + "triplet_params": vec10f(*params[t].tolist()),
+                _P + "triplet_ref_twist_q": 0.0,  # the first strain evaluation yields the reference twist itself
+            }
+        )
     return bodies if proxies else list(range(edge0, edge0 + n_e))
 
 
-def add_rod_graph(
+def add_colliding_rod(
     builder: ModelBuilder,
-    node_positions: list[Vec3],
-    edges: list[tuple[int, int]],
+    rod: Rod,
     *,
-    radius: float = 0.1,
     cfg: ModelBuilder.ShapeConfig | None = None,
-    stretch_stiffness: float | None = None,
-    stretch_damping: float | None = None,
-    shear_stiffness: float | None = None,
-    shear_damping: float | None = None,
-    bend_stiffness: float | None = None,
-    bend_damping: float | None = None,
-    twist_stiffness: float | None = None,
-    twist_damping: float | None = None,
-    label: str | None = None,
-    wrap_in_articulation: bool = True,
-    quaternions: list[Quat] | None = None,
-    junction_collision_filter: bool = True,
-    color: Vec3 | None = None,
-    body_frame_origin: Literal["start", "com"] | None = None,
-) -> tuple[list[int], list[int]]:
-    """DER counterpart of :meth:`newton.ModelBuilder.add_rod_graph`, with the same arguments.
+    contact_exclusion: float = 1.5,
+    **kwargs,
+) -> list[int]:
+    """:func:`add_rod` with colliding proxies, for the ADMM solver.
 
-    Builds a :class:`newton.Rod` from ``node_positions`` and ``edges`` and hands it to
-    :func:`add_rod`, so only ordered chains are supported; a ring given as the chain edges
-    plus a closing ``(n - 1, 0)`` edge becomes a closed rod. Returns ``(body_indices, [])``:
-    bodies follow ``edges``, and a DER rod has no joints.
-
-    DER has no shear, so ``shear_stiffness`` and ``shear_damping`` must be None. The proxies
-    are kinematic and posed at the segment midpoint, so ``wrap_in_articulation``,
-    ``junction_collision_filter`` and ``body_frame_origin`` have no effect.
+    Proxy pairs whose arc length strictly between them is below ``contact_exclusion`` contact
+    thicknesses (two radii) are filtered: touching neighbours are not a contact. ``cfg.gap``
+    defaults to the rod radius. Other arguments are those of :func:`add_rod`.
     """
-    if shear_stiffness is not None or shear_damping is not None:
-        raise NotImplementedError("add_rod_graph: DER rods have no shear mode")
-    points = np.asarray(node_positions, dtype=float)
-    edge_array = np.asarray(edges, dtype=int).reshape(-1, 2)
-    n = len(points)
-    ring = np.vstack((Rod._generate_ordered_chain_edges(n), [[n - 1, 0]]))
-    if n >= 3 and np.array_equal(edge_array, ring):
-        rod = Rod(np.vstack((points, points[:1])), quaternions=quaternions, closed=True, radius=radius)
-    else:
-        rod = Rod(points, edges=edge_array, quaternions=quaternions, radius=radius)
-    bodies = add_rod(
-        builder,
-        rod,
-        cfg=cfg,
-        stretch_stiffness=stretch_stiffness,
-        stretch_damping=stretch_damping,
-        bend_stiffness=bend_stiffness,
-        bend_damping=bend_damping,
-        twist_stiffness=twist_stiffness,
-        twist_damping=twist_damping,
-        label=label,
-        color=color,
-    )
-    return bodies, []
+    if not kwargs.get("proxies", True):
+        raise ValueError("add_colliding_rod: collision needs the capsule proxies (proxies=True)")
+    radius = rod._resolve_radius() or 0.1
+    cfg = copy.copy(cfg or builder.default_shape_cfg)
+    if cfg.gap is None:
+        cfg.gap = radius
+    bodies = add_rod(builder, rod, cfg=cfg, collide=True, **kwargs)
+
+    cutoff = contact_exclusion * 2.0 * radius
+    points = np.asarray(rod._normalize_and_validate_geometry()[0], dtype=float)
+    length = np.linalg.norm(points[1:] - points[:-1], axis=1)
+    n_e = len(length)
+    shapes = [builder.body_shapes[b][0] for b in bodies]
+    for a in range(n_e):
+        dist = 0.0
+        for k in range(1, n_e if rod.closed else n_e - a):
+            if dist >= cutoff:
+                break
+            b = (a + k) % n_e
+            builder.add_shape_collision_filter_pair(shapes[min(a, b)], shapes[max(a, b)])
+            dist += length[b]
+    return bodies

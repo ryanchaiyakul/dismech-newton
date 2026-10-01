@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local diagnostics and notes, not part of the package
+scratch/

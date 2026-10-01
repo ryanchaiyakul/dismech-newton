@@ -1,6 +1,8 @@
 # dismech-newton
 
-Implicit discrete elastic rods for [Newton](https://github.com/newton-physics/newton): a Newton-Raphson solver
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
+Discrete elastic rods for [Newton](https://github.com/newton-physics/newton): a Newton-Raphson solver
 (`DiSMechSolver`) and an ADMM solver with contact and friction (`ADMMDiSMechSolver`). Requires an NVIDIA GPU with CUDA 13.
 
 ## Quick install
@@ -38,7 +40,3 @@ uv run examples/cantilever.py
     </td>
   </tr>
 </table>
-
-## License
-
-[GPL-3.0](LICENSE)

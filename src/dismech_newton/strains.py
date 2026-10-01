@@ -80,14 +80,8 @@ def add_edge_theta_hessian(H: mat11f, col: int, De: wp.vec3, Df: wp.vec3) -> mat
 
 @wp.func
 def edge_gradient(De: wp.vec3, Df: wp.vec3, dtheta_e: float, dtheta_f: float) -> vec11f:
-    g = vec11f()
-    for k in range(3):
-        g[k] = -De[k]
-        g[4 + k] = De[k] - Df[k]
-        g[8 + k] = Df[k]
-    g[3] = dtheta_e
-    g[7] = dtheta_f
-    return g
+    d = De - Df
+    return vec11f(-De[0], -De[1], -De[2], dtheta_e, d[0], d[1], d[2], dtheta_f, Df[0], Df[1], Df[2])
 
 
 # -- geometry -----------------------------------------------------------------------------
@@ -307,6 +301,30 @@ def dtau(g: TripletGeometry):
     Def = (2.0 / g.chi * skew(te) - wp.outer(kb, g.tt)) / (2.0 * ne * nf)
     H = add_edge_hessian(mat11f(), Dee, Def, Dff)
     return J, H
+
+
+@wp.func
+def strain_gradient(g: TripletGeometry, sigma: vec5f, l0e: float, l0f: float) -> vec11f:
+    """``J^T sigma`` alone (no Hessians), written without component writes so Warp can differentiate it."""
+    k1 = g.strain[2]
+    k2 = g.strain[3]
+    kb = g.kb
+    tt = g.tt
+    De = (
+        sigma[0] / l0e * g.te
+        + sigma[2] * (-k1 * tt + wp.cross(g.tf, g.td2)) / g.ne
+        + sigma[3] * (-k2 * tt - wp.cross(g.tf, g.td1)) / g.ne
+        + sigma[4] * 0.5 * kb / g.ne
+    )
+    Df = (
+        sigma[1] / l0f * g.tf
+        + sigma[2] * (-k1 * tt - wp.cross(g.te, g.td2)) / g.nf
+        + sigma[3] * (-k2 * tt + wp.cross(g.te, g.td1)) / g.nf
+        + sigma[4] * 0.5 * kb / g.nf
+    )
+    dth_e = -0.5 * (sigma[2] * wp.dot(kb, g.m1e) + sigma[3] * wp.dot(kb, g.m2e)) - sigma[4]
+    dth_f = -0.5 * (sigma[2] * wp.dot(kb, g.m1f) + sigma[3] * wp.dot(kb, g.m2f)) + sigma[4]
+    return edge_gradient(De, Df, dth_e, dth_f)
 
 
 @wp.func

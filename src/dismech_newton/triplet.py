@@ -15,13 +15,14 @@ import numpy as np
 import warp as wp
 from newton import Model, State
 
-from .frames import reference_twist
+from .frames import node, reference_twist, scatter_dof, scatter_node
 from .linear import SymmetricCSR, csr_slot
 from .strains import (
     edge_direction,
     mat55f,
     rest_strain,
     strain_derivatives,
+    strain_gradient,
     triplet_geometry,
     unpack_conn,
     vec5f,
@@ -33,15 +34,10 @@ from .strains import (
 @wp.func
 def linear_energy(eps: vec5f, eps_prev: vec5f, rest: vec5f, p: vec10f, dt: float):
     """``E = 1/2 sum k_i (eps_i - rest_i)^2`` plus strain-rate viscosity ``c_i d eps_i / dt``."""
-    rate = (eps - eps_prev) / dt
-    sigma = vec5f()
-    C = mat55f()
-    for i in range(5):
-        k = p[i]
-        c = p[5 + i]
-        sigma[i] = k * (eps[i] - rest[i]) + c * rate[i]
-        C[i, i] = k + c / dt
-    return sigma, C
+    k = vec5f(p[0], p[1], p[2], p[3], p[4])
+    c = vec5f(p[5], p[6], p[7], p[8], p[9])
+    sigma = wp.cw_mul(k, eps - rest) + wp.cw_mul(c, eps - eps_prev) / dt
+    return sigma, wp.diag(k + c / dt)
 
 
 @wp.kernel
@@ -142,6 +138,51 @@ def make_assemble_kernel(energy):
     return assemble_kernel
 
 
+@cache
+def make_residual_kernel(energy):
+    """The gradient ``J^T sigma`` alone, on the flat DOF vector, differentiable with ``wp.Tape``
+    (for the step adjoint, :mod:`~dismech_newton.adjoint`)."""
+
+    @wp.kernel(module="unique")
+    def residual_kernel(
+        q: wp.array[float],
+        q_old: wp.array[float],
+        edge_d1_old: wp.array[wp.vec3],
+        triplet_ref_twist_old: wp.array[float],
+        triplet_conn: wp.array[vec5i],
+        edge_length: wp.array[float],
+        triplet_params: wp.array[vec10f],
+        triplet_rest: wp.array[wp.vec3],
+        strain_prev: wp.array[vec5f],
+        dt: float,
+        theta_dof_offset: int,
+        dof_fixed: wp.array[wp.int32],
+        # outputs
+        residual: wp.array[float],
+    ):
+        t = wp.tid()
+        e, f, n0, n1, n2 = unpack_conn(triplet_conn[t])
+        ie = theta_dof_offset + e
+        i_f = theta_dof_offset + f
+        l0e = edge_length[e]
+        l0f = edge_length[f]
+        geom = triplet_geometry(
+            node(q, n0), node(q, n1), node(q, n2), q[ie], q[i_f],
+            edge_d1_old[e], wp.normalize(node(q_old, n1) - node(q_old, n0)),
+            edge_d1_old[f], wp.normalize(node(q_old, n2) - node(q_old, n1)),
+            triplet_ref_twist_old[t], l0e, l0f,
+        )
+        sigma, C = energy(geom.strain, strain_prev[t], rest_strain(triplet_rest[t]), triplet_params[t], dt)
+        g = strain_gradient(geom, sigma, l0e, l0f)
+        scatter_node(residual, dof_fixed, n0, wp.vec3(g[0], g[1], g[2]))
+        scatter_node(residual, dof_fixed, n1, wp.vec3(g[4], g[5], g[6]))
+        scatter_node(residual, dof_fixed, n2, wp.vec3(g[8], g[9], g[10]))
+        scatter_dof(residual, dof_fixed, ie, g[3])
+        scatter_dof(residual, dof_fixed, i_f, g[7])
+
+    return residual_kernel
+
+
 class Triplets:
     """The model's triplets, bound for a solver.
 
@@ -169,7 +210,7 @@ class Triplets:
 
         self.strain_prev = wp.zeros(self.count, dtype=vec5f, device=self.device)
         rest = wp.zeros(self.count, dtype=vec5f, device=self.device)
-        self._measure(model.state(), rest)
+        self.measure(model.state(), rest)
         self.rest = wp.array(rest.numpy()[:, 2:], dtype=wp.vec3, device=self.device)  # [kappa1, kappa2, tau]
 
     def dofs(self) -> np.ndarray:
@@ -179,7 +220,7 @@ class Triplets:
         return np.column_stack([3 * n0, 3 * n0 + 1, 3 * n0 + 2, th + e, 3 * n1, 3 * n1 + 1, 3 * n1 + 2,
                                 th + f, 3 * n2, 3 * n2 + 1, 3 * n2 + 2])
 
-    def _measure(self, state: State, out: wp.array) -> None:
+    def measure(self, state: State, out: wp.array) -> None:
         s = state.dismech
         wp.launch(
             strain_kernel,
@@ -191,18 +232,23 @@ class Triplets:
 
     def begin_step(self, state_in: State) -> None:
         """Record the start-of-step strains."""
-        self._measure(state_in, self.strain_prev)
+        self.measure(state_in, self.strain_prev)
 
     def assemble(self, state_in: State, state_out: State, residual: wp.array, hessian: SymmetricCSR, dt: float):
         """Add the gradient and upper-triangle Hessian at ``state_out`` into ``residual`` and ``hessian``."""
-        s_in, s_out = state_in.dismech, state_out.dismech
+        s_in = state_in.dismech
+        self.assemble_at(state_out.particle_q, state_out.dismech.edge_q, state_in.particle_q, s_in.edge_d1_q,
+                         s_in.triplet_ref_twist_q, self.strain_prev, residual, hessian, dt)
+
+    def assemble_at(self, node_q, edge_q, node_q_old, edge_d1_old, ref_twist_old, strain_prev, residual: wp.array,
+                    hessian: SymmetricCSR, dt: float) -> None:
+        """:meth:`assemble` on explicit arrays: at ``(node_q, edge_q)``, frames from the step start."""
         wp.launch(
             self._kernel,
             dim=self.count,
             inputs=[
-                state_out.particle_q, state_in.particle_q, s_out.edge_q, s_in.edge_d1_q, s_in.triplet_ref_twist_q,
-                self.conn, self.der.edge_length, self.params, self.rest, self.strain_prev, dt, self.num_node_dofs,
-                self.dof_fixed,
+                node_q, node_q_old, edge_q, edge_d1_old, ref_twist_old, self.conn, self.der.edge_length,
+                self.params, self.rest, strain_prev, dt, self.num_node_dofs, self.dof_fixed,
             ],
             outputs=[residual, hessian.indptr, hessian.indices, hessian.vals],
             device=self.device,

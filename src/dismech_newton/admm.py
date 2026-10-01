@@ -27,9 +27,9 @@ from newton import Contacts, Model, State
 
 from .builder import add_colliding_rod
 from .contact import ContactTerm
-from .frames import fixed_node, flatten_state, node, scatter_dof, scatter_node
+from .frames import external_force, fixed_node, flatten_state, node, scatter_dof, scatter_node
 from .linear import BlockInverseSolver, CudssSolver, SymmetricCSR
-from .solver import DiSMechSolver, external_force
+from .solver import DiSMechSolver
 from .strains import (
     TripletGeometry,
     edge_direction,

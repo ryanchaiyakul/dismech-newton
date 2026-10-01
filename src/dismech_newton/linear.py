@@ -120,6 +120,10 @@ class CudssSolver:
         cudss.set_stream(self._handle, self.device.stream.cuda_stream)
         cudss.execute(self._handle, phase, self._config, self._data, self._A, self._xm, self._bm)
 
+    def invalidate(self) -> None:
+        """The values of ``A`` changed: the next solve refactorises (for ``refactorize=False``)."""
+        self._factored = False
+
     def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
         """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
         wp.launch(_convert, dim=self.A.n, inputs=[b], outputs=[self._b], device=self.device)

@@ -1,4 +1,4 @@
-# dismech-newton
+# DiSMech-Newton
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://opensource.org/license/gpl-3.0)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -25,10 +25,8 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
   <tr>
     <td>A cable between two clamps is counter-twisted until it buckles into a plectoneme, held open by self-contact.<br>
     <code>uv run examples/cable_plectoneme.py</code><br>
-    <sub>5.1× real time</sub></td>
     <td>A loose overhand knot is pulled tight with friction, matching <a href="https://doi.org/10.1103/PhysRevLett.99.164301">Audoly et al. (2007)</a> and <a href="https://doi.org/10.1103/PhysRevLett.115.118302">Jawed et al. (2015)</a>.<br>
     <code>uv run examples/overhand_knot.py</code><br>
-    <sub>0.59× real time</sub></td>
   </tr>
   <tr>
     <th>Flagella bundling</th>
@@ -41,14 +39,20 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
   <tr>
     <td>Ten helical flagella spin in a viscous fluid and bundle, after <a href="https://arxiv.org/abs/2205.10309">Tong et al. (2022)</a>.<br>
     <code>uv run examples/flagella.py --flagella 10</code><br>
-    <sub>0.21× real time</sub></td>
     <td>A clamped rod sags under gravity, next to Newton's VBD cable and the Euler-Bernoulli curve.<br>
     <code>uv run examples/cantilever.py</code><br>
-    <sub>2.0× real time (DER ADMM, implicit Euler)</sub></td>
+  </tr>
+  <tr>
+    <th colspan="2">Gradient Optimization</th>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/fit_stiffness.webp" alt="Fitting stiffness and damping by gradient" width="100%"></td>
+  </tr>
+  <tr>
+    <td colspan="2">L-BFGS fits a cantilever's bending stiffness and damping to an observed motion, with gradients through the solver. Each iteration (green) beside the truth (grey), with its path on the loss landscape.<br>
+    <code>uv run examples/fit_stiffness.py</code><br>
   </tr>
 </table>
-
-Speeds are simulated seconds per wall-clock second, headless, on an RTX 5070 Ti.
 
 ## Install
 

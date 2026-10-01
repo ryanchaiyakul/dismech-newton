@@ -1,6 +1,6 @@
 # dismech-newton
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://opensource.org/license/gpl-3.0)
 
 Discrete elastic rods for [Newton](https://github.com/newton-physics/newton): a Newton-Raphson solver
 (`DiSMechSolver`) and an ADMM solver with contact and friction (`ADMMDiSMechSolver`). Requires an NVIDIA GPU with CUDA 13.

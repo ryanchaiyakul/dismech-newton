@@ -1,26 +1,22 @@
 """Implicit discrete elastic rods: the theta method (implicit Euler to implicit midpoint), Newton-Raphson, cuDSS."""
 
+import warnings
+
 import warp as wp
 from newton import Contacts, Control, Model, State
 from newton.solvers import SolverBase
 
+from .adjoint import StepAdjoint, suspended_tape
 from .builder import add_rod, fix_segment, register_custom_attributes
 from .frames import (
     advance_frames_kernel,
     dof_constants,
+    external_force,
     flatten_state,
     pose_proxies_kernel,
 )
 from .linear import CudssSolver, SymmetricCSR
 from .triplet import Triplets, linear_energy
-
-
-@wp.func
-def external_force(i: int, mass: wp.array[float], gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3]) -> float:
-    """``m g + particle_f`` on node DOF ``i = 3 * node + k``."""
-    n = i // 3
-    k = i - 3 * n
-    return mass[i] * gravity[0][k] + particle_f[n][k]
 
 
 @wp.kernel
@@ -170,6 +166,8 @@ class DiSMechSolver(SolverBase):
         self._no_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self._no_velocity = wp.zeros(0, dtype=wp.spatial_vector, device=self.device)
         self._has_proxies = bool((self.der.edge_body.numpy() >= 0).any())
+        self._adjoint = None  # StepAdjoint, built on the first vjp
+        self._warned_contacts = False
         self._build_system()
 
     def _build_system(self) -> None:
@@ -181,7 +179,37 @@ class DiSMechSolver(SolverBase):
         self._linear = CudssSolver(self.hessian)
 
     def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
+        """Advance ``state_in`` by ``dt`` into ``state_out``.
+
+        Under an active ``wp.Tape`` the iterations are not recorded: the step goes on the tape as
+        its implicit-function adjoint (:meth:`vjp`), when ``state_out`` has gradients.
+        """
         dt = float(dt)
+        with suspended_tape() as tape:
+            self._step(state_in, state_out, contacts, dt)
+        if tape is not None:
+            self._record(tape, state_in, state_out, contacts, dt)
+
+    def vjp(self, state_in: State, state_out: State, dt: float) -> None:
+        """Backpropagate the step ``state_in -> state_out`` (see :class:`~dismech_newton.adjoint.StepAdjoint`):
+        from the ``.grad`` arrays of ``state_out`` into those of ``state_in`` and ``model.dismech.triplet_params``."""
+        if self._adjoint is None:
+            self._adjoint = StepAdjoint(self)
+        self._adjoint.vjp(state_in, state_out, float(dt))
+
+    def _record(self, tape: wp.Tape, state_in: State, state_out: State, contacts: Contacts | None, dt: float):
+        s_in, s_out = state_in.dismech, state_out.dismech
+        outputs = (s_out.q, s_out.qd, s_out.edge_d1_q, s_out.triplet_ref_twist_q)
+        if not any(a.requires_grad for a in outputs):
+            return
+        if contacts is not None and not self._warned_contacts:
+            warnings.warn("the step gradient does not differentiate contact forces yet", stacklevel=3)
+            self._warned_contacts = True
+        inputs = (s_in.q, s_in.qd, s_in.edge_d1_q, s_in.triplet_ref_twist_q, state_in.particle_f, self.triplets.params)
+        arrays = [a for a in (*inputs, *outputs) if a is not None and a.requires_grad]
+        tape.record_func(lambda: self.vjp(state_in, state_out, dt), arrays)
+
+    def _step(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float):
         flatten_state(state_in)
         flatten_state(state_out)
         q_in, q = state_in.dismech.q, state_out.dismech.q

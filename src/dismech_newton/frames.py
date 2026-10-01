@@ -35,15 +35,17 @@ def flatten_state(state: State) -> None:
     """Make ``state`` own the flat vectors ``dismech.q`` / ``dismech.qd`` (idempotent).
 
     ``particle_q``, ``edge_q``, ``particle_qd`` and ``edge_qd`` become views into them. Call it
-    before any CUDA graph capture; the solver does so on the first step.
+    before any CUDA graph capture; the solver does so on the first step. A state made with
+    ``requires_grad`` keeps it: the views share the flat vectors' gradients.
     """
     ns = state.dismech
     if getattr(ns, "q", None) is not None:
         return
     n = state.particle_q.shape[0]
     nd = 3 * n
+    grad = state.particle_q.requires_grad
     for flat_name, node_name, edge_name in (("q", "particle_q", "edge_q"), ("qd", "particle_qd", "edge_qd")):
-        flat = wp.zeros(nd + ns.edge_q.shape[0], dtype=float, device=state.particle_q.device)
+        flat = wp.zeros(nd + ns.edge_q.shape[0], dtype=float, device=state.particle_q.device, requires_grad=grad)
         nodes = flat[:nd].reshape((n, 3)).view(wp.vec3)
         edges = flat[nd:]
         nodes.assign(getattr(state, node_name))
@@ -82,6 +84,14 @@ def scatter_dof(rhs: wp.array[float], fixed: wp.array[wp.int32], i: int, v: floa
     """``rhs[i] += v`` unless DOF ``i`` is fixed."""
     if fixed[i] == 0:
         wp.atomic_add(rhs, i, v)
+
+
+@wp.func
+def external_force(i: int, mass: wp.array[float], gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3]) -> float:
+    """``m g + particle_f`` on node DOF ``i = 3 * node + k``."""
+    n = i // 3
+    k = i - 3 * n
+    return mass[i] * gravity[0][k] + particle_f[n][k]
 
 
 # -- frame math ---------------------------------------------------------------------------

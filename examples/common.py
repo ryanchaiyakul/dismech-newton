@@ -1,5 +1,7 @@
 """Helpers shared by the examples."""
 
+from functools import cache
+
 import newton
 import numpy as np
 import warp as wp
@@ -11,6 +13,19 @@ from dismech_newton import flatten_state
 def smoothstep(t: float, t0: float, t1: float) -> float:
     s = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
     return s * s * (3.0 - 2.0 * s)
+
+
+@cache
+def font(size: int):
+    """A TrueType font of ``size`` px for the image panels (Pillow's default if none is found)."""
+    from PIL import ImageFont  # noqa: PLC0415
+
+    for name in ("segoeui.ttf", "Arial.ttf", "arial.ttf", "DejaVuSans.ttf", "Helvetica.ttc"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
 
 
 def segment_dofs(model, body: int, twist_only: bool = False) -> list[int]:
@@ -140,7 +155,8 @@ class CableExample:
         flatten_state(self.state_0)
         flatten_state(self.state_1)
         self.graph = None
-        viewer.set_model(model)
+        if viewer is not None:  # None: a simulation another example draws
+            viewer.set_model(model)
 
     def drive(self, t0: float, t1: float) -> None:
         """Set the drives for the frame from ``t0`` to ``t1`` (host)."""

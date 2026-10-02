@@ -17,6 +17,8 @@ try:
 except ImportError:
     cudss = None
 
+_CUDA_R_64F, _CUDA_R_32I = 1, 10  # cudaDataType codes
+
 
 class SymmetricCSR:
     """Upper-triangle CSR of a symmetric ``n x n`` float64 matrix.
@@ -59,39 +61,32 @@ class SymmetricCSR:
         return self.vals.shape[0]
 
 
-@wp.func
-def csr_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], row: int, col: int) -> int:
-    """Index into the CSR values of ``(row, col)``, which must be in the pattern."""
-    lo = indptr[row]
-    hi = indptr[row + 1] - 1
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if indices[mid] < col:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
+class GeneralCSR:
+    """CSR of a general (non-symmetric) ``n x n`` float64 matrix, both triangles."""
 
+    def __init__(self, A: sp.spmatrix, device) -> None:
+        A = sp.csr_matrix(A)
+        A.sum_duplicates()
+        A.sort_indices()
+        self.n = A.shape[0]
+        self.indptr = wp.array(A.indptr.astype(np.int32), dtype=wp.int32, device=device)
+        self.indices = wp.array(A.indices.astype(np.int32), dtype=wp.int32, device=device)
+        self.vals = wp.array(A.data.astype(np.float64), dtype=wp.float64, device=device)
 
-# -- cuDSS --------------------------------------------------------------------------------
-
-_CUDA_R_64F, _CUDA_R_32I = 1, 10  # cudaDataType codes
-
-
-@wp.kernel
-def _convert(src: wp.array[Any], dst: wp.array[Any]):
-    i = wp.tid()
-    dst[i] = type(dst[i])(src[i])
+    @property
+    def nnz(self) -> int:
+        return self.vals.shape[0]
 
 
 class CudssSolver:
-    """``A x = b`` by LDL^T of ``A``'s upper triangle with cuDSS, on Warp's arrays and stream.
+    """``A x = b`` by LDL^T of ``A``'s upper triangle (LU for a :class:`GeneralCSR`) with cuDSS, on
+    Warp's arrays and stream.
 
     The first solve runs the analysis. With ``refactorize`` every solve refactorises (the values of
     ``A`` change between solves); without, ``A`` is factorised once and solves are triangular only.
     """
 
-    def __init__(self, A: SymmetricCSR, refactorize: bool = True) -> None:
+    def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True) -> None:
         if cudss is None:
             raise ImportError("CudssSolver requires nvmath (install the 'gpu' extra)")
         self.A = A
@@ -107,9 +102,13 @@ class CudssSolver:
         self._handle = cudss.create()
         self._config = cudss.config_create()
         self._data = cudss.data_create(self._handle)
+        if isinstance(A, GeneralCSR):
+            kind = cudss.MatrixType.GENERAL, cudss.MatrixViewType.FULL
+        else:
+            kind = cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
         self._A = cudss.matrix_create_csr(
             A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, A.vals.ptr, _CUDA_R_32I, _CUDA_R_32I, _CUDA_R_64F,
-            cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER, cudss.IndexBase.ZERO,
+            *kind, cudss.IndexBase.ZERO,
         )
         self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
         self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
@@ -137,46 +136,6 @@ class CudssSolver:
         wp.launch(_convert, dim=self.A.n, inputs=[self._x], outputs=[x], device=self.device)
         if reset is not None:
             wp.copy(*reset)
-
-
-def _destroy(handle, config, data, matrices) -> None:
-    for m in matrices:
-        cudss.matrix_destroy(m)
-    cudss.data_destroy(handle, data)
-    cudss.config_destroy(config)
-    cudss.destroy(handle)
-
-
-# -- dense block inverse ------------------------------------------------------------------
-
-
-@wp.kernel
-def _block_inverse_kernel(
-    perm: wp.array[wp.int32],
-    slot_block: wp.array[wp.int32],
-    block_start: wp.array[wp.int32],
-    block_size: wp.array[wp.int32],
-    block_offset: wp.array[wp.int32],
-    inv: wp.array[float],
-    b: wp.array[float],
-    reset_src: wp.array[float],
-    # outputs
-    x: wp.array[float],
-    reset_dst: wp.array[float],
-):
-    """``x = A^{-1} b``, one thread per DOF in block order; also ``reset_dst = reset_src`` if given."""
-    p = wp.tid()
-    k = slot_block[p]
-    s = block_start[k]
-    n = block_size[k]
-    col = block_offset[k] + p - s  # the inverse is symmetric: column p - s of the block
-    acc = float(0.0)
-    for j in range(n):
-        acc += inv[col + j * n] * b[perm[s + j]]
-    i = perm[p]
-    x[i] = acc
-    if reset_dst.shape[0] > 0:
-        reset_dst[i] = reset_src[i]
 
 
 class BlockInverseSolver:
@@ -236,3 +195,57 @@ class BlockInverseSolver:
             outputs=[x, dst],
             device=self.device,
         )
+
+
+def _destroy(handle, config, data, matrices) -> None:
+    for m in matrices:
+        cudss.matrix_destroy(m)
+    cudss.data_destroy(handle, data)
+    cudss.config_destroy(config)
+    cudss.destroy(handle)
+
+
+# -- kernels ------------------------------------------------------------------------------
+
+
+@wp.func
+def csr_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], row: int, col: int) -> int:
+    """Index into the CSR values of ``(row, col)``, which must be in the pattern."""
+    lo = indptr[row]
+    hi = indptr[row + 1] - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if indices[mid] < col:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+@wp.kernel
+def _convert(src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    dst[i] = type(dst[i])(src[i])
+
+
+@wp.kernel
+def _block_inverse_kernel(
+    perm: wp.array[wp.int32], slot_block: wp.array[wp.int32], block_start: wp.array[wp.int32],
+    block_size: wp.array[wp.int32], block_offset: wp.array[wp.int32], inv: wp.array[float], b: wp.array[float],
+    reset_src: wp.array[float],
+    # outputs
+    x: wp.array[float], reset_dst: wp.array[float],
+):
+    """``x = A^{-1} b``, one thread per DOF in block order; also ``reset_dst = reset_src`` if given."""
+    p = wp.tid()
+    k = slot_block[p]
+    s = block_start[k]
+    n = block_size[k]
+    col = block_offset[k] + p - s  # the inverse is symmetric: column p - s of the block
+    acc = float(0.0)
+    for j in range(n):
+        acc += inv[col + j * n] * b[perm[s + j]]
+    i = perm[p]
+    x[i] = acc
+    if reset_dst.shape[0] > 0:
+        reset_dst[i] = reset_src[i]

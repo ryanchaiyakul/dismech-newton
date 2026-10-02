@@ -11,7 +11,7 @@ twist angle.
 
 import numpy as np
 import warp as wp
-from newton import Model, ParticleFlags, State
+from newton import JointType, Model, ParticleFlags, State
 
 # -- flat DOF vector ----------------------------------------------------------------------
 
@@ -29,6 +29,22 @@ def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
         wp.array(mass.astype(np.float32), dtype=float, device=model.device),
         wp.array(fixed, dtype=wp.int32, device=model.device),
     )
+
+
+def proxy_joints(model: Model) -> np.ndarray:
+    """Per edge, the ``(joint_q, joint_qd)`` starts of its proxy's free root joint (``-1`` without one)."""
+    out = np.full((model.dismech.edge_body.shape[0], 2), -1, dtype=np.int32)
+    if not model.joint_count:
+        return out
+    free = (model.joint_type.numpy() == int(JointType.FREE)) & (model.joint_parent.numpy() < 0)
+    joint_of = np.full(max(model.body_count, 1), -1)
+    joint_of[model.joint_child.numpy()[free]] = np.nonzero(free)[0]
+    edge_body = model.dismech.edge_body.numpy()
+    j = np.where(edge_body >= 0, joint_of[np.maximum(edge_body, 0)], -1)
+    has = j >= 0
+    out[has, 0] = model.joint_q_start.numpy()[j[has]]
+    out[has, 1] = model.joint_qd_start.numpy()[j[has]]
+    return out
 
 
 def flatten_state(state: State) -> None:
@@ -150,11 +166,8 @@ def reference_twist(d1e: wp.vec3, te: wp.vec3, d1f: wp.vec3, tf: wp.vec3, ref_tw
 
 @wp.kernel
 def advance_frames_kernel(
-    node_q_prev: wp.array[wp.vec3],
-    node_q: wp.array[wp.vec3],
-    edge_node0: wp.array[wp.int32],
-    edge_node1: wp.array[wp.int32],
-    edge_d1_prev: wp.array[wp.vec3],
+    node_q_prev: wp.array[wp.vec3], node_q: wp.array[wp.vec3], edge_node0: wp.array[wp.int32],
+    edge_node1: wp.array[wp.int32], edge_d1_prev: wp.array[wp.vec3],
     # outputs
     edge_d1: wp.array[wp.vec3],
 ):
@@ -168,20 +181,16 @@ def advance_frames_kernel(
 
 @wp.kernel
 def pose_proxies_kernel(
-    node_q: wp.array[wp.vec3],
-    node_qd: wp.array[wp.vec3],
-    edge_q: wp.array[float],
-    edge_d1: wp.array[wp.vec3],
-    edge_node0: wp.array[wp.int32],
-    edge_node1: wp.array[wp.int32],
-    edge_body: wp.array[wp.int32],
-    set_velocity: int,
+    node_q: wp.array[wp.vec3], node_qd: wp.array[wp.vec3], edge_q: wp.array[float], edge_d1: wp.array[wp.vec3],
+    edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32], edge_body: wp.array[wp.int32],
+    edge_joint: wp.array[wp.vec2i], set_velocity: int,
     # outputs
-    body_q: wp.array[wp.transform],
-    body_qd: wp.array[wp.spatial_vector],
+    body_q: wp.array[wp.transform], body_qd: wp.array[wp.spatial_vector], joint_q: wp.array[float],
+    joint_qd: wp.array[float],
 ):
     """Pose every proxy (origin at the edge midpoint, +Z along the tangent, +X along ``m1``) and,
-    with ``set_velocity``, set its rigid velocity (midpoint velocity, edge rotation rate)."""
+    with ``set_velocity``, set its rigid velocity (midpoint velocity, edge rotation rate). Given
+    ``joint_q``, a proxy's free root joint (``edge_joint`` starts, ``-1`` without) gets the same."""
     e = wp.tid()
     body = edge_body[e]
     if body < 0:
@@ -197,9 +206,17 @@ def pose_proxies_kernel(
         m1[1], m2[1], t[1],
         m1[2], m2[2], t[2],
     )
-    body_q[body] = wp.transform(0.5 * (x0 + x1), wp.quat_from_matrix(R))
+    X = wp.transform(0.5 * (x0 + x1), wp.quat_from_matrix(R))
+    body_q[body] = X
+    v0 = node_qd[n0]
+    v1 = node_qd[n1]
+    d = x1 - x0
+    twist = wp.spatial_vector(0.5 * (v0 + v1), wp.cross(d, v1 - v0) / wp.dot(d, d))
     if set_velocity != 0:
-        v0 = node_qd[n0]
-        v1 = node_qd[n1]
-        d = x1 - x0
-        body_qd[body] = wp.spatial_vector(0.5 * (v0 + v1), wp.cross(d, v1 - v0) / wp.dot(d, d))
+        body_qd[body] = twist
+    j = edge_joint[e]
+    if joint_q.shape[0] > 0 and j[0] >= 0:  # a free root joint: joint_q = body_q, joint_qd = body_qd
+        for k in range(7):
+            joint_q[j[0] + k] = X[k]
+        for k in range(6):
+            joint_qd[j[1] + k] = twist[k]

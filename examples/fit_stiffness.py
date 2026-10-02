@@ -21,7 +21,8 @@ import newton.examples
 import numpy as np
 import scipy.ndimage
 import warp as wp
-from PIL import Image, ImageDraw, ImageFont
+from common import font
+from PIL import Image, ImageDraw
 from scipy.optimize import minimize
 
 from dismech_newton import ADMMDiSMechSolver as Solver
@@ -159,15 +160,6 @@ _VIRIDIS = np.array([(68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), 
 _TEXT = (220, 220, 220)
 
 
-def _font(size: int):
-    for name in ("segoeui.ttf", "Arial.ttf", "arial.ttf", "DejaVuSans.ttf", "Helvetica.ttc"):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            pass
-    return ImageFont.load_default()
-
-
 class LandscapePlot:
     """The loss landscape as an image: banded log loss, downhill arrows, the true parameters (cross)
     and the optimiser's path (red start, green current)."""
@@ -183,7 +175,7 @@ class LandscapePlot:
         self.base = Image.new("RGB", (s + 2 * m, s + 2 * m), (24, 24, 28))
         self.base.paste(Image.fromarray(rgb.astype(np.uint8)), (m, m))
         draw = ImageDraw.Draw(self.base)
-        font = _font(13)
+        f13 = font(13)
         log_k, log_c = np.log(np.geomspace(*K_RANGE, GRID)), np.log(np.geomspace(*C_RANGE, GRID))
         for j in range(1, GRID, 3):
             for i in range(1, GRID, 3):
@@ -191,12 +183,12 @@ class LandscapePlot:
                 p = np.array(self.to_px(log_k[i], log_c[j]))
                 self._arrow(draw, p, p + 13 * np.array([d[0], -d[1]]))
         for k in (1, 2, 5, 10):
-            draw.text((self.to_px(np.log(k), 0)[0], s + m + 6), f"{k:g}", fill=_TEXT, font=font, anchor="mt")
+            draw.text((self.to_px(np.log(k), 0)[0], s + m + 6), f"{k:g}", fill=_TEXT, font=f13, anchor="mt")
         for c in (0.01, 0.03, 0.1, 0.3):
-            draw.text((m - 6, self.to_px(0, np.log(c))[1]), f"{c:g}", fill=_TEXT, font=font, anchor="rm")
-        draw.text((m + s / 2, s + m + 26), "bend stiffness", fill=_TEXT, font=font, anchor="mt")
-        draw.text((m + s / 2, m / 2), "loss over (stiffness, damping)", fill=_TEXT, font=_font(15), anchor="mm")
-        draw.text((8, m - 14), "damping", fill=_TEXT, font=font, anchor="lm")
+            draw.text((m - 6, self.to_px(0, np.log(c))[1]), f"{c:g}", fill=_TEXT, font=f13, anchor="rm")
+        draw.text((m + s / 2, s + m + 26), "bend stiffness", fill=_TEXT, font=f13, anchor="mt")
+        draw.text((m + s / 2, m / 2), "loss over (stiffness, damping)", fill=_TEXT, font=font(15), anchor="mm")
+        draw.text((8, m - 14), "damping", fill=_TEXT, font=f13, anchor="lm")
         x, y = self.to_px(*np.log(TRUE))
         draw.line([(x - 7, y - 7), (x + 7, y + 7)], fill=(255, 255, 255), width=3)
         draw.line([(x - 7, y + 7), (x + 7, y - 7)], fill=(255, 255, 255), width=3)
@@ -229,9 +221,9 @@ class LandscapePlot:
         img = Image.new("RGB", (plot.width, plot.height + len(banner) * line + 16), (24, 24, 28))
         img.paste(plot, (0, img.height - plot.height))
         draw = ImageDraw.Draw(img)
-        font = _font(18)
+        f18 = font(18)
         for i, (text, color) in enumerate(banner):
-            draw.text((self.margin, 12 + i * line), text, fill=color, font=font)
+            draw.text((self.margin, 12 + i * line), text, fill=color, font=f18)
         return np.asarray(img)
 
 

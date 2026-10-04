@@ -1,47 +1,32 @@
-"""Implicit discrete elastic rods: the theta method (implicit Euler to implicit midpoint), Newton-Raphson, cuDSS."""
+"""Implicit discrete elastic rods: the theta method, Newton-Raphson, a sparse direct solve."""
 
+from contextlib import contextmanager
+
+import numpy as np
 import warp as wp
-from newton import Contacts, Control, Model, State
+from newton import Contacts, Control, JointType, Model, State
 from newton.solvers import SolverBase
 
-from .adjoint import StepAdjoint, suspended_tape
 from .builder import add_rod, fix_segment, register_custom_attributes
 from .contact import ContactSnapshot
-from .frames import (
-    advance_frames_kernel,
-    dof_constants,
-    external_force,
-    flatten_state,
-    pose_proxies_kernel,
-    proxy_joints,
-)
-from .linear import CudssSolver, SymmetricCSR
+from .dofs import dof_constants, external_force, flatten_state
+from .linear import sparse_solver
+from .sparse import SymmetricCSR
+from .strains import material_frame, parallel_transport
 from .triplet import Triplets, linear_energy
 
 
 class DiSMechSolver(SolverBase):
     """Implicit discrete elastic rods, solved with Newton-Raphson.
 
-    Each step solves ``M (q - q_n - dt v_n) / dt^2 + dE/dq(q) - f_ext = 0`` for the node positions
-    and edge twist angles, iterating in ``state_out``. More generally it solves that for a step
-    ``theta dt``, which gives ``q_theta = (1 - theta) q_n + theta q_{n+1}`` of the (one-leg) theta method,
-    and extrapolates to ``q_{n+1}``. ``theta = 1`` is implicit Euler (first order, damps every mode);
-    ``theta = 1/2`` is implicit midpoint (second order, symplectic, no numerical damping), and a little
-    above 1/2 damps mostly the stiff, high-frequency modes. External force is ``m * model.gravity`` plus
-    ``state_in.particle_f``. Contacts and controls are ignored (see the ADMM subclass). Fixed DOFs
-    (:func:`fix_segment`) are prescribed by writing ``state_in.dismech.q``. States are flattened on
-    first use. Subclasses replace :meth:`_build_system` and :meth:`_solve`.
+    Fixed DOFs are prescribed through ``state_in.dismech.q``; contacts and controls are ignored. The linear
+    solves use cuDSS on CUDA (graph-capturable; the 'gpu' extra) and SciPy on the CPU.
 
     Args:
-        model: Model built with :meth:`add_rod`; must be on a CUDA device.
-        energy: Triplet energy (see :mod:`dismech_newton.triplet`).
-        newton_iterations: Maximum Newton-Raphson iterations per step.
-        newton_tol: Stop when ``max |dq| / (1 + |q|) < newton_tol``; ``0`` always runs
-            ``newton_iterations``. The test runs on the device (``wp.capture_while``).
-        pose_proxies: Pose the capsule proxies (and set their velocities) at the end of every step;
-            otherwise call :meth:`update_proxies` when needed.
-        theta: Where in the step the forces are evaluated, in ``[1/2, 1]``: ``1`` implicit Euler,
-            ``1/2`` implicit midpoint.
+        newton_iterations: Maximum Newton iterations per step.
+        newton_tol: Stop at ``max |dq| / (1 + |q|) < newton_tol``; ``0`` runs ``newton_iterations``.
+        pose_proxies: Pose the capsule proxies every step (else call :meth:`update_proxies`).
+        theta: In ``[1/2, 1]``: ``1`` implicit Euler, ``1/2`` implicit midpoint.
     """
 
     register_custom_attributes = staticmethod(register_custom_attributes)
@@ -56,8 +41,6 @@ class DiSMechSolver(SolverBase):
         if not 0.5 <= theta <= 1.0:
             raise ValueError(f"theta must be in [1/2, 1], got {theta}")
         self.theta = float(theta)
-        if not wp.get_device(model.device).is_cuda:
-            raise ValueError(f"{type(self).__name__} runs on CUDA")
         self.newton_iterations = newton_iterations
         self.newton_tol = newton_tol
         self.pose_proxies = pose_proxies
@@ -80,19 +63,15 @@ class DiSMechSolver(SolverBase):
         self._build_system()
 
     def _build_system(self) -> None:
-        """Residual, upper-triangle CSR Hessian and its solver."""
+        """Residual, CSR Hessian and its solver."""
         self.hessian = SymmetricCSR(self.num_dofs, self.triplets.dofs(), self.device)
         self.residual = wp.zeros(self.num_dofs, dtype=float, device=self.device)
         self.dx = wp.zeros(self.num_dofs, dtype=float, device=self.device)
         self._err = wp.zeros(1, dtype=float, device=self.device)
-        self._linear = CudssSolver(self.hessian)
+        self._linear = sparse_solver(self.hessian)
 
     def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
-        """Advance ``state_in`` by ``dt`` into ``state_out``.
-
-        Under an active ``wp.Tape`` the iterations are not recorded: the step goes on the tape as
-        its implicit-function adjoint (:meth:`vjp`), when ``state_out`` has gradients.
-        """
+        """Advance ``state_in`` by ``dt``; under a ``wp.Tape`` the step is recorded as its adjoint (:meth:`vjp`)."""
         dt = float(dt)
         with suspended_tape() as tape:
             self._step(state_in, state_out, contacts, dt)
@@ -100,27 +79,32 @@ class DiSMechSolver(SolverBase):
                 self._record(tape, state_in, state_out, dt)
 
     def refresh_mass(self) -> None:
-        """Re-read ``model.particle_mass`` and ``model.dismech.edge_inertia`` after they changed."""
+        """Re-read the masses and twist inertias after they changed."""
         self.mass.assign(dof_constants(self.model)[0])
 
     def vjp(self, state_in: State, state_out: State, dt: float, contacts: ContactSnapshot | None = None) -> None:
-        """Backpropagate the step ``state_in -> state_out`` (:mod:`~dismech_newton.adjoint`) from
-        ``state_out``'s ``.grad`` arrays; ``contacts`` from :meth:`contact_snapshot`, right after the step."""
+        """Backpropagate the step from ``state_out``'s ``.grad``; ``contacts`` from :meth:`contact_snapshot`.
+
+        Gradients reach ``state_in`` and, where ``requires_grad``, ``triplet_params``, ``triplets.rest``,
+        ``edge_length``, ``particle_mass``, ``edge_inertia`` and ``contact.friction``."""
         if self._adjoint is None:
+            from .adjoint import StepAdjoint  # imports this module's step kernels
+
             self._adjoint = StepAdjoint(self)
         self._adjoint.vjp(state_in, state_out, float(dt), contacts)
 
     def contact_snapshot(self) -> ContactSnapshot | None:
-        """The last step's contacts, for :meth:`vjp`; this solver has none."""
+        """The last step's contacts for :meth:`vjp` (none here)."""
         return None
 
     def _record(self, tape: wp.Tape, state_in: State, state_out: State, dt: float):
         s_in, s_out = state_in.dismech, state_out.dismech
-        outputs = (s_out.q, s_out.qd, s_out.edge_d1_q, s_out.triplet_ref_twist_q)
+        outputs = (s_out.q, s_out.qd, s_out.edge_d1_q, s_out.triplet_ref_twist_q, s_out.triplet_strain_q)
         if not any(a.requires_grad for a in outputs):
             return
         contacts = self.contact_snapshot()
-        inputs = (s_in.q, s_in.qd, s_in.edge_d1_q, s_in.triplet_ref_twist_q, state_in.particle_f, self.triplets.params,
+        inputs = (s_in.q, s_in.qd, s_in.edge_d1_q, s_in.triplet_ref_twist_q, s_in.triplet_strain_q,
+                  state_in.particle_f, self.triplets.params,
                   self.triplets.rest, self.der.edge_length, self.model.particle_mass, self.der.edge_inertia,
                   contacts and contacts.friction)
         arrays = [a for a in (*inputs, *outputs) if a is not None and a.requires_grad]
@@ -133,12 +117,12 @@ class DiSMechSolver(SolverBase):
         h = self.theta * dt  # the implicit Euler step solved
         self.alpha = 1.0 / (h * h)
         self.triplets.begin_step(state_in)
-        wp.launch(_predict_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, h],
+        wp.launch(predict_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, h],
                   outputs=[self.q_pred, q], device=self.device)
 
         self._solve(state_in, state_out, contacts, h)
 
-        wp.launch(_theta_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, self.theta, dt],
+        wp.launch(theta_kernel, dim=self.num_dofs, inputs=[self.fixed, q_in, state_in.dismech.qd, q, self.theta, dt],
                   outputs=[q, state_out.dismech.qd], device=self.device)
         wp.launch(
             advance_frames_kernel,
@@ -153,7 +137,7 @@ class DiSMechSolver(SolverBase):
             self.update_proxies(state_out)
 
     def _solve(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> None:
-        """Newton-Raphson on ``state_out.dismech.q``, starting from the initial guess."""
+        """Newton-Raphson on ``state_out.dismech.q``."""
         self._iterate(self._newton_iteration, self.newton_iterations, 1, self.newton_tol, self._err,
                       state_in=state_in, state_out=state_out, dt=dt)
 
@@ -161,9 +145,9 @@ class DiSMechSolver(SolverBase):
         q = state_out.dismech.q
         self.residual.zero_()
         self.hessian.vals.zero_()
-        self.triplets.assemble(state_in, state_out, self.residual, self.hessian, dt)
+        self.triplets.assemble(q, state_in, self.triplets.strain_prev, self.residual, self.hessian, dt)
         wp.launch(
-            _inertia_kernel,
+            inertia_kernel,
             dim=self.num_dofs,
             inputs=[q, self.q_pred, self.mass, self.alpha, self.fixed, self.model.gravity,
                     self._particle_f(state_in), self.num_node_dofs],
@@ -176,8 +160,7 @@ class DiSMechSolver(SolverBase):
                   device=self.device)
 
     def _iterate(self, block, max_iterations: int, block_size: int, tol: float, err: wp.array, **kwargs) -> None:
-        """Run ``block(**kwargs)`` (``block_size`` iterations) until ``err < tol`` or ``max_iterations``,
-        testing on the device, so the loop can be graph-captured; ``tol = 0`` runs a fixed count."""
+        """Run ``block`` until ``err < tol`` or ``max_iterations``, tested on the device (graph-capturable)."""
         if tol <= 0.0:
             for _ in range(-(-max_iterations // block_size)):
                 block(**kwargs)
@@ -194,6 +177,11 @@ class DiSMechSolver(SolverBase):
         wp.capture_while(self._go, body, **kwargs)
 
     @property
+    def graph_capturable(self) -> bool:
+        """Whether :meth:`step` can be captured in a CUDA graph (decided by the first step for ADMM)."""
+        return self.device.is_cuda and (self._linear is None or self._linear.graph_capturable)
+
+    @property
     def last_iterations(self) -> int:
         """Iterations of the last step (a device read)."""
         return int(self._count.numpy()[0])
@@ -202,7 +190,7 @@ class DiSMechSolver(SolverBase):
         return state.particle_f if state.particle_f is not None else self._no_force
 
     def update_proxies(self, state: State) -> None:
-        """Pose the capsule proxies and set their velocities, in ``body_q``/``body_qd`` and their free joints."""
+        """Pose the capsule proxies and set their velocities (and their free joints)."""
         if not self._has_proxies or state.body_q is None:
             return
         body_qd = state.body_qd if state.body_qd is not None else self._no_velocity
@@ -219,57 +207,39 @@ class DiSMechSolver(SolverBase):
         )
 
 
+def active_tape() -> wp.Tape | None:
+    """The ``wp.Tape`` recording now, if any (a Warp private, as warp.fem reads it)."""
+    return wp._src.context.runtime.tape
+
+
+@contextmanager
+def suspended_tape():
+    """Pause the active ``wp.Tape`` (if any) inside the block; yields it."""
+    runtime = wp._src.context.runtime  # kernels that must not be recorded
+    tape, runtime.tape = runtime.tape, None
+    try:
+        yield tape
+    finally:
+        runtime.tape = tape
+
+
+def proxy_joints(model: Model) -> np.ndarray:
+    """Per edge, the ``(joint_q, joint_qd)`` starts of its proxy's free root joint, ``-1`` without."""
+    out = np.full((model.dismech.edge_body.shape[0], 2), -1, dtype=np.int32)
+    if not model.joint_count:
+        return out
+    free = (model.joint_type.numpy() == int(JointType.FREE)) & (model.joint_parent.numpy() < 0)
+    joint_of = np.full(max(model.body_count, 1), -1)
+    joint_of[model.joint_child.numpy()[free]] = np.nonzero(free)[0]
+    edge_body = model.dismech.edge_body.numpy()
+    j = np.where(edge_body >= 0, joint_of[np.maximum(edge_body, 0)], -1)
+    has = j >= 0
+    out[has, 0] = model.joint_q_start.numpy()[j[has]]
+    out[has, 1] = model.joint_qd_start.numpy()[j[has]]
+    return out
+
+
 # -- kernels ------------------------------------------------------------------------------
-
-
-@wp.kernel
-def _predict_kernel(
-    fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], dt: float,
-    q_pred: wp.array[float], q: wp.array[float],
-):
-    """``q_pred = q0 + dt v0``, the initial guess; fixed DOFs keep their prescribed ``q0``."""
-    i = wp.tid()
-    q_pred[i] = q0[i] + dt * v0[i]
-    if fixed[i] != 0:
-        q[i] = q0[i]
-    else:
-        q[i] = q_pred[i]
-
-
-@wp.kernel
-def _theta_kernel(fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], theta: float, dt: float,
-                  q: wp.array[float], v: wp.array[float]):
-    """From ``q_theta`` (an implicit Euler step ``h = theta dt``): ``q = q0 + (q_theta - q0) / theta`` and
-    ``v = v0 + (q_theta - q0 - h v0) / (theta^2 dt)``; ``theta = 1`` is implicit Euler itself."""
-    i = wp.tid()
-    if fixed[i] != 0:
-        v[i] = 0.0
-        return
-    d = q[i] - q0[i]
-    q[i] = q0[i] + d / theta
-    v[i] = v0[i] + (d - theta * dt * v0[i]) / (theta * theta * dt)
-
-
-@wp.kernel
-def _inertia_kernel(
-    q: wp.array[float], q_pred: wp.array[float], mass: wp.array[float], alpha: float, fixed: wp.array[wp.int32],
-    gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3], num_node_dofs: int,
-    # outputs
-    residual: wp.array[float], hess_indptr: wp.array[wp.int32], hess_vals: wp.array[wp.float64],
-):
-    """Inertia ``M alpha (q - q_pred)`` minus external force; Dirichlet rows get a zero residual and a unit diagonal."""
-    i = wp.tid()
-    slot = hess_indptr[i]  # the diagonal leads each row
-    if fixed[i] != 0:
-        residual[i] = 0.0
-        hess_vals[slot] = wp.float64(1.0)
-        return
-    r = residual[i]
-    if i < num_node_dofs:
-        r = r - external_force(i, mass, gravity, particle_f)
-    k = mass[i] * alpha
-    residual[i] = r + k * (q[i] - q_pred[i])
-    hess_vals[slot] = hess_vals[slot] + wp.float64(k)
 
 
 @wp.kernel
@@ -286,7 +256,7 @@ def _apply_step_kernel(dx: wp.array[float], q: wp.array[float], track: int, err:
 @wp.kernel
 def _stop_kernel(err: wp.array[float], tol: float, block: int, max_iterations: int,
                  count: wp.array[wp.int32], go: wp.array[wp.int32]):
-    """After ``block`` more iterations: stop once every ``err`` is below ``tol`` or at ``max_iterations``."""
+    """Stop once every ``err < tol`` or at ``max_iterations``."""
     n = count[0] + block
     count[0] = n
     converged = int(1)
@@ -295,3 +265,122 @@ def _stop_kernel(err: wp.array[float], tol: float, block: int, max_iterations: i
             converged = 0
     if converged != 0 or n >= max_iterations:
         go[0] = 0
+
+
+# -- theta-method step kernels (one thread per DOF), shared with the adjoint ---------------
+
+
+@wp.kernel
+def predict_kernel(
+    fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], h: float,
+    # outputs
+    q_pred: wp.array[float], q: wp.array[float],
+):
+    """``q_pred = q0 + h v0``; given ``q``, also the initial guess (fixed DOFs keep ``q0``)."""
+    i = wp.tid()
+    q_pred[i] = q0[i] + h * v0[i]
+    if q.shape[0] > 0:
+        if fixed[i] != 0:
+            q[i] = q0[i]
+        else:
+            q[i] = q_pred[i]
+
+
+@wp.kernel
+def theta_kernel(
+    fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[float], q_theta: wp.array[float], theta: float,
+    dt: float,
+    # outputs
+    q: wp.array[float], v: wp.array[float],
+):
+    """Extrapolate the implicit Euler step ``h = theta dt`` to the step end; ``q`` may alias ``q_theta``."""
+    i = wp.tid()
+    if fixed[i] != 0:
+        q[i] = q_theta[i]
+        v[i] = 0.0
+        return
+    d = q_theta[i] - q0[i]
+    q[i] = q0[i] + d / theta
+    v[i] = v0[i] + (d - theta * dt * v0[i]) / (theta * theta * dt)
+
+
+@wp.kernel
+def inertia_kernel(
+    q: wp.array[float], q_pred: wp.array[float], mass: wp.array[float], alpha: float, fixed: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3], particle_f: wp.array[wp.vec3], num_node_dofs: int,
+    # outputs
+    residual: wp.array[float], hess_indptr: wp.array[wp.int32], hess_vals: wp.array[wp.float64],
+):
+    """``residual += M alpha (q - q_pred) - f_ext`` on free DOFs; given a Hessian, its leading diagonals."""
+    i = wp.tid()
+    if hess_vals.shape[0] > 0:
+        slot = hess_indptr[i]
+        if fixed[i] != 0:
+            hess_vals[slot] = wp.float64(1.0)
+        else:
+            hess_vals[slot] = hess_vals[slot] + wp.float64(mass[i] * alpha)
+    if fixed[i] != 0:
+        return
+    r = mass[i] * alpha * (q[i] - q_pred[i])
+    if i < num_node_dofs:
+        r = r - external_force(i, mass, gravity, particle_f)
+    wp.atomic_add(residual, i, r)
+
+
+# -- end-of-step kernels (one thread per edge) --------------------------------------------
+
+
+@wp.kernel
+def advance_frames_kernel(
+    node_q_prev: wp.array[wp.vec3], node_q: wp.array[wp.vec3], edge_node0: wp.array[wp.int32],
+    edge_node1: wp.array[wp.int32], edge_d1_prev: wp.array[wp.vec3],
+    # outputs
+    edge_d1: wp.array[wp.vec3],
+):
+    """Parallel-transport every ``d1`` to the current tangent."""
+    e = wp.tid()
+    n0 = edge_node0[e]
+    n1 = edge_node1[e]
+    t_prev = wp.normalize(node_q_prev[n1] - node_q_prev[n0])
+    edge_d1[e] = parallel_transport(edge_d1_prev[e], t_prev, wp.normalize(node_q[n1] - node_q[n0]))
+
+
+@wp.kernel
+def pose_proxies_kernel(
+    node_q: wp.array[wp.vec3], node_qd: wp.array[wp.vec3], edge_q: wp.array[float], edge_d1: wp.array[wp.vec3],
+    edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32], edge_body: wp.array[wp.int32],
+    edge_joint: wp.array[wp.vec2i], set_velocity: int,
+    # outputs
+    body_q: wp.array[wp.transform], body_qd: wp.array[wp.spatial_vector], joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+):
+    """Pose each proxy (midpoint, +Z tangent, +X ``m1``) and optionally its velocity and free joint."""
+    e = wp.tid()
+    body = edge_body[e]
+    if body < 0:
+        return
+    n0 = edge_node0[e]
+    n1 = edge_node1[e]
+    x0 = node_q[n0]
+    x1 = node_q[n1]
+    t = wp.normalize(x1 - x0)
+    m1, m2 = material_frame(edge_d1[e], t, edge_q[e])
+    R = wp.mat33(
+        m1[0], m2[0], t[0],
+        m1[1], m2[1], t[1],
+        m1[2], m2[2], t[2],
+    )
+    X = wp.transform(0.5 * (x0 + x1), wp.quat_from_matrix(R))
+    body_q[body] = X
+    v0 = node_qd[n0]
+    v1 = node_qd[n1]
+    d = x1 - x0
+    twist = wp.spatial_vector(0.5 * (v0 + v1), wp.cross(d, v1 - v0) / wp.dot(d, d))
+    if set_velocity != 0:
+        body_qd[body] = twist
+    j = edge_joint[e]
+    if joint_q.shape[0] > 0 and j[0] >= 0:  # a free root joint: joint_q = body_q, joint_qd = body_qd
+        for k in range(7):
+            joint_q[j[0] + k] = X[k]
+        for k in range(6):
+            joint_qd[j[1] + k] = twist[k]

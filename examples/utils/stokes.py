@@ -1,38 +1,26 @@
-"""Regularized Stokeslet segments (Cortez 2018): the viscous drag of the IMC flagella paper.
+"""Regularized Stokeslet segments (Cortez 2018): the viscous drag of the flagella example.
 
-A port of ``RegularizedStokeslet.cpp`` from https://github.com/StructuresComp/rod-contact-sim
-(Tong, Choi et al., arXiv:2205.10309, Appendix A). The fluid velocity at every node is a linear
-function of the force densities at every node of every rod, ``U = A f``, with ``A`` dense. At the
-start of each step ``A`` is built at the nodes' positions, ``8 pi eta A f = U`` is solved for the
-nodes' velocities (no slip), and ``F = -8 pi eta A^-1 U`` is applied explicitly for the step.
-
-As in the reference, ``A`` is factored by Cholesky (Eigen's ``llt``); here with cuSOLVER, in single
-precision (the segment integrals are in double): ``A`` is well conditioned (``cond < 10^3`` in a
-tight bundle), single precision costs a relative ``~1e-6`` in ``F`` and is ten times faster than
-double on a consumer GPU. Assembly and solve run on Warp's stream with buffers allocated once and
-no host synchronization; cuSOLVER's ``spotrf`` does not capture in a CUDA graph, so the caller
-runs :meth:`Stokeslets.compute` eagerly.
-
-Explicit, the drag is stable only while ``dt R / m < 2`` in every mode, ``R = 8 pi eta A^-1``. In
-a tight bundle the free tips (half a node's mass) of neighbouring flagella reach ``dt R / m ~ 5``
-at the paper's 1 ms, and the drag at the tips flips sign and doubles each step. With :meth:`Stokeslets.implicit`,
-the drag is instead taken at the velocity the drag alone would leave after the step (backward Euler on
-the drag, split from the rest of the step): ``F = -R (M + dt R)^-1 M v``, i.e.
-``F = -S (S A S / (8 pi eta) + dt I)^-1 S v`` with ``S = M^(1/2)``, again one Cholesky solve. It is
-stable for any ``dt``, and the explicit drag where ``dt R / m << 1``.
+A port of ``RegularizedStokeslet.cpp`` (https://github.com/StructuresComp/rod-contact-sim; Tong, Choi et al.,
+arXiv:2205.10309, Appendix A). Each step builds the dense mobility ``U = A f`` at the nodes, solves
+``8 pi eta A f = U`` for the nodes' velocities (no slip; one single-precision Cholesky, cuSOLVER on CUDA,
+SciPy on the CPU) and applies ``F = -8 pi eta A^-1 U`` for the step. :meth:`Stokeslets.implicit` takes the
+drag backward-Euler instead: the explicit drag flips sign at the tips of a tight bundle once ``dt R / m > 2``.
+cuSOLVER does not capture in a CUDA graph, so call :meth:`Stokeslets.compute` eagerly.
 """
 
 import ctypes
 import sys
 
 import numpy as np
+import scipy.linalg
 import warp as wp
-from cupy.cuda import device as _cupy_device
 
 
 def _cusolver_library() -> ctypes.CDLL:
     """The cuSOLVER that CuPy loaded, called directly with buffers allocated once (CuPy's ``posv``
     copies ``A``, allocates and synchronizes on every call)."""
+    from cupy.cuda import device as _cupy_device
+
     _cupy_device.get_cusolver_handle()  # makes CuPy load it
     names = ("cusolver64_12.dll", "cusolver64_11.dll") if sys.platform == "win32" else ("libcusolver.so.12", "libcusolver.so.11")
     for name in names:
@@ -149,6 +137,8 @@ class Stokeslets:
         self.force = wp.zeros(self.n, dtype=wp.vec3, device=device)
         self._s = wp.ones(n3, dtype=float, device=device)
         self._scale, self._shift, self._post = 1.0, 0.0, -8.0 * np.pi * viscosity  # explicit
+        if not wp.get_device(device).is_cuda:
+            return  # SciPy solves in place on the host arrays
         self._lib = lib = _cusolver_library()
         self._handle = ctypes.c_void_p()
         _check(lib.cusolverDnCreate(ctypes.byref(self._handle)), "cusolverDnCreate")
@@ -170,12 +160,17 @@ class Stokeslets:
                   inputs=[pos, vel, self.nv, wp.float64(self.epsilon), self._s, self._scale, self._shift],
                   outputs=[self.A, self.U], device=self.device)
         # A is symmetric: its row-major lower triangle is cuSOLVER's column-major upper, either will do.
-        lib = self._lib
-        _check(lib.cusolverDnSetStream(self._handle, wp.get_stream(self.device).cuda_stream), "setStream")
-        _check(lib.cusolverDnSpotrf(self._handle, _LOWER, n3, self.A.ptr, n3, self._work.ptr, self._work.shape[0],
-                                    self._info.ptr), "spotrf")
-        _check(lib.cusolverDnSpotrs(self._handle, _LOWER, n3, 1, self.A.ptr, n3, self.U.ptr, n3, self._info.ptr),
-               "spotrs")
+        if self.A.device.is_cuda:
+            lib = self._lib
+            _check(lib.cusolverDnSetStream(self._handle, wp.get_stream(self.device).cuda_stream), "setStream")
+            _check(lib.cusolverDnSpotrf(self._handle, _LOWER, n3, self.A.ptr, n3, self._work.ptr,
+                                        self._work.shape[0], self._info.ptr), "spotrf")
+            _check(lib.cusolverDnSpotrs(self._handle, _LOWER, n3, 1, self.A.ptr, n3, self.U.ptr, n3, self._info.ptr),
+                   "spotrs")
+        else:  # the host arrays are NumPy views: factor and solve in place
+            U = self.U.numpy()
+            factor = scipy.linalg.cho_factor(self.A.numpy().T, lower=True, overwrite_a=True, check_finite=False)
+            U[:] = scipy.linalg.cho_solve(factor, U, check_finite=False)
         wp.launch(_force_kernel, dim=self.n, inputs=[self.U, self._s, self._post], outputs=[self.force],
                   device=self.device)
         return self.force

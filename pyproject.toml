@@ -21,8 +21,6 @@ requires-python = ">=3.10"
 dependencies = [
     "newton~=1.6.0",
     "scipy>=1.14",
-    "cupy-cuda13x>=14.2.0",
-    "nvmath-python[cu13]>=1.0",
 ]
 
 [project.urls]
@@ -30,11 +28,16 @@ Homepage = "https://github.com/ryanchaiyakul/dismech-newton"
 Issues = "https://github.com/ryanchaiyakul/dismech-newton/issues"
 
 [project.optional-dependencies]
+gpu = [
+    "cupy-cuda13x>=14.2.0",
+    "nvmath-python[cu13]>=1.0",
+]
 viewer = [
     "imgui-bundle>=1.92.900",
     "pyglet>=2.1.6,<3",
     "PyOpenGL>=3.1",
     "pillow>=10",
+    "matplotlib>=3.8",
 ]
 mujoco = [
     "gitpython>=3.1",
@@ -51,6 +54,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.16.10",
 ]
 
 [tool.ruff]

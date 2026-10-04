@@ -1,12 +1,8 @@
-"""Flagella bundling from the IMC paper (Tong, Choi et al., arXiv:2205.10309, Sec. 4.1).
+"""Helical flagella spin in a viscous fluid and bundle (Tong, Choi et al., arXiv:2205.10309, Sec. 4.1).
 
-``M`` right-handed helical flagella hang from clamps on a regular polygon of side 0.03 m. Each
-clamped first edge lies on its helix axis and spins at ``omega``; the helices rotate in a viscous
-fluid (regularized Stokeslet segments, :mod:`stokes`: one drag force per step, backward Euler in the
-drag), wrap around one another and bundle, held apart by contact (frictionless in the paper;
-``--mu`` adds friction).
-Geometry and the clamp follow the paper's code (``world::rodGeometry``): a straight clamped edge, a
-45-degree lead-in, then 4 helical turns, 68 nodes. Parameters are the paper's; see ``PAPER``.
+Shows: external forces on the nodes (``state.particle_f``, here the fluid drag of :mod:`utils.stokes`),
+clamped segments spun through their twist, and contact between rods. Parameters are the paper's
+(``PAPER``); its contact is frictionless, ``--mu`` adds friction.
 
     uv run examples/flagella.py --flagella 3
     uv run examples/flagella.py --viewer null --test
@@ -18,8 +14,8 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from common import segment_distance, segment_dofs
-from stokes import Stokeslets
+from utils.common import SIM, inset, segment_distance, segment_dofs
+from utils.stokes import Stokeslets
 
 from dismech_newton import ADMMDiSMechSolver, flatten_state
 
@@ -45,7 +41,8 @@ TOP = 0.3  # height of the clamps [m]
 
 
 def flagellum(p: dict, offset: tuple[float, float]) -> np.ndarray:
-    """Nodes of one flagellum, clamp at the top (``world::rodGeometry``, its x axis turned to -z)."""
+    """Nodes of one flagellum, clamp at the top, as the paper's code builds it (``world::rodGeometry``, its x
+    axis turned to -z): a straight clamped edge on the helix axis, a 45-degree lead-in, then 4 helical turns."""
     a, b = p["helix_radius"], p["helix_pitch"] / (2.0 * math.pi)
     turns = p["axial_length"] / b
     length = turns * math.hypot(a, b)
@@ -82,9 +79,8 @@ def _spin_twist_kernel(dofs: wp.array[wp.int32], rest: wp.array[float], omega: f
 
 
 @wp.kernel
-def _count_kernel(step: wp.array[wp.int32], iterations: wp.array[wp.int32], total: wp.array[wp.int32]):
+def _advance_step(step: wp.array[wp.int32]):
     step[0] = step[0] + 1
-    total[0] = total[0] + iterations[0]
 
 
 class DERFlagella:
@@ -100,7 +96,6 @@ class DERFlagella:
         self.nv = len(self.points[0])
         self.stokes = Stokeslets(count, self.nv, p["viscosity"], p["epsilon"], wp.get_device())
         self._step = wp.zeros(1, dtype=wp.int32)
-        self._total_iterations = wp.zeros(1, dtype=wp.int32)
         self._graphs = [None, None]
         self._parity = 0
         self.steps = 0
@@ -114,7 +109,6 @@ class DERFlagella:
             self.rods.append(bodies)
         self.model = model = builder.finalize()
         self.solver = ADMMDiSMechSolver(model, friction=p["friction"], **solver_options)
-        self._iterations = self.solver._count  # this step's
         if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
             self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
         self.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
@@ -135,7 +129,7 @@ class DERFlagella:
             wp.capture_launch(graph)
         else:
             self._simulate()
-            if self.steps >= 1 and wp.get_device().is_cuda:  # the solver sets itself up on its first step
+            if self.steps >= 1 and self.solver.graph_capturable:  # the solver sets itself up on its first step
                 with wp.ScopedCapture() as capture:
                     self._simulate()
                 self._graphs[self._parity] = capture.graph
@@ -149,15 +143,11 @@ class DERFlagella:
                   outputs=[self.state_0.dismech.q])
         self.pipeline.collide(self.state_0, self.contacts, dt=2.0 * self.dt)
         self.solver.step(self.state_0, self.state_1, None, self.contacts, self.dt)
-        wp.launch(_count_kernel, dim=1, inputs=[self._step, self._iterations], outputs=[self._total_iterations])
+        wp.launch(_advance_step, dim=1, inputs=[self._step])
 
     @property
     def time(self) -> float:
         return self.steps * self.dt
-
-    @property
-    def total_iterations(self) -> int:
-        return int(self._total_iterations.numpy()[0])
 
     def nodes(self) -> np.ndarray:
         """``(count, nv, 3)`` node positions."""
@@ -194,14 +184,20 @@ class DERFlagella:
 
 
 class Example:
+    fps = 60
+    plot_every = 30  # frames between plot updates
+    plot_time = PAPER["total_time"]  # [s] the time axis of the plot
+
     def __init__(self, viewer, args=None):
         count = getattr(args, "flagella", 3) if args is not None else 3
         mu = getattr(args, "mu", PAPER["friction"]) if args is not None else PAPER["friction"]
         self.sim = DERFlagella(count, {**PAPER, "friction": mu})
         self.viewer = viewer
-        self.frame_dt = 1.0 / 60.0
+        self.frame_dt = 1.0 / self.fps
         self.steps_per_frame = max(1, round(self.frame_dt / self.sim.dt))
         self.min_gap = np.inf
+        self.frame = 0
+        self.history = [(0.0, self.sim.tip_spread())]  # (time, mean tip distance), every plot update
         viewer.set_model(self.sim.model)
         if hasattr(viewer, "set_camera"):
             viewer.set_camera(pos=wp.vec3(0.015, -0.55, 0.2), pitch=0.0, yaw=90.0)
@@ -209,8 +205,27 @@ class Example:
     def step(self):
         for _ in range(self.steps_per_frame):
             self.sim.step()
+        self.frame += 1
+        if self.frame % self.plot_every == 0:
+            self.history.append((self.sim.time, self.sim.tip_spread()))
+
+    def image(self, size: tuple[int, int] = (400, 400)) -> np.ndarray:
+        """The mean distance between the free ends over time (the reference code's bundling measure),
+        as an RGBA image (see :func:`utils.common.inset`)."""
+        t, d = np.array(self.history).T
+
+        def draw(ax):
+            ax.plot(t, 1e3 * d, color=SIM)
+            ax.set(xlim=(0.0, max(self.plot_time, self.sim.time)), ylim=(0.0, 1e3 * max(1.6 * d[0], 1.1 * d.max())))
+            ax.set_xlabel(r"time $t$ (s)")
+            ax.set_ylabel(r"tip spread $\bar{d}$ (mm)")
+            ax.locator_params(nbins=5)
+
+        return inset(draw, size)
 
     def render(self):
+        if self.frame % self.plot_every == 0:
+            self.viewer.log_image("tip spread", self.image())
         self.viewer.begin_frame(self.sim.time)
         self.viewer.log_state(self.sim.state_0)
         self.viewer.end_frame()

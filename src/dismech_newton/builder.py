@@ -1,10 +1,4 @@
-"""Adding DER rods to a ``ModelBuilder``.
-
-Nodes are Newton particles (a fixed node has ``ParticleFlags.ACTIVE`` cleared); edges and triplets
-are ``dismech`` custom frequencies. Unless ``proxies=False``, every edge also gets a kinematic,
-massless capsule proxy body, posed by the solver, for rendering and collision. Rest strains are
-not stored: the solver measures them on the initial configuration.
-"""
+"""Adding DER rods to a ``ModelBuilder``: nodes are particles, edges and triplets ``dismech`` frequencies."""
 
 import copy
 
@@ -13,7 +7,7 @@ import warp as wp
 from newton import Model, ModelBuilder, ParticleFlags, Rod
 from newton._src.core.types import Vec3
 
-from .strains import vec10f
+from .strains import vec5f, vec10f
 
 NAMESPACE = "dismech"
 _P = f"{NAMESPACE}:"
@@ -31,12 +25,14 @@ ATTRIBUTES = [
     ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
 ]
 
-# Time-evolving state: (frequency, name, dtype).
+# Time-evolving state: (frequency, name, dtype, default).
 STATE_ATTRIBUTES = [
-    ("edge", "edge_q", float),  # material twist angle theta
-    ("edge", "edge_qd", float),
-    ("edge", "edge_d1_q", wp.vec3),  # time-parallel reference director
-    ("triplet", "triplet_ref_twist_q", float),
+    ("edge", "edge_q", float, None),  # material twist angle theta
+    ("edge", "edge_qd", float, None),
+    ("edge", "edge_d1_q", wp.vec3, None),  # time-parallel reference director
+    ("triplet", "triplet_ref_twist_q", float, None),
+    # The strains at the end of the last step (strain-rate damping); NaN until a step measures them.
+    ("triplet", "triplet_strain_q", vec5f, vec5f(*([float("nan")] * 5))),
 ]
 
 
@@ -50,17 +46,16 @@ def register_custom_attributes(builder: ModelBuilder) -> None:
                 name=name, dtype=dtype, frequency=_P + frequency, namespace=NAMESPACE, references=references
             )
         )
-    for frequency, name, dtype in STATE_ATTRIBUTES:
+    for frequency, name, dtype, default in STATE_ATTRIBUTES:
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name=name, dtype=dtype, frequency=_P + frequency, assignment=Model.AttributeAssignment.STATE,
-                namespace=NAMESPACE,
+                namespace=NAMESPACE, default=default,
             )
         )
 
 
 def _resolve(explicit, rigidity, length, default, n: int) -> np.ndarray:
-    """Stiffness per entity: explicit value, else rigidity / length, else default."""
     if explicit is not None:
         return np.full(n, explicit)
     if rigidity is not None:
@@ -69,7 +64,7 @@ def _resolve(explicit, rigidity, length, default, n: int) -> np.ndarray:
 
 
 def fix_segment(builder: ModelBuilder, body: int | None = None, *, edge: int | None = None) -> None:
-    """Clamp a segment, both nodes and its twist, named by its proxy ``body`` or its ``edge`` index."""
+    """Clamp a segment (both nodes and its twist), by proxy ``body`` or ``edge`` index."""
     if (body is None) == (edge is None):
         raise ValueError("fix_segment: pass exactly one of `body` and `edge`")
     if edge is None:
@@ -96,15 +91,9 @@ def add_rod(
     proxies: bool = True,
     color: Vec3 | None = None,
 ) -> list[int]:
-    """Add an ordered chain (open or closed) of DER segments.
+    """Add an ordered chain of DER segments; returns the proxy bodies (edge indices without proxies).
 
-    Returns the proxy body indices or, with ``proxies=False``, the edge indices.
-
-    Stiffness per entity: the explicit argument, else the rod's section rigidity divided by the
-    rest length (EA / l0 per edge, EI / L_dual and GJ / L_dual per triplet), else a default
-    (stretch 1e5, bend 0, twist = bend). Damping is strain-rate viscosity in the same units; twist
-    damping defaults to bend damping. Mass comes from ``cfg.density``. The proxies collide only
-    with ``collide`` (``finalize`` enumerates every colliding shape pair).
+    Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend.
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
     if not Rod._is_ordered_chain_topology(len(points), edges):
@@ -224,20 +213,18 @@ def add_colliding_rod(
     *,
     cfg: ModelBuilder.ShapeConfig | None = None,
     contact_exclusion: float = 1.5,
+    contact_gap: float = 0.5,
     **kwargs,
 ) -> list[int]:
-    """:func:`add_rod` with colliding proxies, for the ADMM solver.
-
-    Proxy pairs whose arc length strictly between them is below ``contact_exclusion`` contact
-    thicknesses (two radii) are filtered: touching neighbours are not a contact. ``cfg.gap``
-    defaults to the rod radius. Other arguments are those of :func:`add_rod`.
-    """
+    """:func:`add_rod` with colliding proxies; pairs closer than ``contact_exclusion`` thicknesses along the rod
+    are filtered. Without ``cfg.gap``, the capsules report pairs within ``contact_gap`` radii of touching (fast
+    motion is covered by the pipeline's speculative contacts); a larger gap adds far contacts that slow ADMM."""
     if not kwargs.get("proxies", True):
         raise ValueError("add_colliding_rod: collision needs the capsule proxies (proxies=True)")
     radius = rod._resolve_radius() or 0.1
     cfg = copy.copy(cfg or builder.default_shape_cfg)
     if cfg.gap is None:
-        cfg.gap = radius
+        cfg.gap = contact_gap * radius
     bodies = add_rod(builder, rod, cfg=cfg, collide=True, **kwargs)
 
     cutoff = contact_exclusion * 2.0 * radius

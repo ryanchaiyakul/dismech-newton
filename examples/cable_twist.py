@@ -1,7 +1,7 @@
-"""Newton's ``example_cable_twist`` with the ADMM DER solver.
+"""Three zigzag cables on the ground, their first segment spun about its axis (Newton's ``example_cable_twist``).
 
-Three zigzag cables lie on the ground with isotropic bend/twist stiffness 1e2, 1e3 and 1e4; the first
-segment of each spins about its axis and the twist propagates through the 90-degree turns.
+Shows: stiffness and damping per rod (``add_rod``), a clamped segment (``fix_segment``) driven through
+its twist DOF (:class:`utils.common.Drive`). Stiffer cables carry the twist further around their turns.
 
     uv run examples/cable_twist.py
     uv run examples/cable_twist.py --viewer null --test
@@ -11,8 +11,8 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from common import CableExample, Drive, segment_dofs
 from newton.examples.cable.example_cable_twist import Example as NewtonExample
+from utils.common import CableExample, Drive, segment_dofs
 
 from dismech_newton import ADMMDiSMechSolver
 
@@ -36,11 +36,12 @@ class Example(CableExample):
                 builder, rod, stretch_stiffness=1.0e6, bend_stiffness=k, twist_stiffness=k,
                 bend_damping=1.0e-2 * k, twist_damping=1.0e-2 * k,
             )
-            ADMMDiSMechSolver.fix_segment(builder, bodies[0])
+            ADMMDiSMechSolver.fix_segment(builder, bodies[0])  # clamped: its nodes and twist follow the drive
             self.rods.append(bodies)
         builder.add_ground_plane()
         model = builder.finalize()
         self.start(viewer, model, ADMMDiSMechSolver(model, friction=0.5), self.radius)
+        # The clamped segments' twist angles, prescribed every substep.
         self.spin = Drive(model, [d for bodies in self.rods for d in segment_dofs(model, bodies[0], True)])
         self.drives = (self.spin,)
 

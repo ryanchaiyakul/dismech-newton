@@ -1,6 +1,6 @@
-"""Newton's ``example_cable_pile`` with the ADMM DER solver.
+"""A hundred wavy cables drop onto the ground and settle into a pile (Newton's ``example_cable_pile``).
 
-Ten layers of ten wavy cables, alternating along x and y, drop onto the ground and settle into a pile.
+Shows: many rods in one model (``add_rod``), ground contact and friction (``ADMMDiSMechSolver``).
 
     uv run examples/cable_pile.py
     uv run examples/cable_pile.py --viewer null --test
@@ -9,7 +9,7 @@ Ten layers of ten wavy cables, alternating along x and y, drop onto the ground a
 import newton
 import newton.examples
 import numpy as np
-from common import CableExample
+from utils.common import CableExample
 
 from dismech_newton import ADMMDiSMechSolver
 
@@ -34,12 +34,13 @@ class Example(CableExample):
                 offset = (lane - (self.lanes - 1) * 0.5) * spacing
                 x, y = (along, offset + wave) if layer % 2 == 0 else (offset + wave, along)
                 points = np.column_stack((x, y, np.full_like(s, z)))
+                # Each rod: nodes from ``points``, one capsule proxy per segment for contact.
                 self.rods.append(ADMMDiSMechSolver.add_rod(
                     builder, newton.Rod(points, radius=self.radius), stretch_stiffness=5.0e5, bend_stiffness=1.0e2,
                     bend_damping=2.0e1,
                 ))
         model = builder.finalize()
-        self.start(viewer, model, ADMMDiSMechSolver(model, friction=1.0), self.radius)
+        self.start(viewer, model, ADMMDiSMechSolver(model, friction=1.0), self.radius)  # Coulomb mu = 1
 
     def test_final(self):
         z = self.state_0.particle_q.numpy()[:, 2]

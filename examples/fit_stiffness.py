@@ -1,16 +1,9 @@
 """Fit a rod's bending stiffness and damping to an observed motion, by gradients through the solver.
 
-The observation is a cantilever released under gravity, simulated with the true parameters. From a
-wrong guess, L-BFGS fits the parameters' logs to it. Each gradient is one ``wp.Tape`` over the rollout:
-the solver records every step as its implicit-function adjoint (:mod:`dismech_newton.adjoint`), one
-linear solve per step, never the ADMM iterations.
-
-The viewer replays the fit: the truth (left, grey) and each L-BFGS iterate in turn (right, green)
-swing side by side in slow motion, with a pause before the next iterate. The image window shows the
-iterate's parameters and its place on the loss landscape over (stiffness, damping), with the downhill
-gradient (arrows) and the optimiser's path so far. The landscape is only the picture: 961 rods, one
-per grid point, in one simulation (they never touch), each with its own loss; one backward pass of
-their sum gives every rod's own gradient, since each rod's parameters reach only its own loss.
+Shows: differentiating a rollout. Record the steps on a ``wp.Tape`` (``model.state(requires_grad=True)``,
+``triplet_params.requires_grad``), call ``tape.backward``, read ``.grad``; the solver backpropagates each
+step by its implicit-function adjoint, one linear solve per step. L-BFGS fits a cantilever's parameters
+from a wrong guess; the viewer replays each iterate (green) beside the truth (grey) on the loss landscape.
 
     uv run examples/fit_stiffness.py
     uv run examples/fit_stiffness.py --viewer null --test
@@ -19,11 +12,9 @@ their sum gives every rod's own gradient, since each rod's parameters reach only
 import newton
 import newton.examples
 import numpy as np
-import scipy.ndimage
 import warp as wp
-from common import font
-from PIL import Image, ImageDraw
 from scipy.optimize import minimize
+from utils.common import inset, inset_scale
 
 from dismech_newton import ADMMDiSMechSolver as Solver
 from dismech_newton import add_rod
@@ -130,7 +121,8 @@ def fit():
 
 
 def landscape(observed: np.ndarray):
-    """Loss and its gradient in (log k, log c) on the grid (rows: damping): one batched rollout, one backward."""
+    """Loss and its gradient in (log k, log c) on the grid (rows: damping), for the picture only: one rod per
+    grid point in one model (they never touch), one backward pass of their summed losses."""
     ks, cs = np.geomspace(*K_RANGE, GRID), np.geomspace(*C_RANGE, GRID)
     builder = newton.ModelBuilder()
     for _ in range(GRID**2):
@@ -156,75 +148,42 @@ def landscape(observed: np.ndarray):
 
 # -- the picture ----------------------------------------------------------------------------
 
-_VIRIDIS = np.array([(68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37)], dtype=float)
-_TEXT = (220, 220, 220)
+TRUTH, ITERATE, PATH = "#d9d9d9", "#4dcc80", "#ff8c3c"  # the rods' colours, and the optimiser's path
 
 
 class LandscapePlot:
-    """The loss landscape as an image: banded log loss, downhill arrows, the true parameters (cross)
-    and the optimiser's path (red start, green current)."""
-
-    size, margin = 360, 48
+    """The loss landscape over (stiffness, damping): banded log loss, downhill arrows, the true
+    parameters (cross) and the optimiser's path to its current iterate (green)."""
 
     def __init__(self, loss: np.ndarray, grad: np.ndarray):
-        s, m = self.size, self.margin
-        z = scipy.ndimage.zoom(np.log10(loss), s / GRID, order=1)[::-1]  # top row: high damping
-        band = np.floor(12 * (z - z.min()) / (z.max() - z.min())) / 12  # banded colours read as contours
-        rgb = np.stack([np.interp(band, np.linspace(0, 1, 5), _VIRIDIS[:, i]) for i in range(3)], axis=-1)
-        rgb[(np.diff(band, axis=0, prepend=band[:1]) != 0) | (np.diff(band, axis=1, prepend=band[:, :1]) != 0)] *= 0.7
-        self.base = Image.new("RGB", (s + 2 * m, s + 2 * m), (24, 24, 28))
-        self.base.paste(Image.fromarray(rgb.astype(np.uint8)), (m, m))
-        draw = ImageDraw.Draw(self.base)
-        f13 = font(13)
-        log_k, log_c = np.log(np.geomspace(*K_RANGE, GRID)), np.log(np.geomspace(*C_RANGE, GRID))
-        for j in range(1, GRID, 3):
-            for i in range(1, GRID, 3):
-                d = -grad[j, i] / max(np.linalg.norm(grad[j, i]), 1e-30)
-                p = np.array(self.to_px(log_k[i], log_c[j]))
-                self._arrow(draw, p, p + 13 * np.array([d[0], -d[1]]))
-        for k in (1, 2, 5, 10):
-            draw.text((self.to_px(np.log(k), 0)[0], s + m + 6), f"{k:g}", fill=_TEXT, font=f13, anchor="mt")
-        for c in (0.01, 0.03, 0.1, 0.3):
-            draw.text((m - 6, self.to_px(0, np.log(c))[1]), f"{c:g}", fill=_TEXT, font=f13, anchor="rm")
-        draw.text((m + s / 2, s + m + 26), "bend stiffness", fill=_TEXT, font=f13, anchor="mt")
-        draw.text((m + s / 2, m / 2), "loss over (stiffness, damping)", fill=_TEXT, font=font(15), anchor="mm")
-        draw.text((8, m - 14), "damping", fill=_TEXT, font=f13, anchor="lm")
-        x, y = self.to_px(*np.log(TRUE))
-        draw.line([(x - 7, y - 7), (x + 7, y + 7)], fill=(255, 255, 255), width=3)
-        draw.line([(x - 7, y + 7), (x + 7, y - 7)], fill=(255, 255, 255), width=3)
+        self.loss, self.grad = loss, grad
 
-    def to_px(self, log_k: float, log_c: float) -> tuple[float, float]:
-        s, m = self.size, self.margin
-        u = (log_k - np.log(K_RANGE[0])) / (np.log(K_RANGE[1]) - np.log(K_RANGE[0]))
-        v = (log_c - np.log(C_RANGE[0])) / (np.log(C_RANGE[1]) - np.log(C_RANGE[0]))
-        return m + u * s, m + (1.0 - v) * s
+    def image(self, path: list[np.ndarray], size: tuple[int, int] = (400, 400)) -> np.ndarray:
+        """The landscape with ``path`` (the iterates' logs so far), as an RGBA image."""
+        ks, cs = np.geomspace(*K_RANGE, GRID), np.geomspace(*C_RANGE, GRID)
+        k, c = np.exp(np.array(path)).T
 
-    @staticmethod
-    def _arrow(draw, p, q):
-        d = (q - p) / np.linalg.norm(q - p)
-        o = np.array([-d[1], d[0]])
-        draw.line([tuple(p), tuple(q)], fill=(235, 235, 235), width=1)
-        draw.polygon([tuple(q), tuple(q - 4 * d + 2.5 * o), tuple(q - 4 * d - 2.5 * o)], fill=(235, 235, 235))
+        def draw(ax):
+            z = np.log10(self.loss)
+            ax.contourf(ks, cs, z, levels=12, cmap="viridis", alpha=0.9)
+            ax.contour(ks, cs, z, levels=12, colors="black", linewidths=0.5 * inset_scale(size), alpha=0.35)
+            d = -self.grad / np.maximum(np.linalg.norm(self.grad, axis=-1, keepdims=True), 1e-30)
+            s = slice(1, None, 3)
+            ax.quiver(ks[s], cs[s], d[s, s, 0], d[s, s, 1], color="white", alpha=0.6, angles="xy",
+                      pivot="mid", scale=26, width=0.004, headwidth=4)
+            ax.plot(k, c, "-o", color=PATH, ms=4 * inset_scale(size), label="L-BFGS")
+            ax.plot(*TRUE, "x", color=TRUTH, ms=12 * inset_scale(size), mew=3 * inset_scale(size), label="truth")
+            ax.plot(k[-1], c[-1], "o", color=ITERATE, ms=11 * inset_scale(size), mec="white", mew=1.5 * inset_scale(size),
+                    label=f"iterate {len(path) - 1}")
+            ax.set(xscale="log", yscale="log", xlim=K_RANGE, ylim=C_RANGE)
+            ax.minorticks_off()
+            ax.set_xticks([1, 2, 5, 10], labels=["$1$", "$2$", "$5$", "$10$"])
+            ax.set_yticks([0.01, 0.03, 0.1, 0.3], labels=["$0.01$", "$0.03$", "$0.1$", "$0.3$"])
+            ax.set_xlabel(r"bend stiffness $k$ (N$\,$m)")
+            ax.set_ylabel(r"bend damping $c$ (N$\,$m$\,$s)")
+            ax.legend(loc="lower left", labelcolor="white")
 
-    def image(self, path: list[np.ndarray], banner: list[tuple[str, tuple]] = ()) -> np.ndarray:
-        """The landscape with ``path`` (iterates so far), under ``banner``: lines of (text, colour)."""
-        plot = self.base.copy()
-        draw = ImageDraw.Draw(plot)
-        pts = [self.to_px(*x) for x in path]
-        if len(pts) > 1:
-            draw.line(pts, fill=(255, 140, 60), width=3)
-        for (x, y), r, color in [(p, 3, (255, 140, 60)) for p in pts[1:-1]] + [(pts[0], 5, (230, 70, 60))]:
-            draw.ellipse([x - r, y - r, x + r, y + r], fill=color)
-        x, y = pts[-1]
-        draw.ellipse([x - 7, y - 7, x + 7, y + 7], fill=(80, 220, 130), outline=(255, 255, 255), width=2)
-        line = 26
-        img = Image.new("RGB", (plot.width, plot.height + len(banner) * line + 16), (24, 24, 28))
-        img.paste(plot, (0, img.height - plot.height))
-        draw = ImageDraw.Draw(img)
-        f18 = font(18)
-        for i, (text, color) in enumerate(banner):
-            draw.text((self.margin, 12 + i * line), text, fill=color, font=f18)
-        return np.asarray(img)
+        return inset(draw, size)
 
 
 class Example:
@@ -266,15 +225,9 @@ class Example:
     def _log_iterate(self):
         self.viewer.log_image("fit", self.panel())
 
-    def panel(self) -> np.ndarray:
-        """The iterate's parameters above its place on the landscape."""
-        r = self.replays[self.k]
-        k, c = np.exp(r["x"])
-        lines = [(f"iterate {self.k} / {len(self.replays) - 1}", (255, 255, 255)),
-                 (f"stiffness  {k:7.3f}   (true {TRUE[0]:g})", (120, 220, 150)),
-                 (f"damping    {c:7.4f}   (true {TRUE[1]:g})", (120, 220, 150)),
-                 (f"loss       {r['loss']:.2e}", (220, 220, 220))]
-        return self.plot.image([x["x"] for x in self.replays[: self.k + 1]], lines)
+    def panel(self, size: tuple[int, int] = (400, 400)) -> np.ndarray:
+        """The iterate's place on the landscape."""
+        return self.plot.image([x["x"] for x in self.replays[: self.k + 1]], size)
 
     def step(self):
         self.frame += 1

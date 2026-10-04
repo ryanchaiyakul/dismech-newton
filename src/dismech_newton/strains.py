@@ -1,87 +1,65 @@
-"""Triplet strains ``[eps_e, eps_f, kappa1, kappa2, tau]`` and their derivatives.
-
-A triplet is two consecutive edges ``e = x1 - x0``, ``f = x2 - x1``; its 11 DOFs are
-``[x0, theta_e, x1, theta_f, x2]``.
+"""Triplet strains ``[eps_e, eps_f, kappa1, kappa2, tau]`` and their derivatives in the DOFs
+``[x0, theta_e, x1, theta_f, x2]``, taken in edge space (``e = x1 - x0``, ``f = x2 - x1``).
 """
 
 import warp as wp
 
-from .frames import material_frame, parallel_transport, reference_twist, skew
-
 vec5f = wp.types.vector(5, float)
 vec10f = wp.types.vector(10, float)
 mat55f = wp.types.matrix((5, 5), float)
-vec5i = wp.types.vector(5, wp.int32)
 vec11f = wp.types.vector(11, float)
 mat11f = wp.types.matrix((11, 11), float)
 mat5_11f = wp.types.matrix((5, 11), float)
 
-
-@wp.func
-def unpack_conn(conn: vec5i):
-    """``(e, f, n0, n1, n2)``: the two edges of a triplet and its three nodes."""
-    return conn[0], conn[1], conn[2], conn[3], conn[4]
+# -- frames -------------------------------------------------------------------------------
 
 
 @wp.func
-def edge_direction(q: wp.array[wp.vec3], a: int, b: int) -> wp.vec3:
-    """Unit tangent from node ``a`` to node ``b``."""
-    return wp.normalize(q[b] - q[a])
+def parallel_transport(m: wp.vec3, t0: wp.vec3, t1: wp.vec3) -> wp.vec3:
+    """Transport ``m`` from ``t0`` to ``t1`` along the shortest arc."""
+    out = m - wp.dot(m, t1) / (1.0 + wp.dot(t0, t1)) * (t0 + t1)
+    return wp.normalize(out)
 
 
 @wp.func
-def rest_strain(r: wp.vec3) -> vec5f:
-    """Rest strains from rest ``[kappa1, kappa2, tau]``; stretch is measured against the rest length."""
-    return vec5f(0.0, 0.0, r[0], r[1], r[2])
-
-
-# -- scatter from edge space into the 11 DOFs ---------------------------------------------
+def signed_angle(a: wp.vec3, b: wp.vec3, axis: wp.vec3) -> float:
+    """Angle from ``a`` to ``b`` about ``axis``, in ``(-pi, pi]``."""
+    return wp.atan2(wp.dot(axis, wp.cross(a, b)), wp.dot(a, b))
 
 
 @wp.func
-def add_block(H: mat11f, r: int, c: int, B: wp.mat33f) -> mat11f:
-    for i in range(3):
-        for j in range(3):
-            H[r + i, c + j] = H[r + i, c + j] + B[i, j]
-    return H
+def wrap_angle(a: float) -> float:
+    """Into ``[-pi, pi)``."""
+    two_pi = 2.0 * wp.PI
+    return a - two_pi * wp.floor((a + wp.PI) / two_pi)
 
 
 @wp.func
-def add_edge_hessian(H: mat11f, Dee: wp.mat33f, Def: wp.mat33f, Dff: wp.mat33f) -> mat11f:
-    """Scatter an edge-space Hessian into node DOFs 0:3, 4:7, 8:11 (``dx0 = -de``, ``dx1 = de - df``, ``dx2 = df``)."""
-    Dfe = wp.transpose(Def)
-    H = add_block(H, 0, 0, Dee)
-    H = add_block(H, 0, 4, -Dee + Def)
-    H = add_block(H, 0, 8, -Def)
-    H = add_block(H, 4, 0, -Dee + Dfe)
-    H = add_block(H, 4, 4, Dee - Def - Dfe + Dff)
-    H = add_block(H, 4, 8, Def - Dff)
-    H = add_block(H, 8, 0, -Dfe)
-    H = add_block(H, 8, 4, Dfe - Dff)
-    H = add_block(H, 8, 8, Dff)
-    return H
+def skew(a: wp.vec3) -> wp.mat33:
+    """``skew(a) @ b == cross(a, b)``."""
+    # fmt: off
+    return wp.mat33(
+          0.0, -a[2],  a[1],
+         a[2],   0.0, -a[0],
+        -a[1],  a[0],   0.0,
+    )
+    # fmt: on
 
 
 @wp.func
-def add_edge_theta_hessian(H: mat11f, col: int, De: wp.vec3, Df: wp.vec3) -> mat11f:
-    """Scatter mixed (edge vectors, theta) second derivatives, symmetric."""
-    for k in range(3):
-        v0 = -De[k]
-        v1 = De[k] - Df[k]
-        v2 = Df[k]
-        H[k, col] = H[k, col] + v0
-        H[col, k] = H[col, k] + v0
-        H[4 + k, col] = H[4 + k, col] + v1
-        H[col, 4 + k] = H[col, 4 + k] + v1
-        H[8 + k, col] = H[8 + k, col] + v2
-        H[col, 8 + k] = H[col, 8 + k] + v2
-    return H
+def material_frame(d1: wp.vec3, t: wp.vec3, theta: float):
+    """``(m1, m2)``: ``(d1, t x d1)`` rotated by ``theta``."""
+    d2 = wp.cross(t, d1)
+    c = wp.cos(theta)
+    s = wp.sin(theta)
+    return c * d1 + s * d2, -s * d1 + c * d2
 
 
 @wp.func
-def edge_gradient(De: wp.vec3, Df: wp.vec3, dtheta_e: float, dtheta_f: float) -> vec11f:
-    d = De - Df
-    return vec11f(-De[0], -De[1], -De[2], dtheta_e, d[0], d[1], d[2], dtheta_f, Df[0], Df[1], Df[2])
+def reference_twist(d1e: wp.vec3, te: wp.vec3, d1f: wp.vec3, tf: wp.vec3, ref_twist_old: float) -> float:
+    """Unwrapped against ``ref_twist_old`` to be continuous in time."""
+    angle = signed_angle(parallel_transport(d1e, te, tf), d1f, tf)
+    return ref_twist_old + wrap_angle(angle - ref_twist_old)
 
 
 # -- geometry -----------------------------------------------------------------------------
@@ -93,10 +71,10 @@ class TripletGeometry:
     tf: wp.vec3
     ne: float
     nf: float
+    l0e: float  # rest lengths
+    l0f: float
     chi: float
     tt: wp.vec3  # (te + tf) / chi
-    td1: wp.vec3  # (m1e + m1f) / chi
-    td2: wp.vec3  # (m2e + m2f) / chi
     kb: wp.vec3  # curvature binormal
     m1e: wp.vec3
     m2e: wp.vec3
@@ -120,12 +98,14 @@ def triplet_geometry(
     l0e: float,
     l0f: float,
 ):
-    """Frames and strains of a triplet; the reference frames are transported from the start of the step."""
+    """Frames and strains; reference frames transported from the start of the step."""
     g = TripletGeometry()
     ee = x1 - x0
     ef = x2 - x1
     g.ne = wp.length(ee)
     g.nf = wp.length(ef)
+    g.l0e = l0e
+    g.l0f = l0f
     g.te = ee / g.ne
     g.tf = ef / g.nf
     d1e = parallel_transport(d1e_old, te_old, g.te)
@@ -139,8 +119,6 @@ def triplet_geometry(
 
     g.chi = 1.0 + wp.dot(g.te, g.tf)
     g.tt = (g.te + g.tf) / g.chi
-    g.td1 = (m1e + m1f) / g.chi
-    g.td2 = (m2e + m2f) / g.chi
     g.kb = 2.0 * wp.cross(g.te, g.tf) / g.chi
 
     eps_e = g.ne / l0e - 1.0
@@ -152,187 +130,23 @@ def triplet_geometry(
     return g
 
 
-# -- derivatives --------------------------------------------------------------------------
+# -- strain derivatives -------------------------------------------------------------------
+#
+# Both curvatures are ``kappa = kb . (Me + Mf) / 2`` with directors that turn as ``dM/dtheta = N``
+# (so ``d^2M/dtheta^2 = -M``): ``kappa1`` has ``M = m2, N = -m1``, ``kappa2`` has ``M = -m1, N = -m2``.
 
 
 @wp.func
-def deps(te: wp.vec3, tf: wp.vec3, ne: float, nf: float, l0e: float, l0f: float):
-    """Gradients and Hessians of the two stretch strains."""
-    Je = vec11f()
-    Jf = vec11f()
-    He = mat11f()
-    Hf = mat11f()
-    de = te / l0e
-    df = tf / l0f
-    Pe = (wp.identity(3, dtype=float) - wp.outer(te, te)) / (l0e * ne)
-    Pf = (wp.identity(3, dtype=float) - wp.outer(tf, tf)) / (l0f * nf)
-    for k in range(3):
-        Je[k] = -de[k]
-        Je[4 + k] = de[k]
-        Jf[4 + k] = -df[k]
-        Jf[8 + k] = df[k]
-        for l in range(3):
-            He[k, l] = Pe[k, l]
-            He[k, 4 + l] = -Pe[k, l]
-            He[4 + k, l] = -Pe[k, l]
-            He[4 + k, 4 + l] = Pe[k, l]
-            Hf[4 + k, 4 + l] = Pf[k, l]
-            Hf[4 + k, 8 + l] = -Pf[k, l]
-            Hf[8 + k, 4 + l] = -Pf[k, l]
-            Hf[8 + k, 8 + l] = Pf[k, l]
-    return Je, Jf, He, Hf
-
-
-@wp.func
-def dkappa(g: TripletGeometry):
-    """Gradients and Hessians of the two bend curvatures."""
-    te = g.te
-    tf = g.tf
-    ne = g.ne
-    nf = g.nf
-    chi = g.chi
-    tt = g.tt
-    kb = g.kb
-    k1 = g.strain[2]
-    k2 = g.strain[3]
-
-    # Edge-space gradients.
-    De1 = (-k1 * tt + wp.cross(tf, g.td2)) / ne
-    Df1 = (-k1 * tt - wp.cross(te, g.td2)) / nf
-    De2 = (-k2 * tt - wp.cross(tf, g.td1)) / ne
-    Df2 = (-k2 * tt + wp.cross(te, g.td1)) / nf
-    g1 = edge_gradient(De1, Df1, -0.5 * wp.dot(kb, g.m1e), -0.5 * wp.dot(kb, g.m1f))
-    g2 = edge_gradient(De2, Df2, -0.5 * wp.dot(kb, g.m2e), -0.5 * wp.dot(kb, g.m2f))
-
-    # Terms shared by both Hessians.
-    I3 = wp.identity(3, dtype=float)
-    ne2 = ne * ne
-    nf2 = nf * nf
-    tt_tt = wp.outer(tt, tt)
-    Pe = I3 - wp.outer(te, te)
-    Pf = I3 - wp.outer(tf, tf)
-    Iet = I3 + wp.outer(te, tf)
-    tf_c_td2_tt = wp.outer(wp.cross(tf, g.td2), tt)
-    te_c_td2_tt = wp.outer(wp.cross(te, g.td2), tt)
-    tf_c_td1_tt = wp.outer(wp.cross(tf, g.td1), tt)
-    te_c_td1_tt = wp.outer(wp.cross(te, g.td1), tt)
-    kb_m2e = wp.outer(kb, g.m2e)
-    kb_m2f = wp.outer(kb, g.m2f)
-    kb_m1e = wp.outer(kb, g.m1e)
-    kb_m1f = wp.outer(kb, g.m1f)
-
-    # kappa1
-    Dee = (
-        (2.0 * k1 * tt_tt - tf_c_td2_tt - wp.transpose(tf_c_td2_tt)) / ne2
-        - k1 / (chi * ne2) * Pe
-        + (kb_m2e + wp.transpose(kb_m2e)) / (4.0 * ne2)
-    )
-    Dff = (
-        (2.0 * k1 * tt_tt + te_c_td2_tt + wp.transpose(te_c_td2_tt)) / nf2
-        - k1 / (chi * nf2) * Pf
-        + (kb_m2f + wp.transpose(kb_m2f)) / (4.0 * nf2)
-    )
-    Def = -k1 / (chi * ne * nf) * Iet + (
-        2.0 * k1 * tt_tt - tf_c_td2_tt + wp.transpose(te_c_td2_tt) - skew(g.td2)
-    ) / (ne * nf)
-    H1 = add_edge_hessian(mat11f(), Dee, Def, Dff)
-    H1[3, 3] = -0.5 * wp.dot(kb, g.m2e)
-    H1[7, 7] = -0.5 * wp.dot(kb, g.m2f)
-    H1 = add_edge_theta_hessian(
-        H1,
-        3,
-        (0.5 * wp.dot(kb, g.m1e) * tt - wp.cross(tf, g.m1e) / chi) / ne,
-        (0.5 * wp.dot(kb, g.m1e) * tt + wp.cross(te, g.m1e) / chi) / nf,
-    )
-    H1 = add_edge_theta_hessian(
-        H1,
-        7,
-        (0.5 * wp.dot(kb, g.m1f) * tt - wp.cross(tf, g.m1f) / chi) / ne,
-        (0.5 * wp.dot(kb, g.m1f) * tt + wp.cross(te, g.m1f) / chi) / nf,
-    )
-
-    # kappa2
-    Dee = (
-        (2.0 * k2 * tt_tt + tf_c_td1_tt + wp.transpose(tf_c_td1_tt)) / ne2
-        - k2 / (chi * ne2) * Pe
-        - (kb_m1e + wp.transpose(kb_m1e)) / (4.0 * ne2)
-    )
-    Dff = (
-        (2.0 * k2 * tt_tt - te_c_td1_tt - wp.transpose(te_c_td1_tt)) / nf2
-        - k2 / (chi * nf2) * Pf
-        - (kb_m1f + wp.transpose(kb_m1f)) / (4.0 * nf2)
-    )
-    Def = -k2 / (chi * ne * nf) * Iet + (
-        2.0 * k2 * tt_tt + tf_c_td1_tt - wp.transpose(te_c_td1_tt) + skew(g.td1)
-    ) / (ne * nf)
-    H2 = add_edge_hessian(mat11f(), Dee, Def, Dff)
-    H2[3, 3] = 0.5 * wp.dot(kb, g.m1e)
-    H2[7, 7] = 0.5 * wp.dot(kb, g.m1f)
-    H2 = add_edge_theta_hessian(
-        H2,
-        3,
-        (0.5 * wp.dot(kb, g.m2e) * tt - wp.cross(tf, g.m2e) / chi) / ne,
-        (0.5 * wp.dot(kb, g.m2e) * tt + wp.cross(te, g.m2e) / chi) / nf,
-    )
-    H2 = add_edge_theta_hessian(
-        H2,
-        7,
-        (0.5 * wp.dot(kb, g.m2f) * tt - wp.cross(tf, g.m2f) / chi) / ne,
-        (0.5 * wp.dot(kb, g.m2f) * tt + wp.cross(te, g.m2f) / chi) / nf,
-    )
-    return g1, g2, H1, H2
-
-
-@wp.func
-def dtau(g: TripletGeometry):
-    """Gradient and Hessian of the twist; theta enters linearly, the rest is the reference twist."""
-    te = g.te
-    tf = g.tf
-    ne = g.ne
-    nf = g.nf
-    kb = g.kb
-
-    J = edge_gradient(0.5 * kb / ne, 0.5 * kb / nf, -1.0, 1.0)
-
-    te_tt = te + g.tt
-    tf_tt = tf + g.tt
-    Dee = -(wp.outer(kb, te_tt) + wp.outer(te_tt, kb)) / (4.0 * ne * ne)
-    Dff = -(wp.outer(kb, tf_tt) + wp.outer(tf_tt, kb)) / (4.0 * nf * nf)
-    Def = (2.0 / g.chi * skew(te) - wp.outer(kb, g.tt)) / (2.0 * ne * nf)
-    H = add_edge_hessian(mat11f(), Dee, Def, Dff)
-    return J, H
-
-
-@wp.func
-def strain_gradient(g: TripletGeometry, sigma: vec5f, l0e: float, l0f: float) -> vec11f:
-    """``J^T sigma`` alone (no Hessians), written without component writes so Warp can differentiate it."""
-    k1 = g.strain[2]
-    k2 = g.strain[3]
-    kb = g.kb
-    tt = g.tt
-    De = (
-        sigma[0] / l0e * g.te
-        + sigma[2] * (-k1 * tt + wp.cross(g.tf, g.td2)) / g.ne
-        + sigma[3] * (-k2 * tt - wp.cross(g.tf, g.td1)) / g.ne
-        + sigma[4] * 0.5 * kb / g.ne
-    )
-    Df = (
-        sigma[1] / l0f * g.tf
-        + sigma[2] * (-k1 * tt - wp.cross(g.te, g.td2)) / g.nf
-        + sigma[3] * (-k2 * tt + wp.cross(g.te, g.td1)) / g.nf
-        + sigma[4] * 0.5 * kb / g.nf
-    )
-    dth_e = -0.5 * (sigma[2] * wp.dot(kb, g.m1e) + sigma[3] * wp.dot(kb, g.m2e)) - sigma[4]
-    dth_f = -0.5 * (sigma[2] * wp.dot(kb, g.m1f) + sigma[3] * wp.dot(kb, g.m2f)) + sigma[4]
-    return edge_gradient(De, Df, dth_e, dth_f)
-
-
-@wp.func
-def strain_derivatives(g: TripletGeometry, sigma: vec5f, l0e: float, l0f: float):
-    """The strain Jacobian ``J`` (5 x 11) and ``sum_i sigma_i H_i``, the stress-weighted strain Hessians."""
-    Jse, Jsf, Hse, Hsf = deps(g.te, g.tf, g.ne, g.nf, l0e, l0f)
-    Jb1, Jb2, Hb1, Hb2 = dkappa(g)
-    Ja, Ha = dtau(g)
+def strain_derivatives(g: TripletGeometry, sigma: vec5f):
+    """``J`` (5 x 11) and ``sum_i sigma_i H_i``."""
+    zero = wp.vec3()
+    De1, Df1, a1, b1 = kappa_gradient(g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
+    De2, Df2, a2, b2 = kappa_gradient(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
+    Jse = edge_gradient(g.te / g.l0e, zero, 0.0, 0.0)
+    Jsf = edge_gradient(zero, g.tf / g.l0f, 0.0, 0.0)
+    Jb1 = edge_gradient(De1, Df1, a1, b1)
+    Jb2 = edge_gradient(De2, Df2, a2, b2)
+    Ja = edge_gradient(0.5 * g.kb / g.ne, 0.5 * g.kb / g.nf, -1.0, 1.0)
     J = mat5_11f()
     for i in range(11):
         J[0, i] = Jse[i]
@@ -340,4 +154,145 @@ def strain_derivatives(g: TripletGeometry, sigma: vec5f, l0e: float, l0f: float)
         J[2, i] = Jb1[i]
         J[3, i] = Jb2[i]
         J[4, i] = Ja[i]
-    return J, sigma[0] * Hse + sigma[1] * Hsf + sigma[2] * Hb1 + sigma[3] * Hb2 + sigma[4] * Ha
+
+    # Stretch: the Hessian of |e| / l0 is the projection (I - t t^T) / (l0 |e|).
+    I3 = wp.identity(3, dtype=float)
+    H = add_edge_hessian(
+        mat11f(),
+        sigma[0] / (g.l0e * g.ne) * (I3 - wp.outer(g.te, g.te)),
+        wp.mat33(),
+        sigma[1] / (g.l0f * g.nf) * (I3 - wp.outer(g.tf, g.tf)),
+    )
+    H = add_kappa_hessian(H, sigma[2], g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
+    H = add_kappa_hessian(H, sigma[3], g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
+    H = add_tau_hessian(H, sigma[4], g)
+    return J, H
+
+
+@wp.func
+def strain_gradient(g: TripletGeometry, sigma: vec5f) -> vec11f:
+    """``J^T sigma`` without component writes, so Warp can differentiate it."""
+    De1, Df1, a1, b1 = kappa_gradient(g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
+    De2, Df2, a2, b2 = kappa_gradient(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
+    De = sigma[0] / g.l0e * g.te + sigma[2] * De1 + sigma[3] * De2 + sigma[4] * 0.5 * g.kb / g.ne
+    Df = sigma[1] / g.l0f * g.tf + sigma[2] * Df1 + sigma[3] * Df2 + sigma[4] * 0.5 * g.kb / g.nf
+    return edge_gradient(De, Df, sigma[2] * a1 + sigma[3] * a2 - sigma[4], sigma[2] * b1 + sigma[3] * b2 + sigma[4])
+
+
+@wp.func
+def kappa_gradient(g: TripletGeometry, k: float, Me: wp.vec3, Mf: wp.vec3, Ne: wp.vec3, Nf: wp.vec3):
+    """``(d/de, d/df, d/dtheta_e, d/dtheta_f)`` of the curvature ``k``."""
+    td = (Me + Mf) / g.chi
+    De = (-k * g.tt + wp.cross(g.tf, td)) / g.ne
+    Df = (-k * g.tt - wp.cross(g.te, td)) / g.nf
+    return De, Df, 0.5 * wp.dot(g.kb, Ne), 0.5 * wp.dot(g.kb, Nf)
+
+
+@wp.func
+def add_kappa_hessian(
+    H: mat11f, w: float, g: TripletGeometry, k: float, Me: wp.vec3, Mf: wp.vec3, Ne: wp.vec3, Nf: wp.vec3
+) -> mat11f:
+    """``H + w d^2k/dq^2``."""
+    te = g.te
+    tf = g.tf
+    ne = g.ne
+    nf = g.nf
+    chi = g.chi
+    tt = g.tt
+    kb = g.kb
+    td = (Me + Mf) / chi
+
+    I3 = wp.identity(3, dtype=float)
+    ne2 = ne * ne
+    nf2 = nf * nf
+    tt_tt = wp.outer(tt, tt)
+    tf_c_td_tt = wp.outer(wp.cross(tf, td), tt)
+    te_c_td_tt = wp.outer(wp.cross(te, td), tt)
+    kb_Me = wp.outer(kb, Me)
+    kb_Mf = wp.outer(kb, Mf)
+    Dee = (
+        (2.0 * k * tt_tt - tf_c_td_tt - wp.transpose(tf_c_td_tt)) / ne2
+        - k / (chi * ne2) * (I3 - wp.outer(te, te))
+        + (kb_Me + wp.transpose(kb_Me)) / (4.0 * ne2)
+    )
+    Dff = (
+        (2.0 * k * tt_tt + te_c_td_tt + wp.transpose(te_c_td_tt)) / nf2
+        - k / (chi * nf2) * (I3 - wp.outer(tf, tf))
+        + (kb_Mf + wp.transpose(kb_Mf)) / (4.0 * nf2)
+    )
+    Def = -k / (chi * ne * nf) * (I3 + wp.outer(te, tf)) + (
+        2.0 * k * tt_tt - tf_c_td_tt + wp.transpose(te_c_td_tt) - skew(td)
+    ) / (ne * nf)
+    H = add_edge_hessian(H, w * Dee, w * Def, w * Dff)
+    H[3, 3] = H[3, 3] - 0.5 * w * wp.dot(kb, Me)
+    H[7, 7] = H[7, 7] - 0.5 * w * wp.dot(kb, Mf)
+    se = -0.5 * w * wp.dot(kb, Ne)
+    sf = -0.5 * w * wp.dot(kb, Nf)
+    H = add_edge_theta_hessian(
+        H, 3, (se * tt + w * wp.cross(tf, Ne) / chi) / ne, (se * tt - w * wp.cross(te, Ne) / chi) / nf
+    )
+    H = add_edge_theta_hessian(
+        H, 7, (sf * tt + w * wp.cross(tf, Nf) / chi) / ne, (sf * tt - w * wp.cross(te, Nf) / chi) / nf
+    )
+    return H
+
+
+@wp.func
+def add_tau_hessian(H: mat11f, w: float, g: TripletGeometry) -> mat11f:
+    """``H + w d^2tau/dq^2``."""
+    kb = g.kb
+    te_tt = g.te + g.tt
+    tf_tt = g.tf + g.tt
+    Dee = -(wp.outer(kb, te_tt) + wp.outer(te_tt, kb)) / (4.0 * g.ne * g.ne)
+    Dff = -(wp.outer(kb, tf_tt) + wp.outer(tf_tt, kb)) / (4.0 * g.nf * g.nf)
+    Def = (2.0 / g.chi * skew(g.te) - wp.outer(kb, g.tt)) / (2.0 * g.ne * g.nf)
+    return add_edge_hessian(H, w * Dee, w * Def, w * Dff)
+
+
+# -- scatter from edge space into the 11 DOFs ---------------------------------------------
+
+
+@wp.func
+def edge_gradient(De: wp.vec3, Df: wp.vec3, dtheta_e: float, dtheta_f: float) -> vec11f:
+    d = De - Df
+    return vec11f(-De[0], -De[1], -De[2], dtheta_e, d[0], d[1], d[2], dtheta_f, Df[0], Df[1], Df[2])
+
+
+@wp.func
+def add_edge_hessian(H: mat11f, Dee: wp.mat33f, Def: wp.mat33f, Dff: wp.mat33f) -> mat11f:
+    """Scatter into node DOFs 0:3, 4:7, 8:11 (``dx0 = -de``, ``dx1 = de - df``, ``dx2 = df``)."""
+    Dfe = wp.transpose(Def)
+    H = add_block(H, 0, 0, Dee)
+    H = add_block(H, 0, 4, -Dee + Def)
+    H = add_block(H, 0, 8, -Def)
+    H = add_block(H, 4, 0, -Dee + Dfe)
+    H = add_block(H, 4, 4, Dee - Def - Dfe + Dff)
+    H = add_block(H, 4, 8, Def - Dff)
+    H = add_block(H, 8, 0, -Dfe)
+    H = add_block(H, 8, 4, Dfe - Dff)
+    H = add_block(H, 8, 8, Dff)
+    return H
+
+
+@wp.func
+def add_edge_theta_hessian(H: mat11f, col: int, De: wp.vec3, Df: wp.vec3) -> mat11f:
+    """Scatter mixed (edge, theta) second derivatives, symmetric."""
+    for k in range(3):
+        v0 = -De[k]
+        v1 = De[k] - Df[k]
+        v2 = Df[k]
+        H[k, col] = H[k, col] + v0
+        H[col, k] = H[col, k] + v0
+        H[4 + k, col] = H[4 + k, col] + v1
+        H[col, 4 + k] = H[col, 4 + k] + v1
+        H[8 + k, col] = H[8 + k, col] + v2
+        H[col, 8 + k] = H[col, 8 + k] + v2
+    return H
+
+
+@wp.func
+def add_block(H: mat11f, r: int, c: int, B: wp.mat33f) -> mat11f:
+    for i in range(3):
+        for j in range(3):
+            H[r + i, c + j] = H[r + i, c + j] + B[i, j]
+    return H

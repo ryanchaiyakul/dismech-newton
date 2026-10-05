@@ -11,7 +11,8 @@ The fixed DOFs (clamp nodes 0, 1; gripper nodes N-2, N-1; the gripper edge's twi
 * ``observed``: each trial's gripper pose readout ``grip_obs`` (noisy), linearly interpolated from the 40 Hz frames to
   the 200 Hz steps and applied as one rigid pose of the gripped edge;
 * ``command``: the nominal command (x compress, z shear, no rotation), the same for every trial.
-* ``true``: the oracle, each trial's hidden actual gripper pose (what the noisy readout measures).
+* ``true``: the oracle, each trial's hidden actual gripper pose (what the noisy readout measures);
+* ``observed_smooth``: ``observed`` low-pass filtered in time first (only in the ``drives`` landscape).
 
 The clamp is a known fixture held at rest. After the fits, every learned k is replayed with the hidden true gripper
 pose to compare trajectories and branches with the data.
@@ -19,9 +20,11 @@ pose to compare trajectories and branches with the data.
 Each rollout starts from the straight rest pose at rest (the learner knows neither the per-trial initial state nor
 the sag; the initial state is forgotten before the fork anyway).
 
-    uv run scratch/sysid/fit_ift.py time          # one forward + backward, timings and an FD check of the gradient
-    uv run scratch/sysid/fit_ift.py fit           # Adam and L-BFGS for every drive, then replay -> fit_ift.npz, fit_ift.png
-    uv run scratch/sysid/fit_ift.py plot          # re-plot fit_ift.npz
+    uv run examples/experimental/sysid/fit_ift.py time    # one forward + backward, timings and an FD check of the gradient
+    uv run examples/experimental/sysid/fit_ift.py fit     # Adam and L-BFGS for every drive, then replay -> fit_ift.npz, .png
+    uv run examples/experimental/sysid/fit_ift.py plot    # re-plot fit_ift.npz
+    uv run examples/experimental/sysid/fit_ift.py drives  # loss landscape in k and branch agreement per drive
+    uv run examples/experimental/sysid/fit_ift.py grad    # gradient near the truth, split by observed vs wrong branch
 """
 
 import sys
@@ -35,9 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import gen_baseline as gb  # noqa: E402
 
 from dismech_newton import flatten_state, suspended_tape  # noqa: E402
-from dismech_newton.solver import advance_frames_kernel  # noqa: E402
 from dismech_newton.strains import vec10f  # noqa: E402
-from dismech_newton.triplet import advance_ref_twist_kernel  # noqa: E402
 
 HERE = Path(__file__).parent
 OUT = HERE / "fit_ift.npz"
@@ -46,6 +47,8 @@ K_GUESS = 2.5
 LOG_K_BOUNDS = (np.log(0.5), np.log(300.0))
 ADAM_LR = 0.15  # Adam on log k
 VARIANTS = ("observed", "command", "true")
+DRIVES = ("observed", "observed_smooth", "true")  # `drives` landscape
+K_GRID = np.geomspace(2.0, 60.0, 13)
 OPTIMIZERS = ("adam", "lbfgs")
 MAX_EVALS = 40  # gradient evaluations per fit
 
@@ -108,6 +111,11 @@ def fixed_schedule(d, variant, rods):
     x_rest = d["x_rest"]
     if variant == "observed":  # the gripper pose readout (noisy), as one rigid pose of the gripped edge
         vals = pose_vals(x_rest, d["t"], d["grip_obs"][:B].astype(np.float64), t_step)
+    elif variant == "observed_smooth":  # the readout, low-pass filtered in time
+        from scipy.ndimage import gaussian_filter1d
+
+        poses = gaussian_filter1d(d["grip_obs"][:B].astype(np.float64), 2.0, axis=1, mode="nearest")
+        vals = pose_vals(x_rest, d["t"], poses, t_step)
     elif variant == "true":  # the oracle: the hidden actual gripper pose
         vals = pose_vals(x_rest, d["t"], d["grip"][:B], t_step)
     else:  # the nominal command, the same for every trial
@@ -147,20 +155,10 @@ class Fit:
     def _start(self):
         """states[0] = the rest pose with the step-0 fixed DOFs, frames transported, strains measured."""
         st, src = self.states[0], self.rest
-        for k in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
-            getattr(st.dismech, k).assign(getattr(src.dismech, k))
-        st.dismech.qd.zero_()
-        dev = self.model.device
+        gb.copy_state(st, src)
         wp.launch(set_fixed, dim=self.fix_idx.shape[0], inputs=[self.fix_idx, self.fix_vals, 0],
-                  outputs=[st.dismech.q], device=dev)
-        d, tr = self.solver.der, self.solver.triplets
-        wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0],
-                  inputs=[src.particle_q, st.particle_q, d.edge_node0, d.edge_node1, src.dismech.edge_d1_q],
-                  outputs=[st.dismech.edge_d1_q], device=dev)
-        wp.launch(advance_ref_twist_kernel, dim=tr.count,
-                  inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, src.dismech.triplet_ref_twist_q],
-                  outputs=[st.dismech.triplet_ref_twist_q], device=dev)
-        tr.measure(st, st.dismech.triplet_strain_q)
+                  outputs=[st.dismech.q], device=self.model.device)
+        gb.restart(self.solver, st, src)
 
     def run(self):
         dev = self.model.device
@@ -184,12 +182,14 @@ class Fit:
                           inputs=[self.states[i + 1].particle_q, self.obs[k - 1], self.free, gb.NODES, self.scale],
                           outputs=[self.loss], device=dev)
 
-    def loss_and_grad(self, log_k):
+    def loss_and_grad(self, log_k, w=None):
+        """Per-trial losses and d(sum_b w_b loss_b)/d(log k); ``w`` defaults to the mean (1 / rods each)."""
+        w = np.full(self.rods, 1.0 / self.rods) if w is None else w
         self.log_k.assign(np.array([log_k], dtype=np.float32))
         tape = wp.Tape()
         with tape:
             self.run()
-        tape.backward(grads={self.loss: wp.full(self.rods, 1.0 / self.rods, dtype=float, device=self.model.device)})
+        tape.backward(grads={self.loss: wp.array(np.asarray(w, np.float32), dtype=float, device=self.model.device)})
         g = float(self.log_k.grad.numpy()[0])
         per_trial = self.loss.numpy().astype(np.float64)
         tape.zero()
@@ -205,6 +205,11 @@ class Fit:
         """Simulated node positions at the observed frames (rods, frames, NODES, 3) of the last rollout."""
         return np.stack([self.states[k * gb.OBS_EVERY].particle_q.numpy().reshape(self.rods, gb.NODES, 3)
                          for k in range(gb.N_OBS + 1)], 1)
+
+    def branch_matches(self):
+        """Per trial: did the last rollout buckle onto the observed branch (at the end of compression)?"""
+        X = self.states[gb.K_BUCKLE * gb.OBS_EVERY].particle_q.numpy().reshape(self.rods, gb.NODES, 3)
+        return (gb.mid_rel(X) > 0) == self.up_obs
 
 
 def time_it(rods=256):
@@ -226,7 +231,6 @@ def time_it(rods=256):
         print(f"{variant}: loss {L.mean():.4f} mm^2 (taped {L2.mean():.4f}); forward {t_fwd:.1f} s, "
               f"forward+backward {t_grad:.1f} s; dL/dlogk IFT {g:+.5e}, FD {fd:+.5e}, rel {abs(g - fd) / abs(fd):.2e}",
               flush=True)
-        print(f"  peak GPU: see nvidia-smi", flush=True)
 
 
 def adam(fun, x, iters=MAX_EVALS, lr=ADAM_LR, b1=0.9, b2=0.999):
@@ -275,7 +279,7 @@ def fit(rods=256):
 
             tic = time.perf_counter()
             if opt == "adam":
-                xs = adam(fun, np.log(K_GUESS))
+                adam(fun, np.log(K_GUESS))
                 x_fit, msg = [h[0] for h in hist if np.isfinite(h[1])][-1], "max evaluations"
             else:
                 x_fit, msg = lbfgs(fun, np.log(K_GUESS))
@@ -298,6 +302,41 @@ def fit(rods=256):
     plot()
 
 
+def drives(rods=256):
+    """Loss landscape over K_GRID and branch agreement for each fixed-DOF drive in DRIVES."""
+    d = load()
+    for variant in DRIVES:
+        f = Fit(rods, variant, d)
+        print(f"\n{variant}:")
+        rows = []
+        for k in K_GRID:
+            L = f.forward(np.log(k))
+            m = f.branch_matches()
+            rows.append((k, L.mean()))
+            print(f"  k {k:7.2f}  loss {L.mean():8.2f}  loss(matched) {L[m].mean() if m.any() else np.nan:8.2f}  "
+                  f"branch match {m.mean():.3f}", flush=True)
+        kbest = min(rows, key=lambda r: r[1])[0]
+        print(f"  argmin over grid: k {kbest:.2f} (true {K_TRUE})")
+        del f
+
+
+def grad(rods=256, ks=(8.25, 10.0, 12.0)):
+    """IFT gradient near the truth (readout drive), split into trials on the observed branch vs the wrong one."""
+    f = Fit(rods, "observed")
+    for k in ks:
+        lk = np.log(k)
+        L = f.forward(lk)
+        match = f.branch_matches()
+        _, g_all = f.loss_and_grad(lk)
+        _, g_m = f.loss_and_grad(lk, match / rods)
+        _, g_w = f.loss_and_grad(lk, ~match / rods)
+        h = 0.05
+        fd = (f.forward(lk + h).mean() - f.forward(lk - h).mean()) / (2 * h)
+        print(f"k {k:5.2f}: match {match.mean():.3f}, loss matched {L[match].mean():.2f} wrong {L[~match].mean():.0f}; "
+              f"dL/dlogk IFT all {g_all:+.1f} = matched {g_m:+.1f} + wrong {g_w:+.1f}; secant FD (h={h}) {fd:+.1f}",
+              flush=True)
+
+
 def plot():
     import matplotlib.pyplot as plt
 
@@ -306,7 +345,6 @@ def plot():
     colors = {"observed": "#2a6fdb", "command": "#d1453b", "true": "#2a9d55"}
     names = {"observed": "readout", "command": "command", "true": "oracle"}
     styles = {"adam": "-", "lbfgs": "--"}
-    opt_names = {"adam": "Adam", "lbfgs": "L-BFGS"}
     runs = [(v, "adam") for v in VARIANTS]  # the plot shows Adam only (L-BFGS is in fit_ift.npz)
     kt = float(d["k_true"])
 
@@ -352,4 +390,7 @@ def plot():
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "fit"
     rods = int(sys.argv[2]) if len(sys.argv) > 2 else 256
-    {"time": time_it, "fit": fit, "plot": plot}[mode](*(() if mode == "plot" else (rods,)))
+    if mode == "plot":
+        plot()
+    else:
+        {"time": time_it, "fit": fit, "drives": drives, "grad": grad}[mode](rods)

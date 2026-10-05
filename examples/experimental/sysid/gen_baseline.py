@@ -14,10 +14,10 @@ runs are deterministic (Newton, batched worlds). Observation noise is added afte
 (free and fixed) and to the gripper pose readout. The compression buckles the rod; with gravity's sag bias
 cancelled only by the noise, trials fork up or down.
 
-    uv run scratch/sysid/gen_baseline.py scan        # P(up) vs density scale (picks the gravity bias)
-    uv run scratch/sysid/gen_baseline.py gen [N]     # dataset -> baseline.npz, baseline.png
-    uv run scratch/sysid/gen_baseline.py plot        # re-plot baseline.npz
-    uv run scratch/sysid/gen_baseline.py check       # sanity checks on baseline.npz
+    uv run examples/experimental/sysid/gen_baseline.py scan        # what decides the branch, for FORK_CONFIGS
+    uv run examples/experimental/sysid/gen_baseline.py gen [N]     # dataset -> baseline.npz, baseline.png
+    uv run examples/experimental/sysid/gen_baseline.py plot        # re-plot baseline.npz
+    uv run examples/experimental/sysid/gen_baseline.py check       # sanity checks on baseline.npz
 """
 
 import sys
@@ -141,6 +141,29 @@ def build(rods: int, density_scale: float):
     return model, solver
 
 
+STATE_KEYS = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q")
+
+
+def copy_state(dst, src):
+    for k in STATE_KEYS:
+        getattr(dst.dismech, k).assign(getattr(src.dismech, k))
+
+
+def restart(solver, st, src):
+    """Make ``st`` (positions already set) a consistent start at rest: the edge frames parallel-transported and the
+    reference twist advanced from ``src`` (as at the end of a step), the strains re-measured. Every rollout must start
+    like this: the frames and stored strains are state, and stale ones kick the rod."""
+    st.dismech.qd.zero_()
+    d, tr, dev = solver.der, solver.triplets, solver.model.device
+    wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0],
+              inputs=[src.particle_q, st.particle_q, d.edge_node0, d.edge_node1, src.dismech.edge_d1_q],
+              outputs=[st.dismech.edge_d1_q], device=dev)
+    wp.launch(advance_ref_twist_kernel, dim=tr.count,
+              inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, src.dismech.triplet_ref_twist_q],
+              outputs=[st.dismech.triplet_ref_twist_q], device=dev)
+    tr.measure(st, st.dismech.triplet_strain_q)
+
+
 @wp.kernel
 def _grip_kernel(p0: wp.array[wp.vec3], pose: wp.array[wp.types.vector(6, float)], nodes: int, segments: int,
                  twist0: int, q: wp.array[float]):
@@ -180,38 +203,23 @@ class Sim:
             flatten_state(s)
         self.twist0 = 3 * m.particle_count
         self.solver.triplets.measure(self.rest, self.rest.dismech.triplet_strain_q)
-        self._copy(self.base, self.rest)
+        copy_state(self.base, self.rest)
 
     def _grip(self, st, pose):
         self.pose.assign(pose.astype(np.float32))
         wp.launch(_grip_kernel, dim=self.rods, inputs=[self.p0, self.pose, NODES, SEGMENTS, self.twist0],
                   outputs=[st.dismech.q], device=self.model.device)
 
-    @staticmethod
-    def _copy(dst, src):
-        for k in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
-            getattr(dst.dismech, k).assign(getattr(src.dismech, k))
-
     def _start(self, st, src, x=None, twist=None):
-        """``st`` = ``src`` moved to positions ``x`` / twists ``twist`` at rest: the edge frames parallel-transported
-        and the reference twist advanced from ``src`` (as at the end of a step), the strains re-measured. Every
-        rollout must start like this: the frames and stored strains are state, and stale ones kick the rod."""
-        self._copy(st, src)
+        """``st`` = ``src`` moved to positions ``x`` / twists ``twist``, restarted at rest (see `restart`)."""
+        copy_state(st, src)
         q = st.dismech.q.numpy()
         if x is not None:
             q[: self.twist0] = x.reshape(-1)
         if twist is not None:
             q[self.twist0:] = twist.reshape(-1)
         st.dismech.q.assign(q)
-        st.dismech.qd.zero_()
-        d, tr = self.solver.der, self.solver.triplets
-        wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0],
-                  inputs=[src.particle_q, st.particle_q, d.edge_node0, d.edge_node1, src.dismech.edge_d1_q],
-                  outputs=[st.dismech.edge_d1_q], device=self.model.device)
-        wp.launch(advance_ref_twist_kernel, dim=tr.count,
-                  inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, src.dismech.triplet_ref_twist_q],
-                  outputs=[st.dismech.triplet_ref_twist_q], device=self.model.device)
-        tr.measure(st, st.dismech.triplet_strain_q)
+        restart(self.solver, st, src)
 
     def sag(self, steps=40, dt=0.5) -> tuple[np.ndarray, np.ndarray]:
         """Static gravity-sag equilibrium with both clamps at rest (big implicit steps = a damped static solve);
@@ -222,7 +230,7 @@ class Sim:
             a.dismech.qd.zero_()
             self.solver.step(a, b, None, None, dt)
             a, b = b, a
-        self._copy(self.base, a)
+        copy_state(self.base, a)
         self.base.dismech.qd.zero_()
         q = a.dismech.q.numpy()
         return q[: self.twist0].reshape(self.rods, NODES, 3), q[self.twist0:].reshape(self.rods, SEGMENTS)
@@ -264,10 +272,19 @@ def sample(rng, trials, sim_sag, s_q0=None):
 
 
 # -- modes ----------------------------------------------------------------------------------------------------------
-def scan(trials=128, seed=3, configs=None):
+FORK_CONFIGS = [  # (label, {module global: value}) for `scan`
+    ("as configured", {}),
+    ("rho .1, pitch .8", dict(DENSITY_SCALE=0.1, S_GRIP_R=np.radians(0.8))),
+    ("rho .1, pitch 1.0", dict(DENSITY_SCALE=0.1, S_GRIP_R=np.radians(1.0))),
+    ("rho .1, pitch .6, theta .5", dict(DENSITY_SCALE=0.1, S_GRIP_R=np.radians(0.6), SOLVER_THETA=0.5)),
+    ("rho .1, pitch .6, theta .5, q0 1mm",
+     dict(DENSITY_SCALE=0.1, S_GRIP_R=np.radians(0.6), SOLVER_THETA=0.5, S_Q0=1e-3)),
+]
+
+
+def scan(trials=128, seed=3, configs=FORK_CONFIGS):
     """What decides the branch: P(up) at the end of compression, and the fraction of trials whose branch flips when
     the initial perturbation (or the gripper error) is removed. ``configs``: (label, {module global: value})."""
-    configs = configs or [("as configured", {})]
     for label, over in configs:
         old = {k: globals()[k] for k in (*over, "T_END", "STEPS", "N_OBS", "K_BUCKLE")}
         globals().update(over)

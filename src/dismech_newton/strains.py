@@ -76,6 +76,8 @@ class TripletGeometry:
     chi: float
     tt: wp.vec3  # (te + tf) / chi
     kb: wp.vec3  # curvature binormal
+    te_old: wp.vec3  # the tangents the reference directors are transported from
+    tf_old: wp.vec3
     m1e: wp.vec3
     m2e: wp.vec3
     m1f: wp.vec3
@@ -108,6 +110,8 @@ def triplet_geometry(
     g.l0f = l0f
     g.te = ee / g.ne
     g.tf = ef / g.nf
+    g.te_old = te_old
+    g.tf_old = tf_old
     d1e = parallel_transport(d1e_old, te_old, g.te)
     d1f = parallel_transport(d1f_old, tf_old, g.tf)
     m1e, m2e = material_frame(d1e, g.te, theta_e)
@@ -134,11 +138,62 @@ def triplet_geometry(
 #
 # Both curvatures are ``kappa = kb . (Me + Mf) / 2`` with directors that turn as ``dM/dtheta = N``
 # (so ``d^2M/dtheta^2 = -M``): ``kappa1`` has ``M = m2, N = -m1``, ``kappa2`` has ``M = -m1, N = -m2``.
+#
+# Those formulas are for current frames (directors transported from the current tangents). Transported from
+# ``t_old`` instead, a director differs by a turn ``phi`` about ``t`` (the holonomy of the transport), which acts as
+# ``theta + phi``: the strains are ``F(x, theta + phi(x))`` with ``F`` the current-frame strains. So with
+# ``T = d(x, theta + phi)/dq``, ``J = J_F T`` and ``sum sigma H = T^T (sum sigma H_F) T + sum_edges (sigma . dF/dtheta)
+# d^2 phi`` -- the exact (symmetric) Hessian of the step's energy.
+
+
+@wp.func
+def transport_turn(t_old: wp.vec3, t: wp.vec3, n: float):
+    """``(d phi/de, d^2 phi/de^2)`` at ``e = n t``, ``phi`` the director's turn about ``t`` between transport from
+    ``t_old`` and from ``t``: the signed area of the spherical triangle ``(t_old, t, t')``, ``t' = e' / |e'|``, from
+    ``tan(phi / 2) = (t x t_old) . t' / (1 + t_old . t + t . t' + t' . t_old)``."""
+    w = wp.cross(t, t_old)
+    c = 1.0 + wp.dot(t_old, t)
+    v = w / c  # d phi / dt' (perpendicular to t)
+    s = t_old + t
+    I3 = wp.identity(3, dtype=float)
+    P = I3 - wp.outer(t, t)
+    H_t = -(wp.outer(w, s) + wp.outer(s, w)) / (2.0 * c * c)  # d^2 phi / dt'^2
+    H = (P * H_t * P - wp.outer(v, t) - wp.outer(t, v)) / (n * n)  # through t' = e' / |e'|
+    return v / n, H
+
+
+@wp.func
+def _transport_map(ge: wp.vec3, gf: wp.vec3) -> mat11f:
+    """``T = d(x, theta + phi)/dq``: the identity, and ``d phi_e/dq``, ``d phi_f/dq`` in the twist rows."""
+    T = wp.identity(11, dtype=float)
+    Ge = edge_gradient(ge, wp.vec3(), 0.0, 0.0)
+    Gf = edge_gradient(wp.vec3(), gf, 0.0, 0.0)
+    for i in range(11):
+        T[3, i] = T[3, i] + Ge[i]
+        T[7, i] = T[7, i] + Gf[i]
+    return T
 
 
 @wp.func
 def strain_derivatives(g: TripletGeometry, sigma: vec5f):
     """``J`` (5 x 11) and ``sum_i sigma_i H_i``."""
+    JF, HF = _current_frame_derivatives(g, sigma)
+    ge, He = transport_turn(g.te_old, g.te, g.ne)
+    gf, Hf = transport_turn(g.tf_old, g.tf, g.nf)
+    T = _transport_map(ge, gf)
+    H = wp.transpose(T) * HF * T
+    torque_e = float(0.0)
+    torque_f = float(0.0)
+    for i in range(5):
+        torque_e = torque_e + sigma[i] * JF[i, 3]
+        torque_f = torque_f + sigma[i] * JF[i, 7]
+    H = add_edge_hessian(H, torque_e * He, wp.mat33(), torque_f * Hf)
+    return JF * T, H
+
+
+@wp.func
+def _current_frame_derivatives(g: TripletGeometry, sigma: vec5f):
+    """``J_F`` and ``sum_i sigma_i H_F,i``: the derivatives for current frames."""
     zero = wp.vec3()
     De1, Df1, a1, b1 = kappa_gradient(g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
     De2, Df2, a2, b2 = kappa_gradient(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
@@ -176,7 +231,12 @@ def strain_gradient(g: TripletGeometry, sigma: vec5f) -> vec11f:
     De2, Df2, a2, b2 = kappa_gradient(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
     De = sigma[0] / g.l0e * g.te + sigma[2] * De1 + sigma[3] * De2 + sigma[4] * 0.5 * g.kb / g.ne
     Df = sigma[1] / g.l0f * g.tf + sigma[2] * Df1 + sigma[3] * Df2 + sigma[4] * 0.5 * g.kb / g.nf
-    return edge_gradient(De, Df, sigma[2] * a1 + sigma[3] * a2 - sigma[4], sigma[2] * b1 + sigma[3] * b2 + sigma[4])
+    torque_e = sigma[2] * a1 + sigma[3] * a2 - sigma[4]
+    torque_f = sigma[2] * b1 + sigma[3] * b2 + sigma[4]
+    # T^T: each edge's turn moves its torque onto the nodes (d phi/de of transport_turn, without its Hessian).
+    w_e = wp.cross(g.te, g.te_old) / ((1.0 + wp.dot(g.te_old, g.te)) * g.ne)
+    w_f = wp.cross(g.tf, g.tf_old) / ((1.0 + wp.dot(g.tf_old, g.tf)) * g.nf)
+    return edge_gradient(De + torque_e * w_e, Df + torque_f * w_f, torque_e, torque_f)
 
 
 @wp.func

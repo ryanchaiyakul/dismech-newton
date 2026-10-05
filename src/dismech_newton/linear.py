@@ -56,9 +56,11 @@ class _Residual:
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`); without ``refactorize``, factorised once."""
+    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`); without ``refactorize``, factorised once. Capturable,
+    but not inside a device-side loop (a conditional graph node fails to instantiate)."""
 
     graph_capturable = True
+    loop_capturable = False
 
     def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False) -> None:
         if cudss is None:
@@ -132,7 +134,7 @@ class CudssSolver:
 class ScipySolver:
     """``A x = b`` by SuperLU on the CPU, in float64; not graph-capturable."""
 
-    graph_capturable = False
+    graph_capturable = loop_capturable = False
 
     def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False) -> None:
         self.A = A
@@ -203,7 +205,7 @@ class BlockInverseSolver:
 
     max_block = 4096  # largest block, and largest total of stored entries, that fits() accepts
     max_entries = 1 << 26
-    graph_capturable = True
+    graph_capturable = loop_capturable = True
 
     def __init__(self, A: SymmetricCSR, increment: bool = False, H: sp.spmatrix | None = None) -> None:
         """``H``: ``A.to_scipy()``, if already at hand."""
@@ -269,7 +271,7 @@ class TridiagonalSolver:
     apart, in the scatter. With ``increment`` the residual is formed in the gather (no extra launch).
     """
 
-    graph_capturable = True
+    graph_capturable = loop_capturable = True
 
     def __init__(self, A: SymmetricCSR, increment: bool = False, H: sp.spmatrix | None = None) -> None:
         """``H``: ``A.to_scipy()``, if already at hand."""

@@ -23,7 +23,7 @@ from dismech_newton.strains import vec10f
 STEPS, DT = 60, 1.0 / 120.0  # half a second: the sag and the first bounce
 TRUE, GUESS = (10.0, 0.05), (2.5, 0.3)  # (bend stiffness [N m / rad], bend damping [N m s / rad])
 RADIUS, SEGMENTS = 0.01, 20
-TOL = 1.0e-5  # the fit resolves the motion only as well as the solver does
+TOL = 1.0e-4  # ADMM's default: tighter stalls at its iteration cap here, without a better fit
 GRID = 31  # landscape samples per axis
 K_RANGE, C_RANGE = (0.625, 20.0), (0.003125, 0.8)  # geometric, with TRUE on the grid
 
@@ -84,7 +84,8 @@ def _motion(r: Rollout, **extra) -> dict:
 def fit():
     """Observe, then L-BFGS on the parameters' logs: the model, the observed motion, every iterate's."""
     builder = newton.ModelBuilder()
-    add_cantilever(builder, bend_stiffness=1.0, color=(0.3, 0.8, 0.5))
+    # ADMM sizes its penalties from the stiffness it is built at: the stiffest candidate converges fastest.
+    add_cantilever(builder, bend_stiffness=K_RANGE[1], color=(0.3, 0.8, 0.5))
     model = builder.finalize()
     r = Rollout(model)
     params = model.dismech.triplet_params

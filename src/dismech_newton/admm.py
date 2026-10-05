@@ -43,7 +43,7 @@ class ADMMDiSMechSolver(DiSMechSolver):
     add_rod = staticmethod(add_colliding_rod)
 
     def __init__(
-        self, model: Model, *, energy=linear_energy, iterations: int = 200, tol: float = 1.0e-4, check_every: int = 10,
+        self, model: Model, *, energy=linear_energy, iterations: int = 50, tol: float = 1.0e-4, check_every: int = 10,
         rho_scale: float = 0.3, rho_abs_ratio: float = 0.1, local_iterations: int = 2, self_contact: bool = True,
         friction: float = 0.3, contact_rho_scale: float = 1.8, contact_smoothing: float = 1.0e-3,
         pose_proxies: bool = True, linear_solver: str = "auto", theta: float = 1.0, obstacle_motion: str = "velocity",
@@ -84,6 +84,10 @@ class ADMMDiSMechSolver(DiSMechSolver):
 
     def contact_snapshot(self) -> ContactSnapshot | None:
         return self.contact.snapshot(self.contact_smoothing)
+
+    @property
+    def _device_loop(self) -> bool:
+        return self.tol > 0.0
 
     def add_contact_reactions(self, body_f: wp.array) -> None:
         """Add the last step's contact wrenches on rigid bodies to ``body_f``."""

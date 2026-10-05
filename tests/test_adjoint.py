@@ -1,6 +1,8 @@
 """The step adjoint against finite differences of a rollout, batched: one model holds a rod per evaluation."""
 
 import copy
+from dataclasses import replace
+from types import SimpleNamespace
 
 import newton
 import numpy as np
@@ -9,17 +11,13 @@ import warp as wp
 from fd import assert_close, derivative, jacobian
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, flatten_state
+from dismech_newton.adjoint import StepAdjoint, _ContactSystem
 from dismech_newton.dofs import dof_constants
+from dismech_newton.linear import cudss
 from dismech_newton.solver import suspended_tape
 
-STEPS, DT, SEGMENTS, RADIUS = 3, 1.0e-2, 4, 0.01
-
-
-@pytest.fixture(autouse=True)
-def _on_device(device):
-    """Models and solvers on ``--device``."""
-    with wp.ScopedDevice(device):
-        yield
+RADIUS = 0.01
+CONTACT_OPTIONS = dict(tol=0.0, iterations=500)  # a fixed count keeps batched copies identical to lone rods
 
 
 @wp.kernel
@@ -42,27 +40,32 @@ def _group(builder, group: int):
 
 
 def _dofs(model, copies: int) -> np.ndarray:
-    """``(copies, n)``: each rod's DOFs, nodes then edges."""
+    """``(copies, n)``: each copy's DOFs, nodes then edges."""
     p, e = model.particle_count // copies, model.dismech.edge_q.shape[0] // copies
     c = np.arange(copies)[:, None]
     return np.hstack([3 * p * c + np.arange(3 * p), 3 * model.particle_count + e * c + np.arange(e)])
 
 
 class Rollout:
-    """Copies of a rod, overlapping but not colliding, each perturbed along its row of ``X``; per copy
-    ``loss = w . (q_T + dt qd_T)`` (``dt`` damps velocity round-off).
+    """Copies of a model, overlapping but not colliding, each perturbed along its row of ``X``; per copy
+    ``loss = sum_t w . (q_t + dt qd_t)`` over every step's end (``dt`` damps velocity round-off; the intermediate
+    states take the loss's adjoint as well as the next step's).
 
-    ``directions`` maps a name to ``(fd step, {array: perturbation per unit})``, arrays one rod's slice of
-    :func:`_parameters`, ``q`` or ``qd``. Every evaluation builds a fresh model, so warm starts do not carry over.
+    ``directions`` maps a name to ``(fd step, {array: perturbation per unit})``, arrays one copy's slice of
+    :func:`_parameters`, ``q`` or ``qd`` (the first state's) or ``force`` (``particle_f`` on every step). Every
+    evaluation builds a fresh model, so warm starts do not carry over.
     """
 
     ground = False
+    colliding = False  # a collision pipeline every step (ADMM)
     height = 1.0
+    segments, steps, dt = 4, 3, 1.0e-2
     rod_options = dict(stretch_stiffness=1.0e4, bend_stiffness=2.0, twist_stiffness=1.0)
 
-    def __init__(self, rng, solver_cls):
+    def __init__(self, rng, solver_cls=DiSMechSolver):
         model = self._model(1, solver_cls)
         self.fixed = dof_constants(model)[1].numpy() != 0
+        self.nodes = model.particle_count
         self.w = rng.normal(size=len(self.fixed))
         self.v0 = self._velocity(rng, model)
         self.directions = self._directions(rng, model)
@@ -72,31 +75,24 @@ class Rollout:
         if self.ground:
             builder.add_ground_plane(cfg=_group(builder, -1))
         for c in range(copies):
-            rod = newton.Rod.create_straight((0.0, 0.0, self.height), (1.0, 0.0, 0.0), 0.5, segment_count=SEGMENTS,
-                                             radius=RADIUS)
-            cfg = _group(builder, c + 1)  # copies touch the ground only
-            bodies = solver_cls.add_rod(builder, rod, cfg=cfg, **self.rod_options)
+            rod = newton.Rod.create_straight((0.0, 0.0, self.height), (1.0, 0.0, 0.0), 0.5,
+                                             segment_count=self.segments, radius=RADIUS)
+            bodies = solver_cls.add_rod(builder, rod, cfg=_group(builder, c + 1), **self.rod_options)  # copies apart
             if not self.ground:
                 solver_cls.fix_segment(builder, bodies[0])
         return builder.finalize()
 
     def _matrix(self, key: str, size: int) -> np.ndarray:
-        """``(k, size)``: the directions' perturbations of one rod's ``key``."""
-        return np.stack([d[key].ravel() if key in d else np.zeros(size) for _, d in self.directions.values()])
+        """``(k, size)``: the directions' perturbations of one copy's ``key``."""
+        return np.array([d[key].ravel() if key in d else np.zeros(size) for _, d in self.directions.values()]
+                        ).reshape(len(self.directions), size)
 
     @property
-    def steps(self) -> np.ndarray:
+    def fd_steps(self) -> np.ndarray:
         return np.array([h for h, _ in self.directions.values()])
 
-    def losses(self, X: np.ndarray, solver_cls, **options) -> np.ndarray:
-        """``(N,)`` at the rows of ``X`` ``(N, k)``."""
-        return self._run(np.atleast_2d(X), solver_cls, options, grad=False)
-
-    def adjoint(self, solver_cls, **options) -> dict:
-        """The derivatives along ``directions`` (and in ``friction``, on the ground)."""
-        return self._run(np.zeros((1, len(self.directions))), solver_cls, options, grad=True)
-
-    def _run(self, X, solver_cls, options, grad):
+    def setup(self, X: np.ndarray, solver_cls, options: dict, grad: bool) -> SimpleNamespace:
+        """``len(X)`` perturbed copies, their solver and states (the first set, the rest to step into)."""
         copies = len(X)
         model = self._model(copies, solver_cls)
         solver = solver_cls(model, **options)
@@ -106,7 +102,7 @@ class Rollout:
             a.assign((base.reshape(copies, -1) + X @ self._matrix(key, base.size // copies)).reshape(base.shape))
             a.requires_grad = grad
         solver.refresh_mass()
-        states = [model.state(requires_grad=grad) for _ in range(STEPS + 1)]
+        states = [model.state(requires_grad=grad) for _ in range(self.steps + 1)]
         for state in states:
             flatten_state(state)
         s0 = states[0].dismech
@@ -117,45 +113,79 @@ class Rollout:
         qd[dofs] = self.v0 + X @ self._matrix("qd", n)
         s0.q.assign(q)
         s0.qd.assign(qd)
-
-        pipeline = contacts = None
-        if self.ground:
-            pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
-                                                speculative_contact_gap_max=2.0 * RADIUS, contact_matching="latest")
-            contacts = pipeline.contacts()
+        force = (X @ self._matrix("force", 3 * self.nodes)).reshape(-1, 3)
+        for state in states[:-1]:
+            state.particle_f.assign(force)
+        run = SimpleNamespace(model=model, solver=solver, states=states, arrays=arrays, dofs=dofs,
+                              pipeline=None, contacts=None)
+        if self.colliding:
+            run.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
+                                                    speculative_contact_gap_max=2.0 * RADIUS,
+                                                    contact_matching="latest")
+            run.contacts = run.pipeline.contacts()
             solver.contact.friction.requires_grad = grad
-        w = np.tile(self.w, copies)
-        loss = wp.zeros(1, dtype=float, requires_grad=True)
+        return run
+
+    def simulate(self, run: SimpleNamespace) -> None:
+        """Every step, after its collision detection (off the tape)."""
+        for t in range(self.steps):
+            if run.pipeline is not None:
+                with suspended_tape():
+                    run.pipeline.collide(run.states[t], run.contacts, dt=2.0 * self.dt)
+            run.solver.step(run.states[t], run.states[t + 1], None, run.contacts, self.dt)
+
+    def losses(self, X: np.ndarray, solver_cls, **options) -> np.ndarray:
+        """``(N,)`` at the rows of ``X`` ``(N, k)``, summed in float64: the float32 atomic sum rounds in a
+        run-dependent order, by more than the finite differences resolve."""
+        run = self.setup(np.atleast_2d(X), solver_cls, options, grad=False)
+        self.simulate(run)
+        total = 0.0
+        for state in run.states[1:]:
+            q, qd = state.dismech.q.numpy().astype(np.float64), state.dismech.qd.numpy().astype(np.float64)
+            total = total + (q[run.dofs] + self.dt * qd[run.dofs]) @ self.w
+        return total
+
+    def record(self, run: SimpleNamespace, loss: wp.array) -> wp.Tape:
+        """Simulate, ``loss``, backward: device work only, so a CUDA graph can hold it once ``run`` has stepped."""
+        if not hasattr(run, "weights"):  # copied from the host before any capture
+            run.weights = wp.array(self.w, dtype=float), wp.array(self.dt * self.w, dtype=float)
+        w, w_dt = run.weights
+        loss.zero_()
         tape = wp.Tape()
         with tape:
-            for t in range(STEPS):
-                if pipeline is not None:
-                    with suspended_tape():
-                        pipeline.collide(states[t], contacts, dt=2.0 * DT)
-                solver.step(states[t], states[t + 1], None, contacts, DT)
-            end = states[STEPS].dismech
-            if grad:
-                wp.launch(_dot, dim=len(w), inputs=[end.q, wp.array(w, dtype=float)], outputs=[loss])
-                wp.launch(_dot, dim=len(w), inputs=[end.qd, wp.array(DT * w, dtype=float)], outputs=[loss])
-        if not grad:
-            # In float64: the float32 atomic sum rounds in a run-dependent order, by more than the
-            # finite differences resolve.
-            q, qd = end.q.numpy().astype(np.float64), end.qd.numpy().astype(np.float64)
-            return (q[dofs] + DT * qd[dofs]) @ self.w
-        if self.ground:
-            assert solver.contact.active.numpy().sum() > 0
+            self.simulate(run)
+            for state in run.states[1:]:
+                wp.launch(_dot, dim=len(self.w), inputs=[state.dismech.q, w], outputs=[loss])
+                wp.launch(_dot, dim=len(self.w), inputs=[state.dismech.qd, w_dt], outputs=[loss])
         tape.backward(loss)
-        grads = {key: a.grad.numpy().ravel() for key, a in arrays.items()}
-        grads["q"], grads["qd"] = s0.q.grad.numpy()[dofs[0]], s0.qd.grad.numpy()[dofs[0]]
+        return tape
+
+    def adjoint(self, solver_cls, **options) -> dict:
+        """The derivatives along ``directions`` (and in ``friction``, with contacts)."""
+        run = self.setup(np.zeros((1, len(self.directions))), solver_cls, options, grad=True)
+        self.record(run, wp.zeros(1, dtype=float, requires_grad=True))
+        if self.colliding:
+            assert run.solver.contact.active.numpy().sum() > 0
+        s0 = run.states[0].dismech
+        grads = {key: a.grad.numpy().ravel() for key, a in run.arrays.items()}
+        grads["q"], grads["qd"] = s0.q.grad.numpy()[run.dofs[0]], s0.qd.grad.numpy()[run.dofs[0]]
+        grads["force"] = sum(state.particle_f.grad.numpy() for state in run.states[:-1]).ravel()
         out = {name: sum(float(grads[key] @ delta.ravel()) for key, delta in deltas.items())
                for name, (_, deltas) in self.directions.items()}
-        if self.ground:
-            out["friction"] = float(solver.contact.friction.grad.numpy()[0])
+        if self.colliding:
+            out["friction"] = float(run.solver.contact.friction.grad.numpy()[0])
         return out
 
-    def finite_differences(self, solver_cls, **options) -> dict:
-        J = jacobian(lambda X: self.losses(X, solver_cls, **options)[:, None], np.zeros(len(self.steps)), self.steps)
-        return dict(zip(self.directions, J[0]))
+    def finite_differences(self, solver_cls, wrt_friction: bool = False, **options) -> dict:
+        """Along ``directions``; with ``wrt_friction``, also in the friction coefficient."""
+        J = jacobian(lambda X: self.losses(X, solver_cls, **options)[:, None], np.zeros(len(self.fd_steps)),
+                     self.fd_steps)
+        out = dict(zip(self.directions, J[0]))
+        if wrt_friction:
+            zero, mu = np.zeros((1, len(self.directions))), options["friction"]
+            out["friction"] = derivative(lambda e: self.losses(zero, solver_cls, **dict(options, friction=mu + e))[0],
+                                         0.05)
+        return out
 
 
 class ClampedRollout(Rollout):
@@ -173,6 +203,7 @@ class ClampedRollout(Rollout):
         bend[:, 2:4] = k[:, 2:4]
         length, mass, inertia = d.edge_length.numpy(), model.particle_mass.numpy(), d.edge_inertia.numpy()
         free = np.where(self.fixed, 0.0, rng.normal(size=self.fixed.size))
+        free_nodes = ~self.fixed[: 3 * self.nodes].reshape(-1, 3)
         return {
             "bend stiffness": (0.2, {"params": bend}),  # relative; a small effect over the steps
             "rest strain": (5.0e-2, {"rest": rng.normal(size=(k.shape[0], 5))}),  # nonlinear in curvature
@@ -181,13 +212,33 @@ class ClampedRollout(Rollout):
                            "inertia": inertia * rng.normal(size=inertia.shape)}),
             "velocity": (2.0e-2, {"qd": free}),
             "position": (6.0e-4, {"q": free}),  # stiff stretching: nonlinear in positions
+            # The prescribed DOFs (the clamp), which every step carries over from its input.
+            "clamp": (6.0e-4, {"q": np.where(self.fixed, rng.normal(size=self.fixed.size), 0.0)}),
+            # [N] on every free node along one direction (a random force per node can all but miss the loss).
+            "force": (0.3, {"force": np.where(free_nodes, 0.3 * rng.normal(size=3), 0.0)}),
         }
+
+
+class SpinningRollout(ClampedRollout):
+    """A long clamped rod swinging and spinning at a long step: its reference frames lag far behind."""
+
+    segments, steps, dt = 30, 2, 1.0 / 30.0
+    rod_options = dict(Rollout.rod_options, bend_damping=0.05)
+
+    def _velocity(self, rng, model):
+        nd, x = 3 * self.nodes, np.linspace(0.0, 1.0, self.nodes)
+        v = np.zeros(self.fixed.size)
+        v[1:nd:3], v[2:nd:3], v[nd:] = 0.5 * x**2, 0.3 * x, np.linspace(0.0, 5.0, v.size - nd)
+        return np.where(self.fixed, 0.0, v)
+
+    def _directions(self, rng, model):
+        return {}
 
 
 class GroundRollout(Rollout):
     """A rod sliding on the ground (ADMM, friction)."""
 
-    ground = True
+    ground = colliding = True
     height = RADIUS
 
     def __init__(self, rng, v_mean, checks):
@@ -218,8 +269,57 @@ class GroundRollout(Rollout):
         return {name: directions[name] for name in self.checks if name in directions}
 
 
-def _assert_matches(adjoint: dict, fd: dict, rtol: float = 1.0e-2, rtols: dict | None = None):
-    """``rtols`` overrides ``rtol`` per name."""
+class CrossingRollout(Rollout):
+    """Per copy a cantilever along x and a free rod along y lying across it, pressed down and sliding along x: one
+    rod-rod contact, mid-edge on both (no cell switch), whose normal turns with the rods (unlike the ground's)."""
+
+    colliding = True
+    half = 0.3125  # nodes at +-0.0625 around the crossing at the origin
+
+    def _model(self, copies: int, solver_cls):
+        builder = newton.ModelBuilder()
+        for c in range(copies):
+            cfg = _group(builder, c + 1)  # the copy's two rods touch each other only
+            for start, direction, clamped in (((-self.half, 0.0, 0.0), (1.0, 0.0, 0.0), True),
+                                              ((0.0, -self.half, 2.0 * RADIUS), (0.0, 1.0, 0.0), False)):
+                rod = newton.Rod.create_straight(start, direction, 0.5, segment_count=self.segments, radius=RADIUS)
+                bodies = solver_cls.add_rod(builder, rod, cfg=cfg, **self.rod_options)
+                if clamped:
+                    solver_cls.fix_segment(builder, bodies[0])
+        return builder.finalize()
+
+    def _velocity(self, rng, model):
+        nd, half = 3 * model.particle_count, model.particle_count // 2
+        v = np.zeros(self.fixed.size)
+        top = slice(3 * half, nd)
+        v[top][0::3], v[top][2::3] = 0.3, -0.1  # sliding along the bottom rod, pressed onto it
+        v[nd:] = np.where(self.fixed[nd:], 0.0, 0.5 * rng.normal(size=v.size - nd))
+        return v
+
+    def _directions(self, rng, model):
+        nd, half = 3 * model.particle_count, model.particle_count // 2
+        x = model.particle_q.numpy()[half:]
+        free = np.where(self.fixed, 0.0, rng.normal(size=self.fixed.size))
+        tilt = np.zeros(self.fixed.size)  # the top rod turned about x: its tangent, so the normal, turns
+        tilt[3 * half + 2 : nd : 3] = x[:, 1]
+        yaw = np.zeros(self.fixed.size)  # turned about z: the crossing angle
+        yaw[3 * half : nd : 3], yaw[3 * half + 1 : nd : 3] = -x[:, 1], x[:, 0]
+        mass = model.particle_mass.numpy()
+        return {
+            "mass": (0.1, {"particle_mass": mass * rng.normal(size=mass.shape)}),
+            "velocity": (4.0e-2, {"qd": free}),
+            "position": (1.2e-3, {"q": free}),  # small effects: smaller steps round off (4x larger is nonlinear)
+            "tilt": (2.0e-2, {"q": tilt}),
+            "yaw": (2.0e-2, {"q": yaw}),
+        }
+
+
+def _check(r: Rollout, solver_cls, options: dict, rtol: float, rtols: dict | None = None, fd_solver_cls=None,
+           fd_options: dict | None = None, wrt_friction: bool = False):
+    """The adjoint of ``solver_cls`` against finite differences (of ``fd_solver_cls``, ``fd_options`` if given);
+    ``rtols`` overrides ``rtol`` per name."""
+    adjoint = r.adjoint(solver_cls, **options)
+    fd = r.finite_differences(fd_solver_cls or solver_cls, wrt_friction=wrt_friction, **(fd_options or options))
     for name, f in fd.items():
         assert_close(adjoint[name], f, (rtols or {}).get(name, rtol), name)
 
@@ -230,14 +330,35 @@ def _assert_matches(adjoint: dict, fd: dict, rtol: float = 1.0e-2, rtols: dict |
         (DiSMechSolver, {"newton_tol": 1.0e-7}),
         (DiSMechSolver, {"newton_tol": 1.0e-7, "theta": 0.5}),
         (ADMMDiSMechSolver, {"tol": 1.0e-6, "iterations": 5000}),
+        (ADMMDiSMechSolver, {"tol": 1.0e-6, "iterations": 5000, "theta": 0.5}),
     ],
-    ids=["newton", "newton-midpoint", "admm"],
+    ids=["newton", "newton-midpoint", "admm", "admm-midpoint"],
 )
 def test_step_adjoint_matches_finite_differences(rng, solver_cls, options):
-    """Differences use Newton-Raphson: the adjoint is of the exact root."""
-    r = ClampedRollout(rng, DiSMechSolver)
-    adjoint = r.adjoint(solver_cls, **options)
-    _assert_matches(adjoint, r.finite_differences(DiSMechSolver, newton_tol=1.0e-7, theta=options.get("theta", 1.0)))
+    """Every differentiable input, the clamp and the external force included. Differences use Newton-Raphson:
+    the adjoint is of the exact root."""
+    _check(ClampedRollout(rng), solver_cls, options, rtol=1.0e-2, fd_solver_cls=DiSMechSolver,
+           fd_options={"newton_tol": 1.0e-7, "theta": options.get("theta", 1.0)})
+
+
+@pytest.mark.parametrize("refine", [0, 1], ids=["solve", "refined"])
+@pytest.mark.parametrize("theta", [1.0, 0.5], ids=["euler", "midpoint"])
+def test_step_adjoint_solves_exact_transpose(monkeypatch, rng, theta, refine):
+    """``|adj_q - J^T lam| / |adj_q|`` against the residual's tape ``J^T`` with the reference frames far from
+    current: the Hessian ``A`` is ``J``, so one solve is exact to round-off."""
+    monkeypatch.setattr(StepAdjoint, "refine", refine)
+    r = SpinningRollout(rng)
+    run = r.setup(np.zeros((1, 0)), DiSMechSolver, dict(newton_tol=1.0e-7, theta=theta), grad=True)
+    r.simulate(run)
+    before, after = run.states[-2:]
+    after.dismech.q.grad.fill_(1.0)
+    run.solver.vjp(before, after, r.dt)
+
+    adj = run.solver._adjoint
+    free = ~r.fixed
+    b = adj._rhs.numpy()[free]
+    adj._jt_lam(before, theta * r.dt)  # J^T of the lam the solve left
+    assert np.linalg.norm(b - adj.q_theta.grad.numpy()[free]) / np.linalg.norm(b) < 2.0e-3
 
 
 @pytest.mark.parametrize(
@@ -252,17 +373,98 @@ def test_step_adjoint_matches_finite_differences(rng, solver_cls, options):
 )
 @pytest.mark.parametrize("smoothing", [0.0, 1.0e-3], ids=["exact", "smoothed"])
 def test_contact_adjoint_matches_finite_differences(device, rng, mu, v_mean, checks, smoothing):
-    """Perturbations stay clear of the stick/slip and on/off switches.
+    """Perturbations stay clear of the stick/slip and on/off switches. The adjoint is exact to ~1e-5 here; the
+    tolerance is the differences' round-off: ~1e-2 for a freely sliding (frictionless) rod, ~2% for the small
+    mass derivative (~3% on the CPU, whose float32 rounding moves the differences, not the adjoint)."""
+    options = dict(CONTACT_OPTIONS, friction=mu, contact_smoothing=smoothing)
+    _check(GroundRollout(rng, v_mean, checks), ADMMDiSMechSolver, options, rtol=3.0e-2,
+           rtols={"mass": 5.0e-2} if device.is_cpu else None, wrt_friction="friction" in checks)
 
-    A fixed iteration count keeps the batched copies identical to lone rods (a tolerance stops on their joint
-    residual); the mass derivative, small against round-off, still differs by up to ~2% (~3% on the CPU,
-    whose float32 rounding moves the differences, not the adjoint)."""
-    r = GroundRollout(rng, v_mean, checks)
-    options = dict(tol=0.0, iterations=500, friction=mu, contact_smoothing=smoothing)
-    adjoint = r.adjoint(ADMMDiSMechSolver, **options)
-    fd = r.finite_differences(ADMMDiSMechSolver, **options)
-    if "friction" in checks:
-        zero = np.zeros((1, len(r.directions)))
-        fd["friction"] = derivative(
-            lambda e: r.losses(zero, ADMMDiSMechSolver, **dict(options, friction=mu + e))[0], 0.05)
-    _assert_matches(adjoint, fd, rtol=3.0e-2, rtols={"mass": 5.0e-2} if device.is_cpu else None)
+
+@pytest.mark.parametrize("mu", [0.0, 0.3], ids=["frictionless", "slide"])
+@pytest.mark.parametrize("smoothing", [0.0, 1.0e-3], ids=["exact", "smoothed"])
+def test_rod_contact_adjoint_matches_finite_differences(rng, mu, smoothing):
+    """Rod-rod contact, whose closest points and normal the step takes from ``q_in``: tilting the top rod turns
+    the normal (missing that dependence was a 2.5-3% error). The mass and random-position derivatives are small
+    against their differences' round-off (~4e-3; they converge toward the adjoint only at larger steps, beyond
+    which the contact turns nonlinear)."""
+    options = dict(CONTACT_OPTIONS, friction=mu, contact_smoothing=smoothing)
+    _check(CrossingRollout(rng, ADMMDiSMechSolver), ADMMDiSMechSolver, options, rtol=2.0e-3,
+           rtols={"mass": 1.0e-2, "position": 1.0e-2}, wrt_friction=mu > 0.0)
+
+
+def test_contact_adjoint_refinement_agrees(monkeypatch, rng):
+    """Refining the contact system against the exact ``J^T`` leaves the solve's gradients (round-off apart)."""
+    r = GroundRollout(rng, (0.3, 0.1, 0.0), ("mass", "velocity", "position", "translation"))
+    options = dict(CONTACT_OPTIONS, friction=0.3, contact_smoothing=1.0e-3)
+    solved = r.adjoint(ADMMDiSMechSolver, **options)
+    monkeypatch.setattr(StepAdjoint, "refine", 2)
+    refined = r.adjoint(ADMMDiSMechSolver, **options)
+    for name in solved:
+        assert_close(refined[name], solved[name], 1.0e-3, name, scale=max(abs(solved[name]), 1.0e-12))
+
+
+@pytest.mark.parametrize(
+    "solver_cls, options",
+    [
+        (DiSMechSolver, {"newton_tol": 0.0, "newton_iterations": 5}),  # cuDSS captures without a tolerance
+        (ADMMDiSMechSolver, {"tol": 1.0e-5}),
+    ],
+    ids=["newton", "admm"],
+)
+def test_gradient_graph_capture(device, rng, solver_cls, options):
+    """A whole gradient evaluation (rollout, loss, backward) in one CUDA graph: replays give the eager
+    gradients, and do not accumulate."""
+    if not device.is_cuda or (solver_cls is DiSMechSolver and cudss is None):
+        pytest.skip("needs CUDA (and cuDSS for Newton-Raphson)")
+    r = ClampedRollout(rng)
+    run = r.setup(np.zeros((1, len(r.directions))), solver_cls, options, grad=True)
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    inputs = [*run.arrays.values(), run.states[0].dismech.q, run.states[0].dismech.qd]
+
+    tape = r.record(run, loss)  # eager: the one-time host work (adjoint, cuDSS analysis, ADMM factorization)
+    assert run.solver.graph_capturable
+    expected = [a.grad.numpy().copy() for a in inputs]
+    with wp.ScopedCapture() as capture:
+        tape.zero()
+        r.record(run, loss)
+    for _ in range(2):
+        wp.capture_launch(capture.graph)
+    for a, g in zip(inputs, expected, strict=True):
+        assert_close(a.grad.numpy(), g, 1.0e-3)
+
+
+def test_graph_capturable_reports_cudss_loops(device):
+    """A tolerance iterates in a device-side loop, which cuDSS cannot be captured in."""
+    if not device.is_cuda or cudss is None:
+        pytest.skip("needs CUDA and cuDSS")
+    model = ClampedRollout(np.random.default_rng(0))._model(1, DiSMechSolver)
+    assert not DiSMechSolver(model, newton_tol=1.0e-6).graph_capturable
+    assert DiSMechSolver(model, newton_tol=0.0).graph_capturable
+
+
+def test_contact_pattern_ignores_slot_order(rng):
+    """The narrow phase fills contact slots in a varying order (across worlds): the same contacts in other slots
+    must reuse the cached pattern (a new one costs a cuDSS analysis) and give the same adjoint."""
+    r = GroundRollout(rng, (0.3, 0.1, 0.0), ("velocity",))
+    r.steps = 1
+    run = r.setup(np.zeros((1, len(r.directions))), ADMMDiSMechSolver,
+                  dict(CONTACT_OPTIONS, friction=0.3, contact_smoothing=1.0e-3), grad=True)
+    r.record(run, wp.zeros(1, dtype=float, requires_grad=True))
+    adjoint, snapshot, state_in = run.solver._adjoint, run.solver.contact_snapshot(), run.states[0]
+    h = run.solver.theta * r.dt
+
+    def solve(snap):
+        system = _ContactSystem.build(adjoint, state_in, h, snap)
+        system.solve(state_in, h)
+        return system.pattern, adjoint._lam.numpy().copy()
+
+    perm = rng.permutation(snapshot.count)
+    permuted = replace(snapshot, **{f: wp.array(getattr(snapshot, f).numpy()[perm], dtype=getattr(snapshot, f).dtype)
+                                    for f in ("active", "pairs", "bary", "normal", "anchor", "shift", "thickness",
+                                              "force", "rho")})
+    assert snapshot.active.numpy().sum() > 1
+    pattern, lam = solve(snapshot)
+    pattern_permuted, lam_permuted = solve(permuted)
+    assert pattern_permuted is pattern
+    np.testing.assert_allclose(lam_permuted, lam, rtol=1.0e-5, atol=1.0e-6 * np.abs(lam).max())

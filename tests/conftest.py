@@ -21,6 +21,13 @@ def device(pytestconfig):
     return wp.get_device(name)
 
 
+@pytest.fixture(autouse=True)
+def _on_device(device):
+    """Models and solvers on ``--device``."""
+    with wp.ScopedDevice(device):
+        yield
+
+
 @pytest.fixture
 def rng(request):
     """Seeded from the test id."""

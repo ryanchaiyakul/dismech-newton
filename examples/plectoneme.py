@@ -8,8 +8,8 @@ The strands must never pass through each other: the linking number has to follow
 Frictionless, the ply slides freely along the axis, so the viewer draws a second rod with a little
 friction (``--display-friction``) whose ply stays put; the plot and the test are the frictionless rod's.
 
-    uv run examples/cable_plectoneme.py
-    uv run examples/cable_plectoneme.py --viewer null --test
+    uv run examples/plectoneme.py
+    uv run examples/plectoneme.py --viewer null --test
 """
 
 from types import SimpleNamespace
@@ -71,7 +71,8 @@ class Example(CableExample):
         for body in (bodies[0], bodies[-1]):
             ADMMDiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        self.start(None if display else viewer, model, ADMMDiSMechSolver(model, friction=friction), A)
+        solver = ADMMDiSMechSolver(model, friction=friction, iterations=200)  # the cap before the default became 50
+        self.start(None if display else viewer, model, solver, A)
         self.end = Drive(model, segment_dofs(model, bodies[-1]))  # the last segment's nodes and twist
         self.drives = (self.end,)
         self.t_end = self.duration(self.turns, self.twist_rate)

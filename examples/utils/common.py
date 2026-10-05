@@ -75,7 +75,7 @@ class CableExample:
     ``plot_every``, the viewer shows :meth:`image` (the theory plot, titled ``plot_name``) every that many frames.
     """
 
-    fps, substeps, capture = 60, 4, True
+    fps, substeps, capture = 60, 8, True
     plot_every, plot_name = 0, "theory"
     pipeline_options: dict = {}
     drives: tuple = ()

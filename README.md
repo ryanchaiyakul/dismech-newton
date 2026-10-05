@@ -27,7 +27,7 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
   <tr>
     <td valign="top">DER (top) and Newton's VBD (bottom) against Euler-Bernoulli.<br><code>uv run examples/cantilever.py</code></td>
     <td valign="top">A knot pulled tight with friction <a href="https://doi.org/10.1103/PhysRevLett.99.164301">Audoly et al. (2007)</a>.<br><code>uv run examples/overhand_knot.py</code></td>
-    <td valign="top">A twisted rod coils into a plectoneme <a href="https://doi.org/10.1016/j.bpj.2009.02.032">Clauvelin et al. (2009)</a>.<br><code>uv run examples/cable_plectoneme.py</code></td>
+    <td valign="top">A twisted rod coils into a plectoneme <a href="https://doi.org/10.1016/j.bpj.2009.02.032">Clauvelin et al. (2009)</a>.<br><code>uv run examples/plectoneme.py</code></td>
   </tr>
   <tr>
     <th width="33%">Flagella Bundling</th>

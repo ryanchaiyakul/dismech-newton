@@ -20,11 +20,12 @@ class DiSMechSolver(SolverBase):
     """Implicit discrete elastic rods, solved with Newton-Raphson.
 
     Fixed DOFs are prescribed through ``state_in.dismech.q``; contacts and controls are ignored. The linear
-    solves use cuDSS on CUDA (graph-capturable; the 'gpu' extra) and SciPy on the CPU.
+    solves use cuDSS on CUDA (the 'gpu' extra) and SciPy on the CPU; :meth:`step` is graph-capturable with
+    ``newton_tol=0`` (cuDSS cannot run inside the device-side loop a tolerance needs).
 
     Args:
         newton_iterations: Maximum Newton iterations per step.
-        newton_tol: Stop at ``max |dq| / (1 + |q|) < newton_tol``; ``0`` runs ``newton_iterations``.
+        newton_tol: Stop at ``max |dq| / (1 + |q|) < newton_tol``; ``0`` runs ``newton_iterations`` (capturable).
         pose_proxies: Pose the capsule proxies every step (else call :meth:`update_proxies`).
         theta: In ``[1/2, 1]``: ``1`` implicit Euler, ``1/2`` implicit midpoint.
     """
@@ -178,8 +179,17 @@ class DiSMechSolver(SolverBase):
 
     @property
     def graph_capturable(self) -> bool:
-        """Whether :meth:`step` can be captured in a CUDA graph (decided by the first step for ADMM)."""
-        return self.device.is_cuda and (self._linear is None or self._linear.graph_capturable)
+        """Whether :meth:`step` can be captured in a CUDA graph (decided by the first step for ADMM). A tolerance
+        iterates in a device-side loop, which cuDSS cannot run inside: ``newton_tol=0`` captures with it."""
+        linear = self._linear
+        if not self.device.is_cuda or linear is None:
+            return self.device.is_cuda
+        return linear.graph_capturable and (not self._device_loop or linear.loop_capturable)
+
+    @property
+    def _device_loop(self) -> bool:
+        """Whether the iterations stop on a tolerance (a device-side loop)."""
+        return self.newton_tol > 0.0
 
     @property
     def last_iterations(self) -> int:

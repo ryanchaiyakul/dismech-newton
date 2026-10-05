@@ -1,8 +1,13 @@
 """Step gradients by the implicit function theorem: ``J^T lam = adj_q`` at the solution, then ``-lam^T dr/d input``.
 
-``lam`` is refined against the exact ``J^T`` with the symmetric Hessian ``A``: ``lam += A^-1 (adj_q - J^T lam)``.
-Contacts: ``M^T w = [adj_q, 0]``, ``M = [[J, rho C^T (I - D)], [C, -D]]``, ``D = dPi/dp`` (smoothed).
+The assembled Hessian ``A`` is ``J`` (the residual is the gradient of the step's energy), so one solve with it is
+exact to round-off. An energy whose ``C`` only approximates ``d sigma / d eps`` makes ``A`` approximate: ``refine``
+then iterates ``lam += A^-1 (adj_q - J^T lam)`` against the exact ``J^T`` of the residual's tape.
+Contacts: ``M^T w = [adj_q, 0]``, ``M = [[J, rho C^T (I - D)], [C, -D]]``, ``D = dPi/dp`` (smoothed), factorised per
+step but analysed once per pattern of contact pairs (in the pairs' order), its values assembled on the device.
 """
+
+from collections import OrderedDict
 
 import numpy as np
 import scipy.sparse as sp
@@ -11,9 +16,11 @@ from newton import State
 
 from .contact import (
     ContactSnapshot,
-    contact_c_matrix,
-    contact_input_adjoint_kernel,
+    contact_c_pattern,
+    contact_friction_adjoint_kernel,
+    contact_frozen_inputs_kernel,
     contact_linearize_kernel,
+    contact_matrix_values_kernel,
     contact_transpose_residual_kernel,
 )
 from .linear import sparse_solver
@@ -24,9 +31,15 @@ from .triplet import advance_ref_twist_kernel
 
 
 class StepAdjoint:
-    """The adjoint of :meth:`DiSMechSolver.step`, built on first use."""
+    """The adjoint of :meth:`DiSMechSolver.step`, built on first use.
 
-    refine = 2
+    Attributes:
+        refine: Refinements against the exact ``J^T``, each one solve and one ``J^T``; only for an energy whose
+            tangent ``C`` is approximate (float32 floors the residual around ``1e-5``-``2e-3`` either way).
+    """
+
+    refine = 0
+    max_patterns = 8  # contact patterns whose analysis is kept
 
     def __init__(self, solver):
         self.solver = solver
@@ -56,6 +69,8 @@ class StepAdjoint:
         self._no_q = wp.zeros(0, dtype=float, device=dev)
         self._no_indptr = wp.zeros(0, dtype=wp.int32, device=dev)
         self._no_vals = wp.zeros(0, dtype=wp.float64, device=dev)
+        self._free = solver.fixed.numpy() == 0
+        self._patterns = OrderedDict()  # contact pattern key -> _ContactPattern, least recently used first
 
     def vjp(self, state_in: State, state_out: State, dt: float, contacts: ContactSnapshot | None = None) -> None:
         """Accumulate the adjoints from ``state_out``'s ``.grad``; both states must still hold the step."""
@@ -133,7 +148,18 @@ class StepAdjoint:
             wp.launch(_add_kernel, dim=n - nd, inputs=[self._mass.grad[nd:]], outputs=[s.der.edge_inertia.grad],
                       device=dev)
         if contact is not None:
-            contact.input_adjoint(s_in.q.grad)
+            contact.input_adjoint(state_in, h)
+
+    def _pattern(self, pairs: np.ndarray) -> "_ContactPattern":
+        """The cached system for these contact pairs (in this order), least recently used evicted."""
+        key = pairs.tobytes()
+        p = self._patterns.pop(key, None)
+        if p is None:
+            p = _ContactPattern(self.hessian, pairs, ~self._free, self.solver.device)
+            while len(self._patterns) >= self.max_patterns:
+                self._patterns.popitem(last=False)
+        self._patterns[key] = p
+        return p
 
     def _jt_lam(self, state_in: State, h: float) -> None:
         """``J^T lam`` into ``q_theta.grad``."""
@@ -165,65 +191,131 @@ class _ContactSystem:
 
     @classmethod
     def build(cls, adjoint: StepAdjoint, state_in: State, h: float, contacts: ContactSnapshot | None):
-        if contacts is None:
+        if contacts is None or not contacts.count:
             return None
-        idx = np.flatnonzero(contacts.active.numpy() != 0).astype(np.int32)
-        return cls(adjoint, state_in, h, contacts, idx) if len(idx) else None
+        # The snapshot holds the active contacts. In the pairs' order, not the slots': the narrow phase fills the
+        # slots in a varying order (across worlds), and the same pair set must map to the same pattern (or every
+        # step re-analyses).
+        pairs = contacts.pairs.numpy()
+        idx = np.lexsort(pairs.T[::-1]).astype(np.int32)
+        return cls(adjoint, state_in, h, contacts, idx, pairs[idx])
 
-    def __init__(self, adjoint: StepAdjoint, state_in: State, h: float, contacts: ContactSnapshot, idx: np.ndarray):
+    def __init__(self, adjoint: StepAdjoint, state_in: State, h: float, contacts: ContactSnapshot, idx: np.ndarray,
+                 pairs: np.ndarray):
         self.adjoint, self.contacts = adjoint, contacts
         c, s = contacts, adjoint.solver
-        dev = s.device
-        n, m = self.n, self.m = s.num_dofs, len(idx)
-        self.idx = wp.array(idx, dtype=wp.int32, device=dev)
-        self.jac = wp.zeros(m, dtype=wp.mat33, device=dev)
-        self.jac_mu = wp.zeros(m, dtype=wp.vec3, device=dev)
-        wp.launch(contact_linearize_kernel, dim=m,
+        self.n, self.m = s.num_dofs, len(idx)
+        self.pattern = p = adjoint._pattern(pairs)
+        self.idx, self.jac, self.jac_mu, self.point, self.w = p.idx, p.jac, p.jac_mu, p.point, p.w
+        self.idx.assign(idx)
+        wp.launch(contact_linearize_kernel, dim=self.m,
                   inputs=[self.idx, adjoint.q_theta, state_in.dismech.q, c.pairs, c.bary, c.normal, c.anchor, c.shift,
                           c.thickness, c.force, c.rho, c.friction, c.smoothing * h],
-                  outputs=[self.jac, self.jac_mu], device=dev)
-
-        # M^T = [[J^T, C^T], [rho (I - D)^T C, -D^T]], J as A.
-        C = contact_c_matrix(c.pairs.numpy()[idx], c.bary.numpy()[idx], s.fixed.numpy() != 0, n).tocsr()
-        Dt = self.jac.numpy().astype(np.float64).transpose(0, 2, 1)
-        rho = c.rho.numpy()[idx].astype(np.float64)
-
-        def block_diagonal(blocks):
-            return sp.bsr_matrix((blocks, np.arange(m), np.arange(m + 1)), shape=(3 * m, 3 * m))
-
-        lower = block_diagonal(rho[:, None, None] * (np.eye(3) - Dt)) @ C
-        MT = sp.bmat([[adjoint.hessian.to_scipy(), C.T], [lower, -block_diagonal(Dt)]], format="csr")
-        self._linear = sparse_solver(GeneralCSR(MT, dev), refactorize=False)
-        self.rhs, self.w, self.res, self.step = (wp.zeros(n + 3 * m, dtype=float, device=dev) for _ in range(4))
+                  outputs=[self.jac, self.jac_mu, self.point], device=s.device)
+        p.set_values(adjoint.hessian, self.idx, c.bary, c.rho, self.jac)
 
     def solve(self, state_in: State, h: float) -> None:
-        """``M^T w = [adj_q_theta, 0]``, refined; ``w_q`` into ``lam``."""
-        a, s, c = self.adjoint, self.adjoint.solver, self.contacts
+        """``M^T w = [adj_q_theta, 0]``, refined ``adjoint.refine`` times; ``w_q`` into ``lam``."""
+        a, s, c, p = self.adjoint, self.adjoint.solver, self.contacts, self.pattern
         dev, n = s.device, self.n
         w_q, w_p = self.w[:n], self.w[n:]
-        wp.copy(self.rhs, a._rhs, count=n)
-        self._linear.solve(self.rhs, self.w)
+        p.b.zero_()
+        wp.copy(p.b, a._rhs, count=n)
+        p.linear.solve(p.b, self.w)
         for _ in range(a.refine):
             wp.copy(a._lam, w_q)
             a._jt_lam(state_in, h)
             wp.launch(_refine_residual_kernel, dim=n, inputs=[s.fixed, a._rhs, a.q_theta.grad],
-                      outputs=[self.res[:n]], device=dev)
+                      outputs=[p.res[:n]], device=dev)
             wp.launch(contact_transpose_residual_kernel, dim=self.m,
                       inputs=[self.idx, c.pairs, c.bary, s.fixed, self.jac, c.rho, w_q, w_p],
-                      outputs=[self.res[:n], self.res[n:]], device=dev)
-            self._linear.solve(self.res, self.step)
-            wp.launch(_add_kernel, dim=n + 3 * self.m, inputs=[self.step], outputs=[self.w], device=dev)
+                      outputs=[p.res[:n], p.res[n:]], device=dev)
+            p.linear.solve(p.res, p.x)
+            wp.launch(_add_kernel, dim=n + 3 * self.m, inputs=[p.x], outputs=[self.w], device=dev)
         wp.copy(a._lam, w_q)
 
-    def input_adjoint(self, q_in_grad: wp.array | None) -> None:
-        """``-w^T dF/d input`` into ``q_in_grad`` and the friction adjoint."""
-        a, s, c = self.adjoint, self.adjoint.solver, self.contacts
-        empty = wp.zeros(0, dtype=float, device=s.device)
-        wp.launch(contact_input_adjoint_kernel, dim=self.m,
-                  inputs=[self.idx, c.pairs, c.bary, c.normal, s.fixed, c.rho, self.jac_mu, a._lam, self.w[self.n:]],
-                  outputs=[q_in_grad if q_in_grad is not None else empty,
-                           c.friction.grad if c.friction.grad is not None else empty],
-                  device=s.device)
+    def input_adjoint(self, state_in: State, h: float) -> None:
+        """``-w^T dF/d input`` into ``q_in``'s adjoint (through what the step froze from it: the reference points,
+        and a rod-rod contact's closest points and normal) and the friction coefficient's."""
+        a, s, c, p, n = self.adjoint, self.adjoint.solver, self.contacts, self.pattern, self.n
+        dev = s.device
+        q_in = state_in.dismech.q
+        if q_in.grad is not None:
+            wp.launch(_negate_kernel, dim=n + 3 * self.m, inputs=[self.w], outputs=[p.neg_w], device=dev)
+            p.e_q.zero_()
+            tape = wp.Tape()
+            with tape:
+                wp.launch(contact_frozen_inputs_kernel, dim=self.m,
+                          inputs=[self.idx, c.pairs, c.bary, c.normal, c.anchor, c.shift, c.thickness, s.fixed,
+                                  _without_grad(a.q_theta), q_in, self.point, c.rho, _without_grad(c.friction),
+                                  c.smoothing * h],
+                          outputs=[p.e_q, p.e_p], device=dev)
+            tape.backward(grads={p.e_q: p.neg_w[:n], p.e_p: p.neg_w_p})
+        if c.friction.grad is not None:
+            wp.launch(contact_friction_adjoint_kernel, dim=self.m,
+                      inputs=[self.idx, c.pairs, c.bary, s.fixed, c.rho, self.jac_mu, a._lam, self.w[n:]],
+                      outputs=[c.friction.grad], device=dev)
+
+
+class _ContactPattern:
+    """``M^T`` for one list of contact pairs: a pattern independent of the values (cuDSS analyses it once), where
+    each entry's value comes from (assembled on the device), and the step's work arrays. Rows: the DOFs, then 3 per
+    contact; ``J`` is ``A``."""
+
+    def __init__(self, hessian: SymmetricCSR, pairs: np.ndarray, fixed: np.ndarray, dev):
+        n, m = hessian.n, len(pairs)
+        indptr, indices = hessian.indptr.numpy(), hessian.indices.numpy()
+        row = np.repeat(np.arange(n), np.diff(indptr))
+        slot = np.arange(len(indices))
+        off = indices != row  # mirror the strict upper triangle
+        contact, node, comp, dof = contact_c_pattern(pairs, fixed)
+        c_row = 3 * contact + comp
+        size = n + 3 * m
+        lower_rows = n + 3 * contact[:, None] + np.arange(3)  # rho (I - D)^T C: per C entry, 3 rows of its contact
+        d_rows = n + 3 * np.arange(m)[:, None, None] + np.arange(3)[None, :, None]
+        d_cols = n + 3 * np.arange(m)[:, None, None] + np.arange(3)[None, None, :]
+        # The entries: A (both triangles), C^T, rho (I - D)^T C, -D^T.
+        rows = np.concatenate([row, indices[off], dof, lower_rows.ravel(), np.broadcast_to(d_rows, (m, 3, 3)).ravel()])
+        cols = np.concatenate([indices, row[off], n + c_row, np.repeat(dof, 3),
+                               np.broadcast_to(d_cols, (m, 3, 3)).ravel()])
+        order = np.lexsort((cols, rows))
+        csr_indptr = np.zeros(size + 1, dtype=np.int64)
+        np.cumsum(np.bincount(rows, minlength=size), out=csr_indptr[1:])
+        self.csr = GeneralCSR(sp.csr_matrix((np.zeros(len(rows)), cols[order], csr_indptr), shape=(size, size)), dev)
+        self.linear = sparse_solver(self.csr, refactorize=False)
+        position = np.empty(len(order), dtype=np.int32)  # each entry's index in the CSR values
+        position[order] = np.arange(len(order), dtype=np.int32)
+        nh, nc = len(slot) + int(off.sum()), len(dof)
+
+        def ints(a):
+            return wp.array(np.asarray(a).astype(np.int32), dtype=wp.int32, device=dev)
+
+        self._hessian_slot, self._hessian_pos = ints(np.concatenate([slot, slot[off]])), ints(position[:nh])
+        self._entry = ints(contact), ints(node), ints(comp)
+        self._c_pos, self._lower_pos = ints(position[nh : nh + nc]), ints(position[nh + nc : nh + 4 * nc])
+        self._d_pos = ints(position[nh + 4 * nc :])
+        self.idx = wp.zeros(m, dtype=wp.int32, device=dev)
+        self.jac = wp.zeros(m, dtype=wp.mat33, device=dev)
+        self.jac_mu = wp.zeros(m, dtype=wp.vec3, device=dev)
+        self.point = wp.zeros(m, dtype=wp.vec3, device=dev)
+        self.b, self.x, self.w, self.res, self.neg_w = (wp.zeros(size, dtype=float, device=dev) for _ in range(5))
+        self.neg_w_p = self.neg_w[n:].reshape((m, 3)).view(wp.vec3)
+        # The contacts' equations as functions of q_in, differentiated in input_adjoint.
+        self.e_q = wp.zeros(n, dtype=float, device=dev, requires_grad=True)
+        self.e_p = wp.zeros(m, dtype=wp.vec3, device=dev, requires_grad=True)
+
+    def set_values(self, hessian: SymmetricCSR, idx: wp.array, bary: wp.array, rho: wp.array, jac: wp.array) -> None:
+        """``M^T``'s values from ``A``, the contacts (snapshot entries ``idx``) and their ``D``, on the device;
+        refactorise on the next solve."""
+        vals, dev = self.csr.vals, self.csr.vals.device
+        wp.launch(_gather_kernel, dim=self._hessian_slot.shape[0], inputs=[self._hessian_slot, self._hessian_pos,
+                  hessian.vals], outputs=[vals], device=dev)
+        if self._c_pos.shape[0]:
+            wp.launch(contact_matrix_values_kernel, dim=self._c_pos.shape[0],
+                      inputs=[*self._entry, self._c_pos, self._lower_pos, idx, bary, rho, jac], outputs=[vals],
+                      device=dev)
+        wp.launch(_minus_d_transpose_kernel, dim=jac.shape[0], inputs=[self._d_pos, jac], outputs=[vals], device=dev)
+        self.linear.invalidate()
 
 
 def _without_grad(a: wp.array | None) -> wp.array | None:
@@ -259,6 +351,23 @@ def _adjoint_rhs_kernel(fixed: wp.array[wp.int32], adj: wp.array[float], rhs: wp
         rhs[i] = 0.0
     else:
         rhs[i] = a
+
+
+@wp.kernel
+def _gather_kernel(src_index: wp.array[wp.int32], dst_index: wp.array[wp.int32], src: wp.array[wp.float64],
+                   dst: wp.array[wp.float64]):
+    e = wp.tid()
+    dst[dst_index[e]] = src[src_index[e]]
+
+
+@wp.kernel
+def _minus_d_transpose_kernel(pos: wp.array[wp.int32], jac: wp.array[wp.mat33], vals: wp.array[wp.float64]):
+    """``-D^T``, a contact's 3x3 block, at ``pos`` (row-major)."""
+    k = wp.tid()
+    D = jac[k]
+    for a in range(3):
+        for b in range(3):
+            vals[pos[9 * k + 3 * a + b]] = wp.float64(-D[b, a])
 
 
 @wp.kernel

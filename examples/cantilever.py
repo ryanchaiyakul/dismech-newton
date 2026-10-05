@@ -51,7 +51,7 @@ class Example:
     height, gap, row_gap, columns = 1.0, 0.3, 1.2, 2  # bottom row's clamp height; spacing of the grid
 
     def __init__(self, viewer, args=None, *, der: tuple[str, ...] = ("DER ADMM, implicit midpoint", "DER ADMM, implicit Euler"),
-                 vbd: tuple[tuple[int, int], ...] = ((10, 5), (100, 50)), der_substeps: int = 4):
+                 vbd: tuple[tuple[int, int], ...] = ((10, 5), (100, 50)), der_substeps: int = 8):
         self.viewer = viewer
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0

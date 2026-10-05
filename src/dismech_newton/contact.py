@@ -12,7 +12,6 @@ frozen per step); it stays out of the global matrix, adding only ``-rho C^T u`` 
 from dataclasses import dataclass
 
 import numpy as np
-import scipy.sparse as sp
 import warp as wp
 from newton import Contacts, Model, State
 
@@ -177,17 +176,25 @@ class ContactTerm:
             wp.copy(self._rho_prev, self.rho_i)
 
     def snapshot(self, smoothing: float) -> ContactSnapshot | None:
-        """This step's contacts, copied for its adjoint."""
-        n = self.count
+        """This step's active contacts, gathered for its adjoint (sized by them, not by the buffer's capacity:
+        one count read)."""
+        n, dev = self.count, self.device
         if not n:
             return None
-        force = wp.zeros(n, dtype=wp.vec3, device=self.device)
-        rho = wp.zeros(n, dtype=float, device=self.device)
-        wp.launch(_snapshot_kernel, dim=n, inputs=[self.rho_i, self.u, self.rho_scale], outputs=[force, rho],
-                  device=self.device)
-        frozen = (wp.clone(a[:n]) for a in (self.active, self.pairs, self.bary, self.normal, self.anchor, self.shift,
-                                             self.thickness))
-        return ContactSnapshot(n, *frozen, force, rho, self.friction, smoothing)
+        offset = wp.empty(n, dtype=wp.int32, device=dev)
+        wp.utils.array_scan(self.active[:n], offset, inclusive=False)
+        m = int(offset[n - 1 :].numpy()[0] + self.active[n - 1 : n].numpy()[0])
+        if not m:
+            return None
+        slot = wp.empty(m, dtype=wp.int32, device=dev)
+        wp.launch(_active_slots_kernel, dim=n, inputs=[self.active, offset], outputs=[slot], device=dev)
+        out = [wp.empty(m, dtype=t, device=dev)
+               for t in (wp.int32, wp.vec4i, wp.vec2, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, float)]
+        wp.launch(_snapshot_kernel, dim=m,
+                  inputs=[slot, self.pairs, self.bary, self.normal, self.anchor, self.shift, self.thickness,
+                          self.rho_i, self.u, self.rho_scale],
+                  outputs=out, device=dev)
+        return ContactSnapshot(m, *out, self.friction, smoothing)
 
     def forces(self) -> tuple[np.ndarray, np.ndarray]:
         """Host ``(pairs, force)``: nodes ``(a0, a1, b0, b1)`` (``b0 = -1``: non-rod), force on ``a``."""
@@ -196,16 +203,13 @@ class ContactTerm:
         return self.pairs.numpy()[: self.count][active], force[active]
 
 
-def contact_c_matrix(pairs: np.ndarray, bary: np.ndarray, fixed: np.ndarray, n: int):
-    """``C`` (``3 m x n``, scipy COO) over the free DOFs."""
-    m = len(pairs)
-    s, t = bary[:, 0].astype(np.float64), bary[:, 1].astype(np.float64)
-    shape = (m, 4, 3)  # contact, node, component
-    weight = np.broadcast_to(np.stack([1.0 - s, s, t - 1.0, -t], 1)[:, :, None], shape)
-    row = np.broadcast_to(3 * np.arange(m)[:, None, None] + np.arange(3), shape)
-    dof = 3 * pairs.astype(np.int64)[:, :, None] + np.arange(3)  # negative for a missing node
+def contact_c_pattern(pairs: np.ndarray, fixed: np.ndarray) -> tuple[np.ndarray, ...]:
+    """``C``'s entries (``3 m x n``, over the free DOFs): per entry its contact, node slot in the pair (0-3, the
+    weight :func:`_weight`), component, and DOF. Row ``3 contact + component``."""
+    dof = 3 * pairs.astype(np.int64)[:, :, None] + np.arange(3)  # (contact, node, component); negative: no node
     keep = (dof >= 0) & ~fixed[np.maximum(dof, 0)]
-    return sp.coo_matrix((weight[keep], (row[keep], dof[keep])), shape=(3 * m, n))
+    contact, node, comp = np.nonzero(keep)
+    return contact, node, comp, dof[keep]
 
 
 # -- geometry -----------------------------------------------------------------------------
@@ -560,11 +564,35 @@ def _reaction_kernel(active: wp.array[wp.int32], body: wp.array[wp.int32], arm: 
 
 
 @wp.kernel
-def _snapshot_kernel(rho_i: wp.array[float], u: wp.array[wp.vec3], rho_scale: float,
-                     force: wp.array[wp.vec3], rho: wp.array[float]):
+def _active_slots_kernel(active: wp.array[wp.int32], offset: wp.array[wp.int32], slot: wp.array[wp.int32]):
+    """``slot[offset[i]] = i`` for the active slots (``offset``: the exclusive scan of ``active``)."""
     i = wp.tid()
-    force[i] = -rho_i[i] * u[i]
-    rho[i] = rho_i[i] / rho_scale
+    if active[i] != 0:
+        slot[offset[i]] = i
+
+
+@wp.kernel
+def _snapshot_kernel(
+    slot: wp.array[wp.int32], pairs: wp.array[wp.vec4i], bary: wp.array[wp.vec2], normal: wp.array[wp.vec3],
+    anchor: wp.array[wp.vec3], shift: wp.array[wp.vec3], thickness: wp.array[float], rho_i: wp.array[float],
+    u: wp.array[wp.vec3], rho_scale: float,
+    # outputs
+    active_out: wp.array[wp.int32], pairs_out: wp.array[wp.vec4i], bary_out: wp.array[wp.vec2],
+    normal_out: wp.array[wp.vec3], anchor_out: wp.array[wp.vec3], shift_out: wp.array[wp.vec3],
+    thickness_out: wp.array[float], force: wp.array[wp.vec3], rho: wp.array[float],
+):
+    """Active contact ``k`` (slot ``slot[k]``): its frozen data, force and penalty."""
+    k = wp.tid()
+    i = slot[k]
+    active_out[k] = 1
+    pairs_out[k] = pairs[i]
+    bary_out[k] = bary[i]
+    normal_out[k] = normal[i]
+    anchor_out[k] = anchor[i]
+    shift_out[k] = shift[i]
+    thickness_out[k] = thickness[i]
+    force[k] = -rho_i[i] * u[i]
+    rho[k] = rho_i[i] / rho_scale
 
 
 @wp.func
@@ -605,9 +633,9 @@ def contact_linearize_kernel(
     bary: wp.array[wp.vec2], normal: wp.array[wp.vec3], anchor: wp.array[wp.vec3], shift: wp.array[wp.vec3],
     thickness: wp.array[float], force: wp.array[wp.vec3], rho: wp.array[float], friction: wp.array[float], eps: float,
     # outputs
-    jac: wp.array[wp.mat33], jac_mu: wp.array[wp.vec3],
+    jac: wp.array[wp.mat33], jac_mu: wp.array[wp.vec3], point: wp.array[wp.vec3],
 ):
-    """``D = dPi/dp`` and ``dPi/dmu`` at ``p = d(q) - force / rho``."""
+    """``D = dPi/dp`` and ``dPi/dmu`` at ``p = d(q) - force / rho`` (into ``point``)."""
     k = wp.tid()
     i = idx[k]
     pair = pairs[i]
@@ -615,6 +643,7 @@ def contact_linearize_kernel(
     n = normal[i]
     c0 = _contact_point(q_in, pair, st, anchor[i]) + shift[i]
     p = _local_point(_contact_point(q, pair, st, anchor[i]), c0, n, thickness[i]) - force[i] / rho[i]
+    point[k] = p
     mu = friction[0]
     pn = wp.dot(p, n)
     pt = p - pn * n
@@ -640,6 +669,30 @@ def contact_linearize_kernel(
 
 
 @wp.kernel
+def contact_matrix_values_kernel(
+    entry_contact: wp.array[wp.int32], entry_node: wp.array[wp.int32], entry_comp: wp.array[wp.int32],
+    pos_ct: wp.array[wp.int32], pos_lower: wp.array[wp.int32], idx: wp.array[wp.int32], bary: wp.array[wp.vec2],
+    rho: wp.array[float], jac: wp.array[wp.mat33],
+    # outputs
+    vals: wp.array[wp.float64],
+):
+    """Per entry of ``C`` (:func:`contact_c_pattern`): its weight at ``pos_ct`` (``C^T``), and
+    ``rho ((I - D)^T C)`` in its contact's three rows at ``pos_lower`` (``M^T``'s lower-left block)."""
+    e = wp.tid()
+    k = entry_contact[e]
+    i = idx[k]
+    c = entry_comp[e]
+    w = _weight(entry_node[e], bary[i])
+    vals[pos_ct[e]] = wp.float64(w)
+    D = jac[k]
+    for a in range(3):
+        delta = float(0.0)
+        if a == c:
+            delta = 1.0
+        vals[pos_lower[3 * e + a]] = wp.float64(rho[i] * (delta - D[c, a]) * w)
+
+
+@wp.kernel
 def contact_transpose_residual_kernel(
     idx: wp.array[wp.int32], pairs: wp.array[wp.vec4i], bary: wp.array[wp.vec2], fixed: wp.array[wp.int32],
     jac: wp.array[wp.mat33], rho: wp.array[float], w_q: wp.array[float], w_p: wp.array[float],
@@ -661,31 +714,80 @@ def contact_transpose_residual_kernel(
         res_p[3 * k + c] = v[c]
 
 
+@wp.func
+def _project(p: wp.vec3, n: wp.vec3, mu: float, eps: float) -> wp.vec3:
+    """``Pi(p)``: onto the gap's half-space along ``n`` and the Coulomb cone, smoothed by ``eps`` (as
+    :func:`contact_linearize_kernel` differentiates it)."""
+    pn = wp.dot(p, n)
+    pt = p - pn * n
+    r = wp.length(pt)
+    z = _ramp(pn, eps) * n
+    if r > 0.0:
+        a = mu * _ramp(-pn, eps)
+        z = z + (_ramp(r - a, eps) - _ramp(-r - a, eps)) / r * pt
+    return z
+
+
+@wp.func
+def _step_node(q: wp.array[float], q_in: wp.array[float], fixed: wp.array[wp.int32], n: int) -> wp.vec3:
+    """Node ``n`` of the step's ``q``: fixed components are ``q_in``'s."""
+    out = wp.vec3()
+    for k in range(3):
+        if fixed[3 * n + k] != 0:
+            out[k] = q_in[3 * n + k]
+        else:
+            out[k] = q[3 * n + k]
+    return out
+
+
 @wp.kernel
-def contact_input_adjoint_kernel(
+def contact_frozen_inputs_kernel(
     idx: wp.array[wp.int32], pairs: wp.array[wp.vec4i], bary: wp.array[wp.vec2], normal: wp.array[wp.vec3],
-    fixed: wp.array[wp.int32], rho: wp.array[float], jac_mu: wp.array[wp.vec3], w_q: wp.array[float],
-    w_p: wp.array[float],
+    anchor: wp.array[wp.vec3], shift: wp.array[wp.vec3], thickness: wp.array[float], fixed: wp.array[wp.int32],
+    q: wp.array[float], q_in: wp.array[float], point: wp.array[wp.vec3], rho: wp.array[float],
+    friction: wp.array[float], eps: float,
     # outputs
-    q_in_grad: wp.array[float], friction_grad: wp.array[float],
+    e_q: wp.array[float], e_p: wp.array[wp.vec3],
 ):
-    """``-w^T dF / d input`` into ``q_in`` and the friction coefficient."""
+    """The contacts' equations at the solution as functions of ``q_in`` through what a step freezes from it,
+    differentiated by Warp: ``e_q = rho C^T (p - Pi(p))`` and ``e_p = d(q) - Pi(p)``, ``d(q) = local(C q)``.
+    A rod-rod contact's closest points ``st`` and normal are recomputed from ``q_in`` (as the step found them);
+    every contact's reference point ``c0 = C q_in + shift`` too. ``q`` and ``p`` are held."""
     k = wp.tid()
     i = idx[k]
     pair = pairs[i]
     st = bary[i]
-    wk = node(w_p, k)
-    if q_in_grad.shape[0] > 0:
-        n = normal[i]
-        pw = wk - wp.dot(n, wk) * n
-        for j in range(4):
-            nj = pair[j]
-            if nj >= 0:
-                w = _weight(j, st)
-                for c in range(3):
-                    g = w * pw[c]
-                    if fixed[3 * nj + c] != 0:
-                        g = g - w * wk[c]
-                    wp.atomic_add(q_in_grad, 3 * nj + c, g)
-    if friction_grad.shape[0] > 0:
-        wp.atomic_add(friction_grad, 0, wp.dot(jac_mu[k], rho[i] * _apply_c(w_q, fixed, pair, st) + wk))
+    n = normal[i]
+    if pair[2] >= 0:
+        st = _closest_st(q_in, pair)
+        d = _contact_point(q_in, pair, st, anchor[i])
+        if wp.length(d) > 1.0e-9:
+            n = wp.normalize(d)
+    c0 = _contact_point(q_in, pair, st, anchor[i]) + shift[i]
+    c = wp.vec3()
+    for j in range(4):
+        nj = pair[j]
+        if nj >= 0:
+            c = c + _weight(j, st) * _step_node(q, q_in, fixed, nj)
+    if pair[2] < 0:
+        c = c - anchor[i]
+    p = point[k]
+    z = _project(p, n, friction[0], eps)
+    e_p[k] = _local_point(c, c0, n, thickness[i]) - z
+    f = rho[i] * (p - z)
+    for j in range(4):
+        if pair[j] >= 0:
+            scatter_node(e_q, fixed, pair[j], _weight(j, st) * f)
+
+
+@wp.kernel
+def contact_friction_adjoint_kernel(
+    idx: wp.array[wp.int32], pairs: wp.array[wp.vec4i], bary: wp.array[wp.vec2], fixed: wp.array[wp.int32],
+    rho: wp.array[float], jac_mu: wp.array[wp.vec3], w_q: wp.array[float], w_p: wp.array[float],
+    # outputs
+    friction_grad: wp.array[float],
+):
+    """``-w^T dF / d mu`` into the friction coefficient's adjoint."""
+    k = wp.tid()
+    i = idx[k]
+    wp.atomic_add(friction_grad, 0, wp.dot(jac_mu[k], rho[i] * _apply_c(w_q, fixed, pairs[i], bary[i]) + node(w_p, k)))

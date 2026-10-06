@@ -20,17 +20,23 @@ class _CSR:
 
 
 class SymmetricCSR(_CSR):
-    """Upper-triangle CSR; the pattern is the diagonal and every DOF pair in a row of ``dofs``."""
+    """Upper-triangle CSR; the pattern is the diagonal and every DOF pair in a row of ``dofs``.
+
+    ``pair_slots[p, r]`` is the slot of the ``p``-th pair ``(dofs[r, i], dofs[r, j])``, ``(i, j)`` in
+    ``np.triu_indices`` order, so kernels scatter without searching (:func:`csr_slot`)."""
 
     def __init__(self, n: int, dofs: np.ndarray, device) -> None:
         keys = [np.arange(n, dtype=np.int64) * (n + 1)]
         i, j = np.triu_indices(dofs.shape[1])
-        a, b = dofs[:, i], dofs[:, j]
-        keys.append((np.minimum(a, b) * n + np.maximum(a, b)).ravel())
+        a, b = dofs[:, i].astype(np.int64), dofs[:, j].astype(np.int64)
+        pairs = np.minimum(a, b) * n + np.maximum(a, b)
+        keys.append(pairs.ravel())
         keys = np.unique(np.concatenate(keys))
         indptr = np.zeros(n + 1, dtype=np.int32)
         np.cumsum(np.bincount(keys // n, minlength=n), out=indptr[1:])
         self._set(n, indptr, (keys % n).astype(np.int32), np.zeros(len(keys)), device)
+        slots = np.searchsorted(keys, pairs).T.astype(np.int32)
+        self.pair_slots = wp.array(np.ascontiguousarray(slots), dtype=wp.int32, device=device)
 
     @classmethod
     def from_scipy(cls, H: sp.spmatrix, device) -> "SymmetricCSR":

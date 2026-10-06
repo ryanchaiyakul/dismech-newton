@@ -6,14 +6,19 @@ import numpy as np
 import warp as wp
 
 from dismech_newton.strains import (
+    local_strain_derivatives,
     mat5_11f,
     mat11f,
+    mat58f,
     strain_derivatives,
     strain_gradient,
     triplet_geometry,
     vec5f,
+    vec8f,
     vec11f,
+    vec36f,
 )
+from dismech_newton.triplet import _local_geometry, _reduction, mat88f
 
 NODE_DOFS = [0, 1, 2, 4, 5, 6, 8, 9, 10]
 THETA_DOFS = [3, 7]
@@ -135,3 +140,85 @@ def eval_triplet(Q: np.ndarray, cfg: TripletConfig, device, sigma=np.zeros(5)) -
         device=device,
     )
     return TripletEval(*(a.numpy().astype(np.float64) for a in (strain, J, H, grad)))
+
+
+# -- the local variable z = [e, theta_e, f, theta_f - theta_e] ----------------------------
+
+Z_EDGE_DOFS = [0, 1, 2, 4, 5, 6]
+Z_THETA_DOFS = [3, 7]
+
+
+def to_z(q: np.ndarray) -> np.ndarray:
+    """``z`` of DOFs ``[x0, theta_e, x1, theta_f, x2]``."""
+    q = np.atleast_2d(q)
+    return np.column_stack([q[:, 4:7] - q[:, 0:3], q[:, 3], q[:, 8:11] - q[:, 4:7], q[:, 7] - q[:, 3]])
+
+
+def unpack_sym8(packed: np.ndarray) -> np.ndarray:
+    """``(..., 36)`` packed upper triangles (row-major, ``i <= j``) to ``(..., 8, 8)`` symmetric matrices."""
+    i, j = np.triu_indices(8)
+    out = np.zeros(packed.shape[:-1] + (8, 8))
+    out[..., i, j] = packed
+    out[..., j, i] = packed
+    return out
+
+
+@wp.kernel
+def _local_kernel(
+    z: wp.array[vec8f], frames: wp.array[wp.vec3], ref_twist: float, l0e: float, l0f: float, sigma: vec5f,
+    # outputs
+    strain: wp.array[vec5f], J: wp.array[mat58f], H: wp.array2d[vec36f], J_ref: wp.array[mat58f],
+    H_ref: wp.array2d[mat88f], H_sigma: wp.array[vec36f],
+):
+    i = wp.tid()
+    g = _local_geometry(z[i], frames[0], frames[1], frames[2], frames[3], ref_twist, l0e, l0f)
+    strain[i] = g.strain
+    T = _reduction()
+    for s in range(5):
+        unit = vec5f()
+        unit[s] = 1.0
+        Js, Hs = local_strain_derivatives(g, unit)
+        J[i] = Js
+        H[i, s] = Hs
+        Jq, Hq = strain_derivatives(g, unit)
+        J_ref[i] = Jq * T
+        H_ref[i, s] = wp.transpose(T) * Hq * T
+    Js, Hs = local_strain_derivatives(g, sigma)
+    H_sigma[i] = Hs
+
+
+@dataclass
+class LocalEval:
+    strain: np.ndarray  # (N, 5)
+    J: np.ndarray  # (N, 5, 8), local_strain_derivatives
+    H: np.ndarray  # (N, 5, 8, 8), unpacked, H[:, i] the Hessian of strain i
+    J_ref: np.ndarray  # (N, 5, 8), strain_derivatives reduced: J T
+    H_ref: np.ndarray  # (N, 5, 8, 8), T^T H T
+    H_sigma: np.ndarray  # (N, 8, 8), sum_i sigma_i H_i, unpacked
+
+
+def eval_local(Z: np.ndarray, cfg: TripletConfig, device, sigma=np.zeros(5)) -> LocalEval:
+    """Strains and z-derivatives at ``Z`` ``(N, 8)``, in float64."""
+    Z = np.atleast_2d(Z)
+    n = Z.shape[0]
+    frames = np.stack([cfg.d1e, cfg.te_old, cfg.d1f, cfg.tf_old])
+    strain = wp.zeros(n, dtype=vec5f, device=device)
+    J = wp.zeros(n, dtype=mat58f, device=device)
+    H = wp.zeros((n, 5), dtype=vec36f, device=device)
+    J_ref = wp.zeros(n, dtype=mat58f, device=device)
+    H_ref = wp.zeros((n, 5), dtype=mat88f, device=device)
+    H_sigma = wp.zeros(n, dtype=vec36f, device=device)
+    wp.launch(
+        _local_kernel,
+        dim=n,
+        inputs=[
+            wp.array(Z, dtype=vec8f, device=device), wp.array(frames, dtype=wp.vec3, device=device),
+            cfg.ref_twist, cfg.l0e, cfg.l0f, vec5f(*sigma),
+        ],
+        outputs=[strain, J, H, J_ref, H_ref, H_sigma],
+        device=device,
+    )
+    out = [a.numpy().astype(np.float64) for a in (strain, J, H, J_ref, H_ref, H_sigma)]
+    out[2] = unpack_sym8(out[2])
+    out[5] = unpack_sym8(out[5])
+    return LocalEval(*out)

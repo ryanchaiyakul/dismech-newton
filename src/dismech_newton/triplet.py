@@ -21,11 +21,11 @@ from .strains import (
     strain_gradient,
     triplet_geometry,
     vec5f,
+    vec8f,
     vec10f,
 )
 
 vec5i = wp.types.vector(5, wp.int32)
-vec8f = wp.types.vector(8, float)
 mat88f = wp.types.matrix((8, 8), float)
 mat11_8f = wp.types.matrix((11, 8), float)
 

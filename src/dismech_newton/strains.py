@@ -10,6 +10,9 @@ mat55f = wp.types.matrix((5, 5), float)
 vec11f = wp.types.vector(11, float)
 mat11f = wp.types.matrix((11, 11), float)
 mat5_11f = wp.types.matrix((5, 11), float)
+vec8f = wp.types.vector(8, float)
+mat58f = wp.types.matrix((5, 8), float)
+vec36f = wp.types.vector(36, float)  # packed upper triangle of a symmetric 8 x 8, row-major (see packed_index)
 
 # -- frames -------------------------------------------------------------------------------
 
@@ -307,6 +310,162 @@ def add_tau_hessian(H: mat11f, w: float, g: TripletGeometry) -> mat11f:
     Dff = -(wp.outer(kb, tf_tt) + wp.outer(tf_tt, kb)) / (4.0 * g.nf * g.nf)
     Def = (2.0 / g.chi * skew(g.te) - wp.outer(kb, g.tt)) / (2.0 * g.ne * g.nf)
     return add_edge_hessian(H, w * Dee, w * Def, w * Dff)
+
+
+# -- derivatives in the local variable z --------------------------------------------------
+#
+# ADMM's local variable is ``z = [e, theta_e, f, theta_f - theta_e]`` (8). In z the edges are coordinates, so the
+# derivatives are the edge-space ones with ``theta_e = z3``, ``theta_f = z3 + z7`` and no node scatter. With
+# ``A = theta_e + phi_e(e)``, ``B = theta_f + phi_f(f)`` (the transport turns) and ``W = sum_i sigma_i F_i`` in the
+# current-frame variables ``(e, f, A, B)`` (``W_AB = 0``):
+#
+#   H_ee = W_ee + ge W_eA^T + W_eA ge^T + W_AA ge ge^T + W_A d^2phi_e     H_e3 = W_eA + W_eB + W_AA ge   H_e7 = W_eB
+#   H_ff = W_ff + gf W_fB^T + W_fB gf^T + W_BB gf gf^T + W_B d^2phi_f     H_f3 = W_fA + H_f7             H_f7 = W_fB + W_BB gf
+#   H_ef = W_ef + W_eB gf^T + ge W_fA^T                                   H_33 = W_AA + W_BB             H_37 = H_77 = W_BB
+#
+# ``ge = d phi_e/de = w_e / (c_e n_e)`` and ``d^2phi_e = -(w_e a_e^T + a_e w_e^T) / n_e^2`` (from transport_turn,
+# with ``w = t x t_old``, ``c = 1 + t . t_old``, ``a = (I - t t^T) t_old / (2 c^2) + t / c``), so every turn term of
+# ``H_ee`` is ``w_e X_e^T + X_e w_e^T``. The curvature Hessians are linear in ``(k, M, N)``, so both are taken at
+# once from the sigma-weighted ``kw, Mw, Nw``; twist and stretch fold into the same terms.
+
+
+@wp.func
+def packed_index(i: int, j: int) -> int:
+    """Slot of ``(i, j)``, ``i <= j``, in a ``vec36f``: ``i * 8 - i * (i - 1) / 2 + (j - i)``."""
+    return i * (15 - i) / 2 + j
+
+
+@wp.func
+def _sym_upper(alpha: float, t: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3, u: wp.vec3, v: wp.vec3):
+    """Upper ``(00, 01, 02, 11, 12, 22)`` of ``alpha (I - t t^T) + a b^T + b a^T + c d^T + d c^T + u v^T + v u^T``."""
+    s00 = alpha * (1.0 - t[0] * t[0]) + 2.0 * (a[0] * b[0] + c[0] * d[0] + u[0] * v[0])
+    s11 = alpha * (1.0 - t[1] * t[1]) + 2.0 * (a[1] * b[1] + c[1] * d[1] + u[1] * v[1])
+    s22 = alpha * (1.0 - t[2] * t[2]) + 2.0 * (a[2] * b[2] + c[2] * d[2] + u[2] * v[2])
+    s01 = -alpha * t[0] * t[1] + a[0] * b[1] + b[0] * a[1] + c[0] * d[1] + d[0] * c[1] + u[0] * v[1] + v[0] * u[1]
+    s02 = -alpha * t[0] * t[2] + a[0] * b[2] + b[0] * a[2] + c[0] * d[2] + d[0] * c[2] + u[0] * v[2] + v[0] * u[2]
+    s12 = -alpha * t[1] * t[2] + a[1] * b[2] + b[1] * a[2] + c[1] * d[2] + d[1] * c[2] + u[1] * v[2] + v[1] * u[2]
+    return s00, s01, s02, s11, s12, s22
+
+
+@wp.func
+def _local_jacobian_row(De: wp.vec3, Df: wp.vec3, a: float, b: float, ge: wp.vec3, gf: wp.vec3) -> vec8f:
+    """A strain's z-gradient from its current-frame ``(d/de, d/df, d/dA, d/dB)``."""
+    u = De + a * ge
+    v = Df + b * gf
+    return vec8f(u[0], u[1], u[2], a + b, v[0], v[1], v[2], b)
+
+
+@wp.func
+def local_strain_derivatives(g: TripletGeometry, sigma: vec5f):
+    """``J = d eps/dz`` (5 x 8) and the packed upper triangle (``vec36f``, see :func:`packed_index`) of
+    ``sum_i sigma_i d^2 eps_i/dz^2`` in ``z = [e, theta_e, f, theta_f - theta_e]``, frames transported from
+    ``g.te_old``, ``g.tf_old``. Equals ``strain_derivatives`` reduced by ``dq/dz`` (``J T``, ``T^T H T``)."""
+    te = g.te
+    tf = g.tf
+    ne = g.ne
+    nf = g.nf
+    chi = g.chi
+    tt = g.tt
+    kb = g.kb
+
+    # Transport turns: d phi/de = w / (c n).
+    we = wp.cross(te, g.te_old)
+    wf = wp.cross(tf, g.tf_old)
+    ce = 1.0 + wp.dot(g.te_old, te)
+    cf = 1.0 + wp.dot(g.tf_old, tf)
+    ge = we / (ce * ne)
+    gf = wf / (cf * nf)
+
+    # J: stretch, the curvatures (M, N) = (m2, -m1) and (-m1, -m2), twist.
+    k1 = g.strain[2]
+    k2 = g.strain[3]
+    td1 = (g.m2e + g.m2f) / chi
+    td2 = -(g.m1e + g.m1f) / chi
+    ue = te / g.l0e
+    uf = tf / g.l0f
+    J = wp.matrix_from_rows(
+        vec8f(ue[0], ue[1], ue[2], 0.0, 0.0, 0.0, 0.0, 0.0),
+        vec8f(0.0, 0.0, 0.0, 0.0, uf[0], uf[1], uf[2], 0.0),
+        _local_jacobian_row(
+            (-k1 * tt + wp.cross(tf, td1)) / ne, (-k1 * tt - wp.cross(te, td1)) / nf,
+            -0.5 * wp.dot(kb, g.m1e), -0.5 * wp.dot(kb, g.m1f), ge, gf,
+        ),
+        _local_jacobian_row(
+            (-k2 * tt + wp.cross(tf, td2)) / ne, (-k2 * tt - wp.cross(te, td2)) / nf,
+            -0.5 * wp.dot(kb, g.m2e), -0.5 * wp.dot(kb, g.m2f), ge, gf,
+        ),
+        _local_jacobian_row(0.5 * kb / ne, 0.5 * kb / nf, -1.0, 1.0, ge, gf),
+    )
+
+    # Sigma-weighted curvature data (one Hessian for both curvatures).
+    s2 = sigma[2]
+    s3 = sigma[3]
+    s4 = sigma[4]
+    kw = s2 * k1 + s3 * k2
+    Me = s2 * g.m2e - s3 * g.m1e
+    Mf = s2 * g.m2f - s3 * g.m1f
+    Ne = -(s2 * g.m1e + s3 * g.m2e)
+    Nf = -(s2 * g.m1f + s3 * g.m2f)
+    td = (Me + Mf) / chi
+    ne2 = ne * ne
+    nf2 = nf * nf
+    nef = ne * nf
+
+    # theta terms
+    W_AA = -0.5 * wp.dot(kb, Me)
+    W_BB = -0.5 * wp.dot(kb, Mf)
+    sA = -0.5 * wp.dot(kb, Ne)
+    sB = -0.5 * wp.dot(kb, Nf)
+    W_eA = (sA * tt + wp.cross(tf, Ne) / chi) / ne
+    W_fA = (sA * tt - wp.cross(te, Ne) / chi) / nf
+    W_eB = (sB * tt + wp.cross(tf, Nf) / chi) / ne
+    W_fB = (sB * tt - wp.cross(te, Nf) / chi) / nf
+    torque_A = -sA - s4
+    torque_B = -sB + s4
+
+    # ee, ff: stretch + curvature projections, the tt and kb symmetric products, the turn terms.
+    pe = (kw * tt - wp.cross(tf, td)) / ne2
+    pf = (kw * tt + wp.cross(te, td)) / nf2
+    ae = (g.te_old - wp.dot(te, g.te_old) * te) / (2.0 * ce * ce) + te / ce
+    af = (g.tf_old - wp.dot(tf, g.tf_old) * tf) / (2.0 * cf * cf) + tf / cf
+    Xe = (W_eA + 0.5 * W_AA * ge) / (ce * ne) - torque_A / ne2 * ae
+    Xf = (W_fB + 0.5 * W_BB * gf) / (cf * nf) - torque_B / nf2 * af
+    ee00, ee01, ee02, ee11, ee12, ee22 = _sym_upper(
+        sigma[0] / (g.l0e * ne) - kw / (chi * ne2), te, tt, pe, kb, (Me - s4 * (te + tt)) / (4.0 * ne2), we, Xe
+    )
+    ff00, ff01, ff02, ff11, ff12, ff22 = _sym_upper(
+        sigma[1] / (g.l0f * nf) - kw / (chi * nf2), tf, tt, pf, kb, (Mf - s4 * (tf + tt)) / (4.0 * nf2), wf, Xf
+    )
+
+    # ef (full 3 x 3): c (I + te tf^T) + qe tt^T + tt qf^T + skew(r) + W_eB gf^T + ge W_fA^T.
+    c = -kw / (chi * nef)
+    qe = pe * (ne / nf) - (0.5 * s4 / nef) * kb
+    qf = pf * (nf / ne)
+    r = (s4 / chi * te - td) / nef
+    ef = (
+        c * (wp.identity(3, dtype=float) + wp.outer(te, tf))
+        + wp.outer(qe, tt)
+        + wp.outer(tt, qf)
+        + wp.outer(W_eB, gf)
+        + wp.outer(ge, W_fA)
+    )
+
+    e3 = W_eA + W_eB + W_AA * ge
+    f7 = W_fB + W_BB * gf
+    f3 = W_fA + f7
+    # fmt: off
+    H = vec36f(
+        ee00, ee01, ee02, e3[0], ef[0, 0], ef[0, 1] - r[2], ef[0, 2] + r[1], W_eB[0],
+        ee11, ee12, e3[1], ef[1, 0] + r[2], ef[1, 1], ef[1, 2] - r[0], W_eB[1],
+        ee22, e3[2], ef[2, 0] - r[1], ef[2, 1] + r[0], ef[2, 2], W_eB[2],
+        W_AA + W_BB, f3[0], f3[1], f3[2], W_BB,
+        ff00, ff01, ff02, f7[0],
+        ff11, ff12, f7[1],
+        ff22, f7[2],
+        W_BB,
+    )
+    # fmt: on
+    return J, H
 
 
 # -- scatter from edge space into the 11 DOFs ---------------------------------------------

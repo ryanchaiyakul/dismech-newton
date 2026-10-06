@@ -18,7 +18,10 @@ from dismech_newton.strains import (
     vec11f,
     vec36f,
 )
-from dismech_newton.triplet import _local_geometry, _reduction, mat88f
+from dismech_newton.triplet import _local_geometry
+
+mat88f = wp.types.matrix((8, 8), float)
+mat11_8f = wp.types.matrix((11, 8), float)
 
 NODE_DOFS = [0, 1, 2, 4, 5, 6, 8, 9, 10]
 THETA_DOFS = [3, 7]
@@ -161,6 +164,20 @@ def unpack_sym8(packed: np.ndarray) -> np.ndarray:
     out[..., i, j] = packed
     out[..., j, i] = packed
     return out
+
+
+@wp.func
+def _reduction() -> mat11_8f:
+    """``d q_triplet / d z`` at ``x0 = 0``."""
+    T = mat11_8f()
+    for k in range(3):
+        T[4 + k, k] = 1.0
+        T[8 + k, k] = 1.0
+        T[8 + k, 4 + k] = 1.0
+    T[3, 3] = 1.0
+    T[7, 3] = 1.0
+    T[7, 7] = 1.0
+    return T
 
 
 @wp.kernel

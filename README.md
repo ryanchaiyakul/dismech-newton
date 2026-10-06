@@ -31,17 +31,17 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
   </tr>
   <tr>
     <th width="33%">Flagella Bundling</th>
-    <th width="33%">Gradient Optimization</th>
+    <th width="33%">System Identification</th>
     <th width="33%">Two-way Coupled Solvers</th>
   </tr>
   <tr>
     <td><img src="docs/admm_flagella.webp" alt="Flagella bundling" width="100%"></td>
-    <td><img src="docs/fit_stiffness.webp" alt="Fitting stiffness and damping by gradient" width="100%"></td>
+    <td><img src="docs/fit_buckling.webp" alt="Fitting stiffness, density and damping to buckling recordings" width="100%"></td>
     <td><img src="docs/admm_franka.webp" alt="Pick and place" width="100%"></td>
   </tr>
   <tr>
     <td valign="top">Flagella bundle in a viscous fluid <a href="https://arxiv.org/abs/2205.10309">Tong et al. (2022)</a>.<br><code>uv run examples/flagella.py --flagella 10</code></td>
-    <td valign="top">L-BFGS fits stiffness and damping with gradients through the solver.<br><code>uv run examples/fit_stiffness.py</code></td>
+    <td valign="top">L-BFGS fits stiffness, density and damping by differentiating through the solver.<br><code>uv run examples/fit_buckling.py</code></td>
     <td valign="top">A MuJoCo Franka carries a rod with two-way coupling (experimental).<br><code>uv run --extra mujoco examples/experimental/franka_rod.py</code></td>
   </tr>
 </table>

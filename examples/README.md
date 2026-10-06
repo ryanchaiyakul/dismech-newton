@@ -11,7 +11,7 @@ Read them in this order: each adds one thing to the last.
 | [`overhand_knot.py`](overhand_knot.py) | Self-contact with friction, both ends clamped and pulled, a measured force against theory. |
 | [`cable_plectoneme.py`](cable_plectoneme.py) | A rod from material constants (`newton.Rod`), frictionless self-contact under twist, against Clauvelin et al. (2009). |
 | [`flagella.py`](flagella.py) | External forces on the nodes (`state.particle_f`: fluid drag) and contact between rods. |
-| [`fit_stiffness.py`](fit_stiffness.py) | Gradients through the solver: `wp.Tape`, `tape.backward`, L-BFGS on the bending stiffness and damping. |
+| [`fit_buckling.py`](fit_buckling.py) | Gradients through the solver: `wp.Tape`, `tape.backward` in a batched model, L-BFGS on stiffness, density and damping from noisy recordings, windowed so every rollout stays on the recorded buckling branch. |
 | [`experimental/franka_rod.py`](experimental/franka_rod.py) | Two-way coupling with a MuJoCo robot arm (`--extra mujoco`). |
 
 ```bash
@@ -37,4 +37,5 @@ self.drives = (self.spin,)                                   # prescribed every 
 graph after the first frame. Clamped DOFs move only through `state.dismech.q`, which `Drive` writes.
 
 [`utils/`](utils) holds what the examples share and the package does not: the frame loop, drives, camera
-framing, geometry checks, the theory plots and the fluid drag of `flagella.py`.
+framing, geometry checks, the theory plots, the fluid drag of `flagella.py` and `cached`, which stores
+results that take minutes (`fit_buckling.py`'s recordings and fit) in `.cache/examples`, once per configuration.

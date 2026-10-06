@@ -6,7 +6,12 @@
 - :func:`default_frames`: the ``--num-frames`` default from a simulated duration.
 - :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks.
 - :func:`inset`: the theory plots drawn in the viewer.
+- :func:`cached`: results that take minutes, computed once per configuration.
 """
+
+import hashlib
+import json
+from pathlib import Path
 
 import newton
 import numpy as np
@@ -19,6 +24,32 @@ from dismech_newton import flatten_state
 def smoothstep(t: float, t0: float, t1: float) -> float:
     s = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
     return s * s * (3.0 - 2.0 * s)
+
+
+# -- results computed once ---------------------------------------------------------------
+
+CACHE = Path(__file__).resolve().parents[2] / ".cache" / "examples"
+
+
+def cached(name: str, config: dict, compute, fresh: bool = False) -> dict[str, np.ndarray]:
+    """``compute()`` (a dict of arrays), stored in ``.cache/examples/<name>-<hash of config>.npz``.
+
+    ``config`` (JSON-able) holds everything the result depends on: a changed value computes and stores a new
+    file, and the old ones stay. Bump a version in it when the code computing the result changes. ``fresh``
+    recomputes regardless. ``rm -rf .cache`` clears every cached result.
+    """
+    text = json.dumps(config, sort_keys=True)
+    path = CACHE / f"{name}-{hashlib.sha256(text.encode()).hexdigest()[:12]}.npz"
+    if path.exists() and not fresh:
+        with np.load(path) as f:
+            return {k: f[k] for k in f.files if k != "config"}
+    out = compute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp, config=text, **out)
+    tmp.replace(path)  # never a half-written result
+    print(f"cached {path.relative_to(CACHE.parents[1])}")
+    return out
 
 
 # -- prescribed motion of clamped segments ------------------------------------------------

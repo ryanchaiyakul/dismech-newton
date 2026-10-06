@@ -15,7 +15,10 @@ from .dofs import fixed_node, flatten_state, node, scatter_dof, scatter_node
 from .sparse import SymmetricCSR, csr_slot
 from .strains import (
     TripletGeometry,
+    local_strain_derivatives,
     mat55f,
+    mat58f,
+    packed_index,
     reference_twist,
     strain_derivatives,
     strain_gradient,
@@ -23,11 +26,10 @@ from .strains import (
     vec5f,
     vec8f,
     vec10f,
+    vec36f,
 )
 
 vec5i = wp.types.vector(5, wp.int32)
-mat88f = wp.types.matrix((8, 8), float)
-mat11_8f = wp.types.matrix((11, 8), float)
 
 
 class Triplets:
@@ -287,6 +289,24 @@ def advance_ref_twist_kernel(
 def energy_kernels(energy) -> SimpleNamespace:
     """``assemble``, ``residual`` (differentiable), ``local`` and ``rest_stiffness`` for ``energy``."""
 
+    @wp.func
+    def local_newton_step(
+        z: vec8f, d: vec8f, P: vec8f, d1e_old: wp.vec3, te_old: wp.vec3, d1f_old: wp.vec3, tf_old: wp.vec3,
+        ref_twist_old: float, l0e: float, l0f: float, eps_prev: vec5f, rest: vec5f, params: vec10f, dt: float,
+        gauss_newton: int,
+    ):
+        """Newton step of ``W(z) + 1/2 |z - d|^2_P`` (Gauss-Newton Hessian with ``gauss_newton``), and whether its
+        Hessian was positive definite. A function, not inline in ``local``, so its temporaries die between steps."""
+        geom = _local_geometry(z, d1e_old, te_old, d1f_old, tf_old, ref_twist_old, l0e, l0f)
+        sigma, C = energy(geom.strain, eps_prev, rest, params, dt)
+        J, H = local_strain_derivatives(geom, sigma)
+        A = _gauss_newton(J, C)
+        if gauss_newton == 0:
+            A = A + H
+        for i in range(8):
+            A[packed_index(i, i)] = A[packed_index(i, i)] + P[i]
+        return _cholesky_solve(A, wp.transpose(J) * sigma + wp.cw_mul(P, z - d))
+
     @wp.kernel(module="unique")
     def assemble(
         q: wp.array[float], q_old: wp.array[float], edge_d1_old: wp.array[wp.vec3],
@@ -385,13 +405,17 @@ def energy_kernels(energy) -> SimpleNamespace:
             rest = triplet_rest[t]
             z_old = zt
             for _it in range(local_iterations):
-                geom = _local_geometry(zt, d1e, te_old, d1f, tf_old, triplet_ref_twist_old[t], l0e, l0f)
-                sigma, C = energy(geom.strain, strain_prev[t], rest, triplet_params[t], dt)
-                g, K, K_gn = _local_derivatives(geom, sigma, C)
-                G = g + wp.cw_mul(P, zt - d)
-                step, ok = _cholesky_solve(K + wp.diag(P), G)
-                if ok == 0:  # indefinite: fall back to Gauss-Newton, positive definite
-                    step, ok = _cholesky_solve(K_gn + wp.diag(P), G)
+                # Indefinite: retry with Gauss-Newton, positive definite. A loop, so the step is inlined once.
+                step = vec8f()
+                gauss_newton = int(0)
+                attempt = int(1)
+                while attempt != 0:
+                    step, ok = local_newton_step(zt, d, P, d1e, te_old, d1f, tf_old, triplet_ref_twist_old[t], l0e,
+                                                 l0f, strain_prev[t], rest, triplet_params[t], dt, gauss_newton)
+                    attempt = 0
+                    if ok == 0 and gauss_newton == 0:
+                        gauss_newton = 1
+                        attempt = 1
                 # Trust region: far from the solution (fast motion) a full step can collapse an edge.
                 s_e = wp.length(wp.vec3(step[0], step[1], step[2])) / (0.25 * l0e)
                 s_f = wp.length(wp.vec3(step[4], step[5], step[6])) / (0.25 * l0f)
@@ -452,37 +476,24 @@ def energy_kernels(energy) -> SimpleNamespace:
         tf = wp.normalize(ef)
         geom = _local_geometry(z0, edge_d1[e], te, edge_d1[f], tf, triplet_ref_twist[t], edge_length[e], edge_length[f])
         sigma, C = energy(geom.strain, geom.strain, triplet_rest[t], triplet_params[t], 1.0)
-        g, K, K_gn = _local_derivatives(geom, sigma, C)
+        J, _H = local_strain_derivatives(geom, sigma)
+        K_gn = _gauss_newton(J, C)
         Kee = wp.mat33()
         Kff = wp.mat33()
         for i in range(3):
             for j in range(3):
-                Kee[i, j] = K_gn[i, j]
-                Kff[i, j] = K_gn[4 + i, 4 + j]
+                Kee[i, j] = K_gn[packed_index(wp.min(i, j), wp.max(i, j))]
+                Kff[i, j] = K_gn[packed_index(4 + wp.min(i, j), 4 + wp.max(i, j))]
         ae = wp.dot(te, Kee * te)
         af = wp.dot(tf, Kff * tf)
         be = 0.5 * (wp.trace(Kee) - ae)
         bf = 0.5 * (wp.trace(Kff) - af)
-        stiffness[t] = wp.vec3(0.5 * (ae + af), 0.5 * (be + bf), K_gn[7, 7])
+        stiffness[t] = wp.vec3(0.5 * (ae + af), 0.5 * (be + bf), K_gn[packed_index(7, 7)])
 
     return SimpleNamespace(assemble=assemble, residual=residual, local=local, rest_stiffness=rest_stiffness)
 
 
 # -- ADMM local step ----------------------------------------------------------------------
-
-
-@wp.func
-def _reduction() -> mat11_8f:
-    """``d q_triplet / d z`` at ``x0 = 0``."""
-    T = mat11_8f()
-    for k in range(3):
-        T[4 + k, k] = 1.0
-        T[8 + k, k] = 1.0
-        T[8 + k, 4 + k] = 1.0
-    T[3, 3] = 1.0
-    T[7, 3] = 1.0
-    T[7, 7] = 1.0
-    return T
 
 
 @wp.func
@@ -498,48 +509,54 @@ def _local_geometry(
 
 
 @wp.func
-def _local_derivatives(geom: TripletGeometry, sigma: vec5f, C: mat55f):
-    """Gradient, Hessian and Gauss-Newton Hessian of ``W`` in ``z``."""
-    J, K_geo = strain_derivatives(geom, sigma)
-    T = _reduction()
-    JT = J * T  # (5, 8)
-    K_gn = wp.transpose(JT) * C * JT
-    K = K_gn + wp.transpose(T) * K_geo * T
-    g = wp.transpose(JT) * sigma
-    return g, K, K_gn
+def _gauss_newton(J: mat58f, C: mat55f) -> vec36f:
+    """Packed ``J^T C J``."""
+    CJ = C * J
+    A = vec36f()
+    for i in range(8):
+        for j in range(i, 8):
+            v = float(0.0)
+            for r in range(5):
+                v = v + J[r, i] * CJ[r, j]
+            A[packed_index(i, j)] = v
+    return A
 
 
 @wp.func
-def _cholesky_solve(A: mat88f, b: vec8f):
-    """``A^{-1} b`` and whether ``A`` was positive definite."""
-    L = mat88f()
+def _cholesky_solve(A: vec36f, b: vec8f):
+    """``A^{-1} b`` for packed ``A`` (factored in place, ``A = R^T R``) and whether ``A`` was positive definite.
+    Every loop bound is a constant or an unrolled loop's index, so all indices are static (registers, not local
+    memory)."""
     ok = int(1)
     for j in range(8):
-        s = A[j, j]
+        a = A[packed_index(j, j)]
+        s = a
         for k in range(j):
-            s = s - L[j, k] * L[j, k]
-        if s <= 1.0e-12 * wp.abs(A[j, j]) or s <= 0.0:
+            s = s - A[packed_index(k, j)] * A[packed_index(k, j)]
+        if s <= 1.0e-12 * wp.abs(a) or s <= 0.0:
             ok = 0
-            s = wp.max(wp.abs(A[j, j]), 1.0e-12)
-        L[j, j] = wp.sqrt(s)
-        for i in range(j + 1, 8):
-            v = A[i, j]
-            for k in range(j):
-                v = v - L[i, k] * L[j, k]
-            L[i, j] = v / L[j, j]
+            s = wp.max(wp.abs(a), 1.0e-12)
+        r = wp.sqrt(s)
+        A[packed_index(j, j)] = r
+        for i in range(j, 8):
+            if i > j:
+                v = A[packed_index(j, i)]
+                for k in range(j):
+                    v = v - A[packed_index(k, i)] * A[packed_index(k, j)]
+                A[packed_index(j, i)] = v / r
     y = vec8f()
     for i in range(8):
         v = b[i]
         for k in range(i):
-            v = v - L[i, k] * y[k]
-        y[i] = v / L[i, i]
+            v = v - A[packed_index(k, i)] * y[k]
+        y[i] = v / A[packed_index(i, i)]
     x = vec8f()
-    for ii in range(8):
-        i = 7 - ii
+    for i in range(7, -1, -1):
         v = y[i]
-        for k in range(i + 1, 8):
-            v = v - L[k, i] * x[k]
-        x[i] = v / L[i, i]
+        for k in range(i, 8):
+            if k > i:
+                v = v - A[packed_index(i, k)] * x[k]
+        x[i] = v / A[packed_index(i, i)]
     return x, ok
 
 

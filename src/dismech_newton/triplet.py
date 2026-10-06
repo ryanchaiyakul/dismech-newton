@@ -12,7 +12,7 @@ import warp as wp
 from newton import Model, State
 
 from .dofs import fixed_node, flatten_state, node, scatter_dof, scatter_node
-from .sparse import SymmetricCSR, csr_slot
+from .sparse import SymmetricCSR
 from .strains import (
     TripletGeometry,
     local_strain_derivatives,
@@ -30,6 +30,10 @@ from .strains import (
 )
 
 vec5i = wp.types.vector(5, wp.int32)
+
+# The local kernel is register-bound (one block of 256 holds a whole SM's registers): small blocks spread small
+# scenes over more SMs and cost nothing at large ones (RTX 2070 Super: 500 triplets 19 -> 11 us, 59k 130 -> 108 us).
+LOCAL_BLOCK_DIM = 32
 
 
 class Triplets:
@@ -108,7 +112,7 @@ class Triplets:
                 q, s_in.q, s_in.edge_d1_q, s_in.triplet_ref_twist_q, self.conn, self.der.edge_length, self.params,
                 self.rest, strain_prev, dt, self.num_node_dofs, self.dof_fixed,
             ],
-            outputs=[residual, hessian.indptr, hessian.indices, hessian.vals],
+            outputs=[residual, hessian.pair_slots, hessian.vals],
             device=self.device,
         )
 
@@ -206,6 +210,7 @@ class TripletTerm:
             ],
             outputs=[self.z, self.u, rhs, stats],
             device=self.device,
+            block_dim=LOCAL_BLOCK_DIM,
         )
 
 
@@ -314,16 +319,17 @@ def energy_kernels(energy) -> SimpleNamespace:
         triplet_params: wp.array[vec10f], triplet_rest: wp.array[vec5f], strain_prev: wp.array[vec5f], dt: float,
         theta_dof_offset: int, dof_fixed: wp.array[wp.int32],
         # outputs
-        residual: wp.array[float], hess_indptr: wp.array[wp.int32], hess_indices: wp.array[wp.int32],
-        hess_vals: wp.array[wp.float64],
+        residual: wp.array[float], hess_slots: wp.array2d[wp.int32], hess_vals: wp.array[wp.float64],
     ):
+        """``hess_slots``: :attr:`SymmetricCSR.pair_slots` of :meth:`Triplets.dofs`."""
         t = wp.tid()
         conn = triplet_conn[t]
         e, f, n0, n1, n2 = unpack_vec5(conn)
         geom = geometry_at(q, q_old, edge_d1_old, triplet_ref_twist_old[t], conn, edge_length, theta_dof_offset)
         sigma, C = energy(geom.strain, strain_prev[t], triplet_rest[t], triplet_params[t], dt)
-        J, K = strain_derivatives(geom, sigma)
-        K = K + wp.transpose(J) * C * J
+        # Derivatives in z = R q (translation invariant), mapped to the DOFs by R's +-1 entries.
+        J, H = local_strain_derivatives(geom, sigma)
+        K = _gauss_newton(J, C) + H
         g = wp.transpose(J) * sigma
 
         dofs = wp.vector(length=11, dtype=wp.int32)
@@ -333,19 +339,19 @@ def energy_kernels(energy) -> SimpleNamespace:
             dofs[8 + k] = 3 * n2 + k
         dofs[3] = theta_dof_offset + e
         dofs[7] = theta_dof_offset + f
+        free = wp.vector(length=11, dtype=wp.int32)
+        for i in range(11):
+            free[i] = int(dof_fixed[dofs[i]] == 0)
 
         for i in range(11):
-            if dof_fixed[dofs[i]] == 0:
-                wp.atomic_add(residual, dofs[i], g[i])
+            if free[i] != 0:
+                wp.atomic_add(residual, dofs[i], _dof_gradient(g, i))
         for i in range(11):
             for j in range(i, 11):
-                v = K[i, j]
-                if j > i:
-                    v = 0.5 * (v + K[j, i])
-                if v != 0.0 and dof_fixed[dofs[i]] == 0 and dof_fixed[dofs[j]] == 0:
-                    row = wp.min(dofs[i], dofs[j])
-                    col = wp.max(dofs[i], dofs[j])
-                    wp.atomic_add(hess_vals, csr_slot(hess_indptr, hess_indices, row, col), wp.float64(v))
+                v = _dof_hessian(K, i, j)
+                if v != 0.0 and free[i] != 0 and free[j] != 0:
+                    slot = hess_slots[i * 11 - (i * (i - 1)) // 2 + (j - i), t]  # triu order
+                    wp.atomic_add(hess_vals, slot, wp.float64(v))
 
     @wp.kernel(module="unique")
     def residual(
@@ -405,17 +411,11 @@ def energy_kernels(energy) -> SimpleNamespace:
             rest = triplet_rest[t]
             z_old = zt
             for _it in range(local_iterations):
-                # Indefinite: retry with Gauss-Newton, positive definite. A loop, so the step is inlined once.
-                step = vec8f()
-                gauss_newton = int(0)
-                attempt = int(1)
-                while attempt != 0:
+                step, ok = local_newton_step(zt, d, P, d1e, te_old, d1f, tf_old, triplet_ref_twist_old[t], l0e, l0f,
+                                             strain_prev[t], rest, triplet_params[t], dt, 0)
+                if ok == 0:  # indefinite: fall back to Gauss-Newton, positive definite
                     step, ok = local_newton_step(zt, d, P, d1e, te_old, d1f, tf_old, triplet_ref_twist_old[t], l0e,
-                                                 l0f, strain_prev[t], rest, triplet_params[t], dt, gauss_newton)
-                    attempt = 0
-                    if ok == 0 and gauss_newton == 0:
-                        gauss_newton = 1
-                        attempt = 1
+                                                 l0f, strain_prev[t], rest, triplet_params[t], dt, 1)
                 # Trust region: far from the solution (fast motion) a full step can collapse an edge.
                 s_e = wp.length(wp.vec3(step[0], step[1], step[2])) / (0.25 * l0e)
                 s_f = wp.length(wp.vec3(step[4], step[5], step[6])) / (0.25 * l0f)
@@ -520,6 +520,51 @@ def _gauss_newton(J: mat58f, C: mat55f) -> vec36f:
                 v = v + J[r, i] * CJ[r, j]
             A[packed_index(i, j)] = v
     return A
+
+
+@wp.func
+def _z_of_dof(i: int):
+    """``dz`` per unit of triplet DOF ``i`` of ``[x0, theta_e, x1, theta_f, x2]``: ``s0 e_a0 + s1 e_a1``. For a
+    constant ``i`` everything folds to constants."""
+    if i < 3:
+        return i, -1.0, i, 0.0
+    if i == 3:
+        return 3, 1.0, 7, -1.0
+    if i < 7:
+        return i - 4, 1.0, i, -1.0
+    if i == 7:
+        return 7, 1.0, 7, 0.0
+    return i - 4, 1.0, i - 4, 0.0
+
+
+@wp.func
+def _packed(A: vec36f, i: int, j: int) -> float:
+    return A[packed_index(wp.min(i, j), wp.max(i, j))]
+
+
+@wp.func
+def _dof_gradient(g: vec8f, i: int) -> float:
+    """``(R^T g)_i``."""
+    a0, s0, a1, s1 = _z_of_dof(i)
+    v = s0 * g[a0]
+    if s1 != 0.0:
+        v = v + s1 * g[a1]
+    return v
+
+
+@wp.func
+def _dof_hessian(A: vec36f, i: int, j: int) -> float:
+    """``(R^T A R)_ij`` for packed ``A``."""
+    a0, s0, a1, s1 = _z_of_dof(i)
+    b0, t0, b1, t1 = _z_of_dof(j)
+    v = s0 * t0 * _packed(A, a0, b0)
+    if t1 != 0.0:
+        v = v + s0 * t1 * _packed(A, a0, b1)
+    if s1 != 0.0:
+        v = v + s1 * t0 * _packed(A, a1, b0)
+        if t1 != 0.0:
+            v = v + s1 * t1 * _packed(A, a1, b1)
+    return v
 
 
 @wp.func

@@ -11,3 +11,6 @@ wheels/
 
 # Local diagnostics and notes, not part of the package
 scratch/
+
+# Cached example results (examples/utils/common.py: cached)
+.cache/

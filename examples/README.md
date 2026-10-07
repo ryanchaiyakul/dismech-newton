@@ -9,7 +9,7 @@ Read them in this order: each adds one thing to the last.
 | [`cable_pile.py`](cable_pile.py) | Many rods in one model, ground contact and friction. |
 | [`cantilever.py`](cantilever.py) | Both solvers (`ADMMDiSMechSolver`, `DiSMechSolver`) and their integrators (`theta`), against a beam formula. |
 | [`overhand_knot.py`](overhand_knot.py) | Self-contact with friction, both ends clamped and pulled, a measured force against theory. |
-| [`cable_plectoneme.py`](cable_plectoneme.py) | A rod from material constants (`newton.Rod`), frictionless self-contact under twist, against Clauvelin et al. (2009). |
+| [`plectoneme.py`](plectoneme.py) | A rod from material constants (`newton.Rod`), frictionless self-contact under twist, against Clauvelin et al. (2009). |
 | [`flagella.py`](flagella.py) | External forces on the nodes (`state.particle_f`: fluid drag) and contact between rods. |
 | [`fit_buckling.py`](fit_buckling.py) | Gradients through the ADMM solver: `wp.Tape`, `tape.backward` in a batched model, `solver.reset` per window, L-BFGS on stiffness, density and damping from noisy 30 fps recordings and a gripper force sensor (positions alone only fix their ratios), windowed so every rollout stays on the recorded buckling branch. |
 | [`experimental/franka_rod.py`](experimental/franka_rod.py) | Two-way coupling with a MuJoCo robot arm (`--extra mujoco`). |

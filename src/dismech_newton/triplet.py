@@ -418,16 +418,8 @@ def energy_kernels(energy) -> SimpleNamespace:
             z[t] = zt
             u[t] = ut
 
-            # Primal residual S q - z and the change of z, relative to the rest lengths for edges.
-            res = Sq - zt
-            m = wp.max(wp.abs(res[3]), wp.abs(res[7]))
-            m = wp.max(m, wp.length(wp.vec3(res[0], res[1], res[2])) / l0e)
-            m = wp.max(m, wp.length(wp.vec3(res[4], res[5], res[6])) / l0f)
-            dz = zt - z_old
-            m = wp.max(m, wp.max(wp.abs(dz[3]), wp.abs(dz[7])))
-            m = wp.max(m, wp.length(wp.vec3(dz[0], dz[1], dz[2])) / l0e)
-            m = wp.max(m, wp.length(wp.vec3(dz[4], dz[5], dz[6])) / l0f)
-            wp.atomic_max(stats, 0, m)
+            # Primal residual S q - z and the change of z.
+            wp.atomic_max(stats, 0, wp.max(_z_size(Sq - zt, l0e, l0f), _z_size(zt - z_old, l0e, l0f)))
 
         # rhs += S_f^T P (z - u - S q_c): the fixed DOFs' coupling moves to the right-hand side.
         c0 = fixed_node(q, dof_fixed, n0)
@@ -492,6 +484,14 @@ def _z_at(q: wp.array[float], n0: int, n1: int, n2: int, ie: int, i_f: int) -> v
     ee = node(q, n1) - node(q, n0)
     ef = node(q, n2) - node(q, n1)
     return vec8f(ee[0], ee[1], ee[2], q[ie], ef[0], ef[1], ef[2], q[i_f] - q[ie])
+
+
+@wp.func
+def _z_size(v: vec8f, l0e: float, l0f: float) -> float:
+    """Max-norm of a ``z`` difference, edges relative to their rest lengths."""
+    m = wp.max(wp.abs(v[3]), wp.abs(v[7]))
+    m = wp.max(m, wp.length(wp.vec3(v[0], v[1], v[2])) / l0e)
+    return wp.max(m, wp.length(wp.vec3(v[4], v[5], v[6])) / l0f)
 
 
 @wp.kernel

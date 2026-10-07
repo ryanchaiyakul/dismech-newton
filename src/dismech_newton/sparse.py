@@ -1,4 +1,4 @@
-"""Device CSR matrices; kernels add into ``vals`` at :func:`csr_slot`."""
+"""Device CSR matrices; kernels add into ``vals``."""
 
 import numpy as np
 import scipy.sparse as sp
@@ -23,7 +23,7 @@ class SymmetricCSR(_CSR):
     """Upper-triangle CSR; the pattern is the diagonal and every DOF pair in a row of ``dofs``.
 
     ``pair_slots[p, r]`` is the slot of the ``p``-th pair ``(dofs[r, i], dofs[r, j])``, ``(i, j)`` in
-    ``np.triu_indices`` order, so kernels scatter without searching (:func:`csr_slot`)."""
+    ``np.triu_indices`` order, so kernels scatter without searching."""
 
     def __init__(self, n: int, dofs: np.ndarray, device) -> None:
         keys = [np.arange(n, dtype=np.int64) * (n + 1)]
@@ -61,17 +61,3 @@ class GeneralCSR(_CSR):
         A.sum_duplicates()
         A.sort_indices()
         self._set(A.shape[0], A.indptr.astype(np.int32), A.indices.astype(np.int32), A.data.astype(np.float64), device)
-
-
-@wp.func
-def csr_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], row: int, col: int) -> int:
-    """Index of ``(row, col)``, which must be in the pattern."""
-    lo = indptr[row]
-    hi = indptr[row + 1] - 1
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if indices[mid] < col:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo

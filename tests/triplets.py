@@ -120,14 +120,14 @@ def _triplet_kernel(
         frames[0], frames[1], frames[2], frames[3], ref_twist, l0e, l0f,
     )
     strain[i] = g.strain
+    Js, Hw = local_strain_derivatives(g, sigma)  # J does not depend on sigma
+    J[i] = Js
+    H_sigma[i] = Hw
     for s in range(5):
         unit = vec5f()
         unit[s] = 1.0
-        Js, Hs = local_strain_derivatives(g, unit)
-        J[i] = Js
+        _J, Hs = local_strain_derivatives(g, unit)
         H[i, s] = Hs
-    _J, Hw = local_strain_derivatives(g, sigma)
-    H_sigma[i] = Hw
     grad[i] = strain_gradient(g, sigma)
 
 

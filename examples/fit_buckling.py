@@ -35,7 +35,7 @@ import warp as wp
 from scipy.optimize import minimize
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
-from utils.common import cached, inset, inset_scale, smoothstep
+from utils.common import cached, capsule_poses, inset, inset_scale, smoothstep
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, flatten_state, suspended_tape
 from dismech_newton.solver import advance_frames_kernel
@@ -583,14 +583,6 @@ def force(ax, observed: np.ndarray, predicted: np.ndarray, t: int, ylim: tuple, 
     ax.legend(loc="lower left")
 
 
-def body_q(x: np.ndarray) -> np.ndarray:
-    """Capsule poses (segments, 7) of a polyline of nodes: at the segments' midpoints, local z along them."""
-    d = x[1:] - x[:-1]
-    d /= np.linalg.norm(d, axis=1, keepdims=True)
-    q = np.concatenate([np.cross([0.0, 0.0, 1.0], d), 1.0 + d[:, 2:3]], axis=1)  # (x, y, z, w): z onto d
-    return np.concatenate([0.5 * (x[1:] + x[:-1]), q / np.linalg.norm(q, axis=1, keepdims=True)], axis=1)
-
-
 class Example:
     """The true motion (grey) and the iterate's replays (green) of the shown trials, stacked: one on the upper
     branch above one on the lower. Each iterate plays the whole experiment, then the next iterate."""
@@ -656,7 +648,7 @@ class Example:
         t = self.t
         toward = np.array([0.0, -0.02, 0.0])  # the iterate just in front of the truth
         x = np.concatenate([self.true[:, t] + self.lift, self.replays[self.k, :, t] + self.lift + toward])
-        self.state.body_q.assign(np.concatenate([body_q(rod) for rod in x]).astype(np.float32))
+        self.state.body_q.assign(np.concatenate([capsule_poses(rod) for rod in x]).astype(np.float32))
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state)
         self.viewer.end_frame()

@@ -6,7 +6,8 @@
 - :func:`contact_pipeline`: Newton's collision pipeline, rigid contacts only.
 - :func:`default_frames`: the ``--num-frames`` default from a simulated duration.
 - :func:`smoothstep`: a smooth ramp from 0 to 1.
-- :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks.
+- :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks; :func:`capsule_poses`: capsules
+  along a polyline, for drawing recorded node positions.
 - :func:`inset`: the theory plots drawn in the viewer.
 - :func:`cached`: results that take minutes, computed once per configuration.
 """
@@ -225,6 +226,14 @@ def close_pairs(x: np.ndarray, radius: float, exclude: int, reach: float) -> tup
     pairs = cKDTree(mid).query_pairs(reach, output_type="ndarray")
     i, j = pairs[np.abs(pairs[:, 0] - pairs[:, 1]) >= exclude].T
     return i, j, segment_distance(x[i], x[i + 1], x[j], x[j + 1]) / (2.0 * radius)
+
+
+def capsule_poses(x: np.ndarray) -> np.ndarray:
+    """Capsule poses (segments, 7) of a polyline of nodes: at the segments' midpoints, local z along them."""
+    d = x[1:] - x[:-1]
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    q = np.concatenate([np.cross([0.0, 0.0, 1.0], d), 1.0 + d[:, 2:3]], axis=1)  # (x, y, z, w): z onto d
+    return np.concatenate([0.5 * (x[1:] + x[:-1]), q / np.linalg.norm(q, axis=1, keepdims=True)], axis=1)
 
 
 def capsules(model, state, rods: list[list[int]]):

@@ -49,19 +49,8 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
 
 ## Install
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Runs on an NVIDIA GPU with CUDA 13 or on the CPU.
-
-As a library, from [PyPI](https://pypi.org/project/dismech-newton/):
+Requires Python 3.10+. Runs on an NVIDIA GPU with CUDA 13 or on the CPU.
 
 ```bash
 pip install "dismech-newton[gpu]"
-```
-
-To run the examples, clone the repository:
-
-```bash
-git clone https://github.com/ryanchaiyakul/dismech-newton.git
-cd dismech-newton
-uv sync --extra gpu --extra viewer
-uv run examples/cantilever.py
 ```

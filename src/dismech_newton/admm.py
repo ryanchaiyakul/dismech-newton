@@ -12,7 +12,7 @@ from newton import Contacts, Model, State
 
 from .builder import add_colliding_rod
 from .contact import ContactSnapshot, ContactTerm
-from .dofs import external_force
+from .dofs import external_force, flatten_state
 from .linear import BlockInverseSolver, CudssSolver, ScipySolver, TridiagonalSolver, sparse_solver
 from .solver import DiSMechSolver
 from .sparse import SymmetricCSR
@@ -81,6 +81,15 @@ class ADMMDiSMechSolver(DiSMechSolver):
     def refresh_mass(self) -> None:
         super().refresh_mass()
         self._factored_alpha = None  # H holds M alpha
+
+    def reset(self, state: State, world_mask: wp.array | None = None, flags: int | None = None) -> None:
+        """Start the next step from ``state`` without the last step's warm start (``z = S q``, ``u = 0``, no
+        contact duals): for a step that does not continue the last one, such as a restart from data."""
+        if world_mask is not None:
+            raise NotImplementedError("ADMMDiSMechSolver.reset resets every world")
+        flatten_state(state)
+        self.elastic.reset(state)
+        self.contact.reset()
 
     def contact_snapshot(self) -> ContactSnapshot | None:
         return self.contact.snapshot(self.contact_smoothing)

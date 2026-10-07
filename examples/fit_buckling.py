@@ -12,7 +12,9 @@ short windows that restart from the data (multiple shooting): each window stays 
 windows of all trials are rods of one batched model; one ``tape.backward`` per batch gives the gradient of all
 unknowns, and L-BFGS fits them from a guess off by 3-4x. It fits twice: the force's error is mostly the gripper
 pose readout's, which the force feels much more than the positions do, so the second fit weighs the force by what
-the first one left unexplained.
+the first one left unexplained. The fit simulates with ADMM (the solver that also handles contact; 50 iterations
+per step), restarted at every window: its warm start from another window would bias the fit. The recordings are
+simulated with Newton.
 
 The viewer replays every L-BFGS step from the first recorded frame (green) over the true motion (grey, without the
 measurement noise the fit sees), for one trial on each branch, beside the parameters and the upper trial's gripper
@@ -35,7 +37,7 @@ from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 from utils.common import cached, inset, inset_scale
 
-from dismech_newton import DiSMechSolver, add_rod, flatten_state, suspended_tape
+from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, flatten_state, suspended_tape
 from dismech_newton.solver import advance_frames_kernel
 from dismech_newton.strains import strain_gradient, vec5f, vec10f
 from dismech_newton.triplet import advance_ref_twist_kernel, geometry_at, linear_energy, vec5i
@@ -86,8 +88,9 @@ def mid_z(x: np.ndarray) -> np.ndarray:
 # -- the model ------------------------------------------------------------------------------------
 
 
-def build(rods: int, ratios: np.ndarray | None = None):
-    """``rods`` rods in one model, both ends clamped; ``ratios`` (rods, 4): each rod's (EI, EA, rho, c) over the truth."""
+def build(rods: int, ratios: np.ndarray | None = None, admm: bool = False):
+    """``rods`` rods in one model, both ends clamped; ``ratios`` (rods, 4): each rod's (EI, EA, rho, c) over the truth.
+    ``admm``: the ADMM solver at a fixed 50 iterations per step (else Newton)."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -GRAVITY))
     for r in range(rods):
         rod = newton.Rod.create_straight((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), LENGTH, segment_count=SEGMENTS,
@@ -110,7 +113,7 @@ def build(rods: int, ratios: np.ndarray | None = None):
     d.triplet_params.assign(p.reshape(-1, 10))
     model.particle_mass.assign(model.particle_mass.numpy() * np.repeat(rho, NODES))
     d.edge_inertia.assign(d.edge_inertia.numpy() * np.repeat(rho, SEGMENTS))
-    solver = DiSMechSolver(model, theta=1.0)
+    solver = ADMMDiSMechSolver(model, theta=1.0, iterations=50, tol=0.0) if admm else DiSMechSolver(model, theta=1.0)
     solver.refresh_mass()
     return model, solver
 
@@ -121,7 +124,7 @@ STATE = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q")
 def start(solver, st, src, q=None, qd=None):
     """``st`` = ``src`` moved to the DOFs ``q``, with velocities ``qd`` (else at rest). The edge frames, reference
     twists and stored strains are state too: they are carried over from ``src`` as at the end of a step, or the rod
-    is kicked."""
+    is kicked. The solver starts its next step from ``st`` (no warm start)."""
     for k in STATE:
         getattr(st.dismech, k).assign(getattr(src.dismech, k))
     if q is not None:
@@ -138,6 +141,7 @@ def start(solver, st, src, q=None, qd=None):
               inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, src.dismech.triplet_ref_twist_q],
               outputs=[st.dismech.triplet_ref_twist_q])
     tr.measure(st, st.dismech.triplet_strain_q)
+    solver.reset(st)
 
 
 def rest_state(model, solver):
@@ -337,7 +341,7 @@ class WindowFit:
         self.G, self.chunks = GROUP, FRAMES // W // GROUP
         R = trials * GROUP  # rod g * trials + b: window g of the batch, trial b
         self.L = W * OBS_EVERY  # steps per window
-        self.model, self.solver = m, solver = build(R)
+        self.model, self.solver = m, solver = build(R, admm=True)
         d = m.dismech
         self.p_true = d.triplet_params.numpy().reshape(R, NT, 10).astype(np.float64)
         self.m_true = m.particle_mass.numpy().astype(np.float64)
@@ -499,7 +503,7 @@ def replay(data: dict, trials: np.ndarray, ratios: np.ndarray) -> tuple[np.ndarr
     recorded frame, driven by the smoothed readout. Node positions (len(ratios), len(trials), frames, NODES, 3)
     and the gripper's force (len(ratios), len(trials), frames, 3)."""
     n, R = len(ratios), len(ratios) * len(trials)
-    model, solver = build(R, np.repeat(ratios, len(trials), 0))
+    model, solver = build(R, np.repeat(ratios, len(trials), 0), admm=True)
     rest = rest_state(model, solver)
     st = model.state()
     flatten_state(st)
@@ -530,7 +534,7 @@ def results(fresh: bool = False) -> dict:
                       trials=TRIALS, seed=SEED, noise=[GRIP_T, GRIP_R, GRIP_TAU, GRIP_RAMP, SHAKE, SHAKE_MODES, OBS_X,
                                                        OBS_GRIP_T, OBS_GRIP_R, OBS_F])
     data = cached("fit_buckling-data", experiment, record, fresh)
-    setup = dict(experiment=experiment, guess=GUESS, window=W, smooth=SMOOTH, velocity=VELOCITY, version=3)
+    setup = dict(experiment=experiment, guess=GUESS, window=W, smooth=SMOOTH, velocity=VELOCITY, version=4)
     out = cached("fit_buckling-fit", setup, lambda: fit(data), fresh)
 
     def replays():

@@ -6,7 +6,7 @@ import zlib
 import numpy as np
 import pytest
 import warp as wp
-from triplets import TripletConfig, eval_local, eval_triplet
+from triplets import TripletConfig, eval_triplet
 
 
 def pytest_addoption(parser):
@@ -71,9 +71,3 @@ def triplet(request) -> TripletConfig:
 def strains(device):
     """``strains(Q, cfg, sigma=...)`` on ``device``."""
     return functools.partial(eval_triplet, device=device)
-
-
-@pytest.fixture(scope="session")
-def local_strains(device):
-    """``local_strains(Z, cfg, sigma=...)`` on ``device``: strains and derivatives in ADMM's ``z``."""
-    return functools.partial(eval_local, device=device)

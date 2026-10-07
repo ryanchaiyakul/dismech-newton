@@ -179,8 +179,7 @@ class DiSMechSolver(SolverBase):
 
     @property
     def graph_capturable(self) -> bool:
-        """Whether :meth:`step` can be captured in a CUDA graph (decided by the first step for ADMM). A tolerance
-        iterates in a device-side loop, which cuDSS cannot run inside: ``newton_tol=0`` captures with it."""
+        """Whether :meth:`step` can be captured in a CUDA graph (decided by the first step for ADMM)."""
         linear = self._linear
         if not self.device.is_cuda or linear is None:
             return self.device.is_cuda
@@ -225,7 +224,7 @@ def active_tape() -> wp.Tape | None:
 @contextmanager
 def suspended_tape():
     """Pause the active ``wp.Tape`` (if any) inside the block; yields it."""
-    runtime = wp._src.context.runtime  # kernels that must not be recorded
+    runtime = wp._src.context.runtime
     tape, runtime.tape = runtime.tape, None
     try:
         yield tape

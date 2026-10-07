@@ -77,9 +77,9 @@ def test_contact_pattern_ignores_slot_order(rng):
 
     perm = rng.permutation(snapshot.count)
     permuted = replace(snapshot, **{f: wp.array(getattr(snapshot, f).numpy()[perm], dtype=getattr(snapshot, f).dtype)
-                                    for f in ("active", "pairs", "bary", "normal", "anchor", "shift", "thickness",
+                                    for f in ("pairs", "bary", "normal", "anchor", "shift", "thickness",
                                               "force", "rho")})
-    assert snapshot.active.numpy().sum() > 1
+    assert snapshot.count > 1
     pattern, lam = solve(snapshot)
     pattern_permuted, lam_permuted = solve(permuted)
     assert pattern_permuted is pattern

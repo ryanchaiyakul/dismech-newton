@@ -31,6 +31,7 @@ def _place_points(src: wp.array[wp.vec3], offset: wp.vec3, start: int, dst: wp.a
     i = wp.tid()
     dst[start + i] = src[i] + offset
 
+
 # name: (solver, its options, color)
 DER_SOLVERS = {
     "DER ADMM, implicit Euler": (ADMMDiSMechSolver, {}, (0.3, 0.8, 0.6)),

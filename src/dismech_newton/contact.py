@@ -24,7 +24,6 @@ class ContactSnapshot:
     """One step's contacts, frozen for its adjoint; ``smoothing`` in [m/s]."""
 
     count: int
-    active: wp.array
     pairs: wp.array
     bary: wp.array
     normal: wp.array
@@ -193,18 +192,12 @@ class ContactTerm:
         slot = wp.empty(m, dtype=wp.int32, device=dev)
         wp.launch(_active_slots_kernel, dim=n, inputs=[self.active, offset], outputs=[slot], device=dev)
         out = [wp.empty(m, dtype=t, device=dev)
-               for t in (wp.int32, wp.vec4i, wp.vec2, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, float)]
+               for t in (wp.vec4i, wp.vec2, wp.vec3, wp.vec3, wp.vec3, float, wp.vec3, float)]
         wp.launch(_snapshot_kernel, dim=m,
                   inputs=[slot, self.pairs, self.bary, self.normal, self.anchor, self.shift, self.thickness,
                           self.rho_i, self.u, self.rho_scale],
                   outputs=out, device=dev)
         return ContactSnapshot(m, *out, self.friction, smoothing)
-
-    def forces(self) -> tuple[np.ndarray, np.ndarray]:
-        """Host ``(pairs, force)``: nodes ``(a0, a1, b0, b1)`` (``b0 = -1``: non-rod), force on ``a``."""
-        active = self.active.numpy()[: self.count] != 0
-        force = -self.rho_i.numpy()[: self.count, None] * self.u.numpy()[: self.count]
-        return self.pairs.numpy()[: self.count][active], force[active]
 
 
 def contact_c_pattern(pairs: np.ndarray, fixed: np.ndarray) -> tuple[np.ndarray, ...]:
@@ -581,14 +574,13 @@ def _snapshot_kernel(
     anchor: wp.array[wp.vec3], shift: wp.array[wp.vec3], thickness: wp.array[float], rho_i: wp.array[float],
     u: wp.array[wp.vec3], rho_scale: float,
     # outputs
-    active_out: wp.array[wp.int32], pairs_out: wp.array[wp.vec4i], bary_out: wp.array[wp.vec2],
-    normal_out: wp.array[wp.vec3], anchor_out: wp.array[wp.vec3], shift_out: wp.array[wp.vec3],
-    thickness_out: wp.array[float], force: wp.array[wp.vec3], rho: wp.array[float],
+    pairs_out: wp.array[wp.vec4i], bary_out: wp.array[wp.vec2], normal_out: wp.array[wp.vec3],
+    anchor_out: wp.array[wp.vec3], shift_out: wp.array[wp.vec3], thickness_out: wp.array[float],
+    force: wp.array[wp.vec3], rho: wp.array[float],
 ):
     """Active contact ``k`` (slot ``slot[k]``): its frozen data, force and penalty."""
     k = wp.tid()
     i = slot[k]
-    active_out[k] = 1
     pairs_out[k] = pairs[i]
     bary_out[k] = bary[i]
     normal_out[k] = normal[i]

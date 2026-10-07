@@ -3,7 +3,9 @@
 - :class:`CableExample`: the frame loop in Newton's example format (drive, collide, step, CUDA graph replay).
 - :class:`Drive`, :func:`segment_dofs`: move clamped segments along a prescribed path.
 - :func:`frame_box`: point the viewer's camera at a box.
+- :func:`contact_pipeline`: Newton's collision pipeline, rigid contacts only.
 - :func:`default_frames`: the ``--num-frames`` default from a simulated duration.
+- :func:`smoothstep`: a smooth ramp from 0 to 1.
 - :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks.
 - :func:`inset`: the theory plots drawn in the viewer.
 - :func:`cached`: results that take minutes, computed once per configuration.
@@ -21,8 +23,9 @@ from scipy.spatial import cKDTree
 from dismech_newton import flatten_state
 
 
-def smoothstep(t: float, t0: float, t1: float) -> float:
-    s = min(max((t - t0) / (t1 - t0), 0.0), 1.0)
+def smoothstep(t, t0: float, t1: float):
+    """0 before ``t0``, 1 after ``t1``, cubic between (``t`` a scalar or an array)."""
+    s = np.clip((t - t0) / (t1 - t0), 0.0, 1.0)
     return s * s * (3.0 - 2.0 * s)
 
 
@@ -94,6 +97,13 @@ class Drive:
                   outputs=[state.dismech.q])
 
 
+def contact_pipeline(model, radius: float, **options) -> newton.CollisionPipeline:
+    """The rod nodes are particles, but the solver reads rigid contacts only: skip the soft ones."""
+    options = {"contact_matching": "latest", **options}
+    return newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
+                                    speculative_contact_gap_max=2.0 * radius, **options)
+
+
 # -- the frame loop -----------------------------------------------------------------------
 
 
@@ -118,10 +128,7 @@ class CableExample:
         self.sim_dt = self.frame_dt / self.substeps
         self.sim_time = 0.0
         self.frame = 0
-        # The rod nodes are particles, but the solver reads rigid contacts only: skip the soft ones.
-        options = {"contact_matching": "latest", **self.pipeline_options, **pipeline}
-        self.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
-                                                 speculative_contact_gap_max=2.0 * radius, **options)
+        self.pipeline = contact_pipeline(model, radius, **{**self.pipeline_options, **pipeline})
         self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = model.state(), model.state()
         flatten_state(self.state_0)

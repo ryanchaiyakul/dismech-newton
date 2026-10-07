@@ -23,7 +23,7 @@ from .contact import (
     contact_matrix_values_kernel,
     contact_transpose_residual_kernel,
 )
-from .linear import sparse_solver
+from .linear import csr_entries, sparse_solver
 from .solver import advance_frames_kernel, inertia_kernel, predict_kernel, suspended_tape, theta_kernel
 from .sparse import GeneralCSR, SymmetricCSR
 from .strains import vec5f
@@ -264,10 +264,7 @@ class _ContactPattern:
 
     def __init__(self, hessian: SymmetricCSR, pairs: np.ndarray, fixed: np.ndarray, dev):
         n, m = hessian.n, len(pairs)
-        indptr, indices = hessian.indptr.numpy(), hessian.indices.numpy()
-        row = np.repeat(np.arange(n), np.diff(indptr))
-        slot = np.arange(len(indices))
-        off = indices != row  # mirror the strict upper triangle
+        h_rows, h_cols, h_slot = csr_entries(hessian)
         contact, node, comp, dof = contact_c_pattern(pairs, fixed)
         c_row = 3 * contact + comp
         size = n + 3 * m
@@ -275,9 +272,8 @@ class _ContactPattern:
         d_rows = n + 3 * np.arange(m)[:, None, None] + np.arange(3)[None, :, None]
         d_cols = n + 3 * np.arange(m)[:, None, None] + np.arange(3)[None, None, :]
         # The entries: A (both triangles), C^T, rho (I - D)^T C, -D^T.
-        rows = np.concatenate([row, indices[off], dof, lower_rows.ravel(), np.broadcast_to(d_rows, (m, 3, 3)).ravel()])
-        cols = np.concatenate([indices, row[off], n + c_row, np.repeat(dof, 3),
-                               np.broadcast_to(d_cols, (m, 3, 3)).ravel()])
+        rows = np.concatenate([h_rows, dof, lower_rows.ravel(), np.broadcast_to(d_rows, (m, 3, 3)).ravel()])
+        cols = np.concatenate([h_cols, n + c_row, np.repeat(dof, 3), np.broadcast_to(d_cols, (m, 3, 3)).ravel()])
         order = np.lexsort((cols, rows))
         csr_indptr = np.zeros(size + 1, dtype=np.int64)
         np.cumsum(np.bincount(rows, minlength=size), out=csr_indptr[1:])
@@ -285,12 +281,12 @@ class _ContactPattern:
         self.linear = sparse_solver(self.csr, refactorize=False)
         position = np.empty(len(order), dtype=np.int32)  # each entry's index in the CSR values
         position[order] = np.arange(len(order), dtype=np.int32)
-        nh, nc = len(slot) + int(off.sum()), len(dof)
+        nh, nc = len(h_slot), len(dof)
 
         def ints(a):
             return wp.array(np.asarray(a).astype(np.int32), dtype=wp.int32, device=dev)
 
-        self._hessian_slot, self._hessian_pos = ints(np.concatenate([slot, slot[off]])), ints(position[:nh])
+        self._hessian_slot, self._hessian_pos = ints(h_slot), ints(position[:nh])
         self._entry = ints(contact), ints(node), ints(comp)
         self._c_pos, self._lower_pos = ints(position[nh : nh + nc]), ints(position[nh + nc : nh + 4 * nc])
         self._d_pos = ints(position[nh + 4 * nc :])

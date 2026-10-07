@@ -1,9 +1,8 @@
-"""Discrete elastic rods with contact and friction, solved with ADMM (``docs/admm.md``).
+"""Discrete elastic rods with contact and friction, solved with ADMM.
 
 Global ``(M alpha + S^T P S) q = M alpha y + f_ext + sum S^T P (z - u)``, local ``z = prox(S q + u)``, dual
 ``u += S q - z``. ``H`` is constant (factorised once); fixed DOFs get identity rows.
 """
-
 
 import numpy as np
 import scipy.sparse as sp
@@ -112,7 +111,6 @@ class ADMMDiSMechSolver(DiSMechSolver):
         vals = np.concatenate([np.where(fixed, 1.0, mass * alpha), v])
         keep = (~fixed[rows] & ~fixed[cols]) | (np.arange(len(rows)) < n)
         H = SymmetricCSR.from_scipy(sp.csr_matrix((vals[keep], (rows[keep], cols[keep])), shape=(n, n)), self.device)
-        # Increment form: the float32 solves round with the correction, not with b (see linear.py).
         kind = self.linear_solver
         host = H.to_scipy() if kind in ("auto", "tridiagonal", "dense") else None  # one copy for fits and setup
         if kind == "auto":

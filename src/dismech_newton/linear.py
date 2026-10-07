@@ -26,6 +26,19 @@ except ImportError:
 _CUDA_R_64F, _CUDA_R_32I = 1, 10  # cudaDataType codes
 
 
+def csr_entries(A: SymmetricCSR | GeneralCSR) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Host ``(rows, cols, slot)`` of every entry of the full matrix, ``slot`` its index in ``A.vals`` (a
+    :class:`SymmetricCSR`'s strict upper triangle mirrored after its stored entries)."""
+    indptr, indices = A.indptr.numpy(), A.indices.numpy()
+    rows = np.repeat(np.arange(A.n), np.diff(indptr))
+    slot = np.arange(len(indices))
+    if not isinstance(A, SymmetricCSR):
+        return rows, indices, slot
+    off = indices != rows
+    return (np.concatenate([rows, indices[off]]), np.concatenate([indices, rows[off]]),
+            np.concatenate([slot, slot[off]]))
+
+
 class _Residual:
     """``r = b - A x`` in float64, one thread per row, reading ``A.vals`` live (full rows of a symmetric
     upper-triangle CSR through an index map)."""
@@ -33,15 +46,7 @@ class _Residual:
     def __init__(self, A: SymmetricCSR | GeneralCSR) -> None:
         self.A = A
         n = A.n
-        indptr, indices = A.indptr.numpy(), A.indices.numpy()
-        rows = np.repeat(np.arange(n), np.diff(indptr))
-        slot = np.arange(len(indices))
-        if isinstance(A, SymmetricCSR):  # mirror the strict upper triangle
-            off = indices != rows
-            rows, cols, slot = (np.concatenate([rows, indices[off]]), np.concatenate([indices, rows[off]]),
-                                np.concatenate([slot, slot[off]]))
-        else:
-            cols = indices
+        rows, cols, slot = csr_entries(A)
         order = np.lexsort((cols, rows))
         full_indptr = np.zeros(n + 1, dtype=np.int32)
         np.cumsum(np.bincount(rows, minlength=n), out=full_indptr[1:])
@@ -85,20 +90,8 @@ class CudssSolver:
             kind = cudss.MatrixType.GENERAL, cudss.MatrixViewType.FULL
         else:
             kind = cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
-        self._A = cudss.matrix_create_csr(
-            A.n,
-            A.n,
-            A.nnz,
-            A.indptr.ptr,
-            0,
-            A.indices.ptr,
-            A.vals.ptr,
-            _CUDA_R_32I,
-            _CUDA_R_32I,
-            _CUDA_R_64F,
-            *kind,
-            cudss.IndexBase.ZERO,
-        )
+        self._A = cudss.matrix_create_csr(A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, A.vals.ptr, _CUDA_R_32I,
+                                          _CUDA_R_32I, _CUDA_R_64F, *kind, cudss.IndexBase.ZERO)
         self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
         self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
         self._execute(cudss.Phase.ANALYSIS)
@@ -129,6 +122,14 @@ class CudssSolver:
                   device=self.device)
         if reset is not None:
             wp.copy(*reset)
+
+
+def _destroy(handle, config, data, matrices) -> None:
+    for m in matrices:
+        cudss.matrix_destroy(m)
+    cudss.data_destroy(handle, data)
+    cudss.config_destroy(config)
+    cudss.destroy(handle)
 
 
 class ScipySolver:
@@ -190,14 +191,6 @@ def sparse_solver(A: SymmetricCSR | GeneralCSR, refactorize: bool = True,
     if A.vals.device.is_cuda and cudss is not None:
         return CudssSolver(A, refactorize, increment)
     return ScipySolver(A, refactorize, increment)
-
-
-def _destroy(handle, config, data, matrices) -> None:
-    for m in matrices:
-        cudss.matrix_destroy(m)
-    cudss.data_destroy(handle, data)
-    cudss.config_destroy(config)
-    cudss.destroy(handle)
 
 
 class BlockInverseSolver:
@@ -315,9 +308,9 @@ class TridiagonalSolver:
         if cusparse is None or not A.vals.device.is_cuda:
             return False
         H = A.to_scipy() if H is None else H
-        off = sp.triu(H, k=1, format="csr")
+        off = sp.triu(H, k=1, format="coo")
         off.eliminate_zeros()
-        degree = np.bincount(np.concatenate([off.tocoo().row, off.tocoo().col]), minlength=A.n)
+        degree = np.bincount(np.concatenate([off.row, off.col]), minlength=A.n)
         n_blocks = connected_components(H, directed=False)[0]
         return degree.max(initial=0) <= 2 and off.nnz == A.n - n_blocks  # a forest of paths
 

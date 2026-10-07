@@ -35,7 +35,7 @@ import warp as wp
 from scipy.optimize import minimize
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
-from utils.common import cached, inset, inset_scale
+from utils.common import cached, inset, inset_scale, smoothstep
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, flatten_state, suspended_tape
 from dismech_newton.solver import advance_frames_kernel
@@ -73,11 +73,6 @@ W = 3  # recorded frames per window (0.1 s: much shorter windows are mostly thei
 GROUP = 10  # windows per trial in one batched model (divides FRAMES // W)
 SMOOTH = 11  # the gripper readout is smoothed in time (a cubic fit over this many frames) before it drives the fit
 VELOCITY = 5  # a window starts with the recorded positions' velocity, a quadratic fit over this many frames
-
-
-def smooth(t):
-    t = np.clip(t, 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
 
 
 def mid_z(x: np.ndarray) -> np.ndarray:
@@ -258,8 +253,8 @@ def command() -> np.ndarray:
     """The nominal gripper pose before every step (STEPS + 1, 6), the same for every trial."""
     t = np.arange(STEPS + 1) * DT
     u = np.zeros((STEPS + 1, 6))
-    u[:, 0] = -COMPRESS * smooth(t / T_COMPRESS)
-    u[:, 2] = SHEAR * smooth((t - T_COMPRESS) / T_SHEAR)
+    u[:, 0] = -COMPRESS * smoothstep(t, 0.0, T_COMPRESS)
+    u[:, 2] = SHEAR * smoothstep(t, T_COMPRESS, T_COMPRESS + T_SHEAR)
     return u
 
 
@@ -271,7 +266,7 @@ def tracking_error(rng, trials: int) -> np.ndarray:
     k /= np.sqrt((k * k).sum())  # unit variance
     w = rng.normal(size=(trials, STEPS + 1 + 2 * half, 6))
     e = np.stack([np.stack([np.convolve(w[b, :, j], k, mode="valid") for j in range(6)], -1) for b in range(trials)])
-    return e * np.r_[[GRIP_T] * 3, [GRIP_R] * 3] * smooth(np.arange(STEPS + 1) * DT / GRIP_RAMP)[None, :, None]
+    return e * np.r_[[GRIP_T] * 3, [GRIP_R] * 3] * smoothstep(np.arange(STEPS + 1) * DT, 0.0, GRIP_RAMP)[None, :, None]
 
 
 def shake(rng, trials: int) -> np.ndarray:
@@ -294,7 +289,8 @@ def record() -> dict:
     rest = rest_state(model, solver)
     x_rest = rest.particle_q.numpy()[:NODES].astype(np.float64)
     a, b = model.state(), model.state()
-    flatten_state(a), flatten_state(b)
+    flatten_state(a)
+    flatten_state(b)
     start(solver, a, rest)
     for _ in range(40):  # the static sag: big implicit steps from rest
         a.dismech.qd.zero_()

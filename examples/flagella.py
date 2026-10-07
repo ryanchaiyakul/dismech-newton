@@ -14,7 +14,7 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from utils.common import SIM, inset, segment_distance, segment_dofs
+from utils.common import SIM, contact_pipeline, inset, segment_distance, segment_dofs
 from utils.stokes import Stokeslets
 
 from dismech_newton import ADMMDiSMechSolver, flatten_state
@@ -87,9 +87,7 @@ class DERFlagella:
     """Our DER, ADMM with contact. One step is: drag at the step's start (eager: cuSOLVER does not
     capture), then drive, collide and solve (a CUDA graph, one per state parity)."""
 
-    name = "DER ADMM"
-
-    def __init__(self, count: int, p: dict = PAPER, *, implicit_drag: bool = True, **solver_options):
+    def __init__(self, count: int, p: dict = PAPER, *, implicit_drag: bool = True):
         self.p = dict(p)
         self.count, self.dt = count, p["dt"]
         self.points = [flagellum(p, o) for o in clamp_offsets(count, p["spacing"])]
@@ -99,7 +97,6 @@ class DERFlagella:
         self._graphs = [None, None]
         self._parity = 0
         self.steps = 0
-        h = p["radius"]
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         self.rods = []
         for points in self.points:
@@ -108,11 +105,10 @@ class DERFlagella:
             ADMMDiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
             self.rods.append(bodies)
         self.model = model = builder.finalize()
-        self.solver = ADMMDiSMechSolver(model, friction=p["friction"], **solver_options)
+        self.solver = ADMMDiSMechSolver(model, friction=p["friction"])
         if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
             self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
-        self.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
-                                                 speculative_contact_gap_max=2.0 * h, contact_matching="latest")
+        self.pipeline = contact_pipeline(model, p["radius"])
         self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = model.state(), model.state()
         for s in (self.state_0, self.state_1):
@@ -153,11 +149,6 @@ class DERFlagella:
         """``(count, nv, 3)`` node positions."""
         return self.state_0.particle_q.numpy().reshape(self.count, self.nv, 3)
 
-    def body_q(self) -> np.ndarray:
-        """Capsule proxy poses, for replay in the viewer."""
-        self.solver.update_proxies(self.state_0)
-        return self.state_0.body_q.numpy()
-
     def gaps(self) -> tuple[float, float]:
         """Closest approach between flagella, and within one (edges > 2 apart), in diameters."""
         x = self.nodes()
@@ -189,8 +180,8 @@ class Example:
     plot_time = PAPER["total_time"]  # [s] the time axis of the plot
 
     def __init__(self, viewer, args=None):
-        count = getattr(args, "flagella", 3) if args is not None else 3
-        mu = getattr(args, "mu", PAPER["friction"]) if args is not None else PAPER["friction"]
+        count = getattr(args, "flagella", 3)
+        mu = getattr(args, "mu", PAPER["friction"])
         self.sim = DERFlagella(count, {**PAPER, "friction": mu})
         self.viewer = viewer
         self.frame_dt = 1.0 / self.fps

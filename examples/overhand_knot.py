@@ -38,7 +38,7 @@ class Example(CableExample):
         self.pull, self.pull_time = 1.3 * (1.25 * self.scale - 0.04), 52.0 * self.scale
         self.build(viewer, points)
 
-    def build(self, viewer, points: np.ndarray, **solver_options):
+    def build(self, viewer, points: np.ndarray):
         """The rope along ``points``, both end segments clamped, to be pulled apart along the line through them."""
         h = self.radius
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -48,7 +48,7 @@ class Example(CableExample):
         for body in (bodies[0], bodies[-1]):
             ADMMDiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        solver = ADMMDiSMechSolver(model, friction=self.friction, **solver_options)
+        solver = ADMMDiSMechSolver(model, friction=self.friction)
         solver.triplets.rest.zero_()  # a rope: straight and untwisted at rest, not knotted
         self.start(viewer, model, solver, h, contact_matching_pos_threshold=h)
         # Both clamped segments' nodes (not their twist), moved along the end-to-end line.
@@ -159,7 +159,7 @@ def long_trefoil(scale: float, tail: float, seg: float, blend: float = 0.06) -> 
     t = np.linspace(-2.4, 2.4, 4000)
     core = np.column_stack((t**3 - 3 * t, t**4 - 4 * t**2, t**5 - 10 * t)) * np.array([1 / 6, 1 / 10, 1 / 30]) * scale
     s = np.linspace(0.0, tail, 400)
-    w = np.array([smoothstep(v, 0.0, blend) for v in s])[:, None]
+    w = smoothstep(s, 0.0, blend)[:, None]
 
     def grow(p, d, axis):
         d = d / np.linalg.norm(d)

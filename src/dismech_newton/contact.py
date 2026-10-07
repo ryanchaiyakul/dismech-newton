@@ -89,6 +89,10 @@ class ContactTerm:
         self.body = wp.full(n, -1, dtype=wp.int32, device=self.device)
         self._u_prev, self._rho_prev = z(wp.vec3), z(float)
 
+    def reset(self) -> None:
+        """Drop the warm start: the next step starts as on a new contact buffer."""
+        self._buffer = None
+
     def begin_step(self, state_in: State, contacts: Contacts | None, solve, h: float,
                    body_q_end: wp.array | None = None, end_weight: float = 1.0) -> None:
         """Map ``contacts`` onto the rod for the step; obstacles move with ``body_qd`` or toward ``body_q_end``."""

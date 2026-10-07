@@ -20,7 +20,6 @@ from .strains import (
     mat58f,
     packed_index,
     reference_twist,
-    strain_derivatives,
     strain_gradient,
     triplet_geometry,
     vec5f,
@@ -165,7 +164,7 @@ class TripletTerm:
 
         self.z = wp.zeros(tr.count, dtype=vec8f, device=self.device)
         self.u = wp.zeros(tr.count, dtype=vec8f, device=self.device)
-        self._initialized = False
+        self._started = False
 
     def penalty(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """COO ``S^T P S``, both triangles."""
@@ -185,17 +184,16 @@ class TripletTerm:
         return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
 
     def begin_step(self, state_in: State) -> None:
-        """``z = S q``, ``u = 0`` on the first step; later steps warm-start."""
-        if self._initialized:
-            return
+        """The first step starts from :meth:`reset`; later steps warm-start."""
+        if not self._started:
+            self.reset(state_in)
+
+    def reset(self, state: State) -> None:
+        """``z = S q``, ``u = 0``: the next step starts from ``state`` without a warm start."""
         tr = self.triplets
-        e, f, n0, n1, n2 = tr.conn.numpy().T
-        q = state_in.dismech.q.numpy()
-        x = q[: tr.num_node_dofs].reshape(-1, 3)
-        th = q[tr.num_node_dofs :]
-        ee, ef = x[n1] - x[n0], x[n2] - x[n1]
-        self.z.assign(np.column_stack((ee, th[e], ef, th[f] - th[e])).astype(np.float32))
-        self._initialized = True
+        wp.launch(_reset_kernel, dim=tr.count, inputs=[state.dismech.q, tr.conn, tr.num_node_dofs],
+                  outputs=[self.z, self.u], device=self.device)
+        self._started = True
 
     def local(self, state_in: State, q: wp.array, dt: float, rhs: wp.array, stats: wp.array, update: int) -> None:
         """With ``update``: prox and dual step. Always: ``rhs += S^T P (z - u)``."""
@@ -394,12 +392,7 @@ def energy_kernels(energy) -> SimpleNamespace:
         ut = u[t]
 
         if update != 0:
-            x0 = node(q, n0)
-            x1 = node(q, n1)
-            x2 = node(q, n2)
-            ee = x1 - x0
-            ef = x2 - x1
-            Sq = vec8f(ee[0], ee[1], ee[2], q[ie], ef[0], ef[1], ef[2], q[i_f] - q[ie])
+            Sq = _z_at(q, n0, n1, n2, ie, i_f)
             d = Sq + ut
 
             d1e = edge_d1_old[e]
@@ -468,12 +461,9 @@ def energy_kernels(energy) -> SimpleNamespace:
         """Per triplet ``(axial, transverse, twist)`` stiffness of ``W`` at rest."""
         t = wp.tid()
         e, f, n0, n1, n2 = unpack_vec5(triplet_conn[t])
-        ee = node(q, n1) - node(q, n0)
-        ef = node(q, n2) - node(q, n1)
-        th_e = q[theta_dof_offset + e]
-        z0 = vec8f(ee[0], ee[1], ee[2], th_e, ef[0], ef[1], ef[2], q[theta_dof_offset + f] - th_e)
-        te = wp.normalize(ee)
-        tf = wp.normalize(ef)
+        z0 = _z_at(q, n0, n1, n2, theta_dof_offset + e, theta_dof_offset + f)
+        te = wp.normalize(wp.vec3(z0[0], z0[1], z0[2]))
+        tf = wp.normalize(wp.vec3(z0[4], z0[5], z0[6]))
         geom = _local_geometry(z0, edge_d1[e], te, edge_d1[f], tf, triplet_ref_twist[t], edge_length[e], edge_length[f])
         sigma, C = energy(geom.strain, geom.strain, triplet_rest[t], triplet_params[t], 1.0)
         J, _H = local_strain_derivatives(geom, sigma)
@@ -482,8 +472,8 @@ def energy_kernels(energy) -> SimpleNamespace:
         Kff = wp.mat33()
         for i in range(3):
             for j in range(3):
-                Kee[i, j] = K_gn[packed_index(wp.min(i, j), wp.max(i, j))]
-                Kff[i, j] = K_gn[packed_index(4 + wp.min(i, j), 4 + wp.max(i, j))]
+                Kee[i, j] = _packed(K_gn, i, j)
+                Kff[i, j] = _packed(K_gn, 4 + i, 4 + j)
         ae = wp.dot(te, Kee * te)
         af = wp.dot(tf, Kff * tf)
         be = 0.5 * (wp.trace(Kee) - ae)
@@ -494,6 +484,26 @@ def energy_kernels(energy) -> SimpleNamespace:
 
 
 # -- ADMM local step ----------------------------------------------------------------------
+
+
+@wp.func
+def _z_at(q: wp.array[float], n0: int, n1: int, n2: int, ie: int, i_f: int) -> vec8f:
+    """``S q`` of a triplet: ``[x1 - x0, theta_e, x2 - x1, theta_f - theta_e]``."""
+    ee = node(q, n1) - node(q, n0)
+    ef = node(q, n2) - node(q, n1)
+    return vec8f(ee[0], ee[1], ee[2], q[ie], ef[0], ef[1], ef[2], q[i_f] - q[ie])
+
+
+@wp.kernel
+def _reset_kernel(
+    q: wp.array[float], triplet_conn: wp.array[vec5i], theta_dof_offset: int,
+    # outputs
+    z: wp.array[vec8f], u: wp.array[vec8f],
+):
+    t = wp.tid()
+    e, f, n0, n1, n2 = unpack_vec5(triplet_conn[t])
+    z[t] = _z_at(q, n0, n1, n2, theta_dof_offset + e, theta_dof_offset + f)
+    u[t] = vec8f()
 
 
 @wp.func

@@ -1,5 +1,6 @@
 # DiSMech-Newton
 
+[![PyPI](https://img.shields.io/pypi/v/dismech-newton)](https://pypi.org/project/dismech-newton/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://opensource.org/license/gpl-3.0)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![CUDA 13](https://img.shields.io/badge/CUDA-13-76B900)
@@ -49,6 +50,14 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
 ## Install
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/). Runs on an NVIDIA GPU with CUDA 13 or on the CPU.
+
+As a library, from [PyPI](https://pypi.org/project/dismech-newton/):
+
+```bash
+pip install "dismech-newton[gpu]"
+```
+
+To run the examples, clone the repository:
 
 ```bash
 git clone https://github.com/ryanchaiyakul/dismech-newton.git

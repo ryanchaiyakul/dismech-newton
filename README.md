@@ -20,9 +20,9 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
     <th width="33%">Plectoneme</th>
   </tr>
   <tr>
-    <td><img src="docs/admm_cantilever.webp" alt="Cantilever" width="100%"></td>
-    <td><img src="docs/admm_knot.webp" alt="Overhand knot" width="100%"></td>
-    <td><img src="docs/admm_plectoneme.webp" alt="Plectoneme" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_cantilever.webp" alt="Cantilever" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_knot.webp" alt="Overhand knot" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_plectoneme.webp" alt="Plectoneme" width="100%"></td>
   </tr>
   <tr>
     <td valign="top">DER (top) and Newton's VBD (bottom) against Euler-Bernoulli.<br><code>uv run examples/cantilever.py</code></td>
@@ -35,9 +35,9 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
     <th width="33%">Two-way Coupled Solvers</th>
   </tr>
   <tr>
-    <td><img src="docs/admm_flagella.webp" alt="Flagella bundling" width="100%"></td>
-    <td><img src="docs/fit_buckling.webp" alt="Fitting stiffness, density and damping to buckling recordings" width="100%"></td>
-    <td><img src="docs/admm_franka.webp" alt="Pick and place" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_flagella.webp" alt="Flagella bundling" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/fit_buckling.webp" alt="Fitting stiffness, density and damping to buckling recordings" width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_franka.webp" alt="Pick and place" width="100%"></td>
   </tr>
   <tr>
     <td valign="top">Flagella bundle in a viscous fluid <a href="https://arxiv.org/abs/2205.10309">Tong et al. (2022)</a>.<br><code>uv run examples/flagella.py --flagella 10</code></td>

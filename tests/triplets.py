@@ -1,5 +1,6 @@
-"""A single triplet's inputs and a kernel evaluating its strains and derivatives."""
+"""A single triplet's inputs, the test cases, and a kernel evaluating its strains and derivatives."""
 
+import functools
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -139,26 +140,51 @@ class TripletEval:
     grad: np.ndarray  # (N, 11), strain_gradient(sigma)
 
 
-def eval_triplet(Q: np.ndarray, cfg: TripletConfig, device, sigma=np.zeros(5)) -> TripletEval:
+def eval_triplet(Q: np.ndarray, cfg: TripletConfig, sigma=np.zeros(5)) -> TripletEval:
     """Strains and derivatives at ``Q`` ``(N, 11)``, in float64: the z-derivatives mapped to the DOFs by ``R``."""
     Q = np.atleast_2d(Q)
     n = Q.shape[0]
     frames = np.stack([cfg.d1e, cfg.te_old, cfg.d1f, cfg.tf_old])
-    strain = wp.zeros(n, dtype=vec5f, device=device)
-    J = wp.zeros(n, dtype=mat58f, device=device)
-    H = wp.zeros((n, 5), dtype=vec36f, device=device)
-    H_sigma = wp.zeros(n, dtype=vec36f, device=device)
-    grad = wp.zeros(n, dtype=vec11f, device=device)
+    strain = wp.zeros(n, dtype=vec5f)
+    J = wp.zeros(n, dtype=mat58f)
+    H = wp.zeros((n, 5), dtype=vec36f)
+    H_sigma = wp.zeros(n, dtype=vec36f)
+    grad = wp.zeros(n, dtype=vec11f)
     wp.launch(
         _triplet_kernel,
         dim=n,
-        inputs=[
-            wp.array(Q, dtype=vec11f, device=device), wp.array(frames, dtype=wp.vec3, device=device),
-            cfg.ref_twist, cfg.l0e, cfg.l0f, vec5f(*sigma),
-        ],
+        inputs=[wp.array(Q, dtype=vec11f), wp.array(frames, dtype=wp.vec3), cfg.ref_twist, cfg.l0e, cfg.l0f,
+                vec5f(*sigma)],
         outputs=[strain, J, H, H_sigma, grad],
-        device=device,
     )
     R = z_map()
     strain, J, H, H_sigma, grad = (a.numpy().astype(np.float64) for a in (strain, J, H, H_sigma, grad))
     return TripletEval(strain, J @ R, R.T @ unpack_sym8(H) @ R, R.T @ unpack_sym8(H_sigma) @ R, grad)
+
+
+# -- cases ----------------------------------------------------------------------------------
+
+
+def _random(seed: int) -> TripletConfig:
+    rng = np.random.default_rng(seed)
+    x0 = 0.1 * rng.normal(size=3)
+    x1 = x0 + 0.1 * (np.array([1.0, 0.0, 0.0]) + 0.4 * rng.normal(size=3))
+    x2 = x1 + 0.1 * (np.array([1.0, 0.0, 0.0]) + 0.4 * rng.normal(size=3))
+    theta_e, theta_f = rng.uniform(-np.pi, np.pi, size=2)
+    l0e, l0f = 0.1 * rng.uniform(0.8, 1.2, size=2)
+    return TripletConfig.current(x0, x1, x2, theta_e, theta_f, ref_twist=rng.normal(), l0e=l0e, l0f=l0f, seed=seed)
+
+
+def _bend(angle: float, l: float = 0.1):
+    """Two edges of length ``l`` bent by ``angle`` in the xy-plane."""
+    return (0.0, 0.0, 0.0), (l, 0.0, 0.0), (l + l * np.cos(angle), l * np.sin(angle), 0.0)
+
+
+CASES = {
+    "straight": lambda: TripletConfig.current(*_bend(0.0)),
+    "bent": lambda: TripletConfig.current(*_bend(np.radians(30.0))),
+    "sharp_bend": lambda: TripletConfig.current(*_bend(np.radians(120.0))),
+    "twisted": lambda: TripletConfig.current(*_bend(np.radians(30.0)), theta_e=0.4, theta_f=-0.9, ref_twist=0.5),
+    "stretched": lambda: TripletConfig.current(*_bend(np.radians(45.0)), l0e=0.08, l0f=0.13),
+    **{f"random-{i}": functools.partial(_random, i) for i in range(3)},
+}

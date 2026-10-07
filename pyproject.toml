@@ -57,6 +57,10 @@ dev = [
     "ruff>=0.16.10",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-rs"]  # list why tests skipped (most need --device cuda)
+
 [tool.ruff]
 line-length = 120
 

@@ -30,12 +30,13 @@ def _chains(rng, lengths=(1, 2, 3, 40, 117), singles=3, scale=2.0e4):
     return H[p][:, p].tocsr()
 
 
-def _solvers(A, device):
-    """Every solver available on ``device``, by name: ``make(increment)``."""
+def _solvers(A, device, refactorize: bool = True):
+    """Every solver available on ``device``, by name: ``make(increment)``; ``refactorize=False``: factor once (as
+    ADMM does), where that is an option."""
     out = {"block": lambda inc: BlockInverseSolver(A, increment=inc),
-           "scipy": lambda inc: ScipySolver(A, increment=inc)}
+           "scipy": lambda inc: ScipySolver(A, refactorize=refactorize, increment=inc)}
     if device.is_cuda and cudss is not None:
-        out["cudss"] = lambda inc: CudssSolver(A, increment=inc)
+        out["cudss"] = lambda inc: CudssSolver(A, refactorize=refactorize, increment=inc)
     if device.is_cuda and cusparse is not None:
         out["tridiagonal"] = lambda inc: TridiagonalSolver(A, increment=inc)
     return out
@@ -98,3 +99,33 @@ def test_tridiagonal_fits(device, rng):
         assert not TridiagonalSolver.fits(A)
         with pytest.raises(ValueError):
             TridiagonalSolver(A)
+
+
+def test_update_in_place(device, rng):
+    """New values of the same pattern, taken in place: a solve captured before the update solves the new system;
+    another pattern is refused."""
+    H1 = _chains(rng)
+    n = H1.shape[0]
+    H2 = (H1 + sp.diags(rng.uniform(0.5, 2.0, n) * 2.0e4)).tocsr()  # e.g. new masses
+    b = rng.normal(size=n) * 1.0e4
+    x_ref = sla.spsolve(H2.tocsc(), b)
+    for name in _solvers(None, device):
+        A = SymmetricCSR.from_scipy(H1, device)  # each solver its own: update writes into it
+        solver = _solvers(A, device, refactorize=False)[name](True)
+        x, b_dev = wp.zeros(n, dtype=float), _array(b)
+        solver.solve(b_dev, x)  # set-up and first factorization
+        graph = None
+        if device.is_cuda and solver.graph_capturable:
+            with wp.ScopedCapture() as capture:
+                solver.solve(b_dev, x)
+            graph = capture.graph
+        assert solver.update(SymmetricCSR.from_scipy(H2, device), H2), f"{name}: refused the same pattern"
+        x.zero_()
+        if graph is not None:
+            wp.capture_launch(graph)
+        else:
+            solver.solve(b_dev, x)
+        err = np.abs(x.numpy() - x_ref).max() / np.abs(x_ref).max()
+        assert err < 1.0e-5, f"{name}: relative error {err:.1e} after the update"
+        other = (H2 + sp.diags(np.ones(n - 1), 1) + sp.diags(np.ones(n - 1), -1)).tocsr()
+        assert not solver.update(SymmetricCSR.from_scipy(other, device), other), f"{name}: took another pattern"

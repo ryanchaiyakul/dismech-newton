@@ -5,8 +5,9 @@
 - :func:`view`, :func:`backprop`: the Warp -> torch -> Warp handoff of an image loss's gradient.
 - :func:`cov6`, :func:`rotation_matrix`: free Gaussians' covariances from log scales and quaternions.
 
-Importing it puts Warp on torch's CUDA stream: gswarp moves Warp there on its first call and leaves it there, and a
-cuDSS solver set up on Warp's own stream before that then fails. Import it before building any solver.
+Importing it puts Warp and torch on one stream, :data:`STREAM`, created by Warp so CUDA graphs can be captured on it
+(not on torch's legacy default stream); import it before building any solver. gswarp binds Warp to its own wrapper of
+torch's stream, on which Warp cannot capture: :class:`Camera` and :func:`backprop` bind :data:`STREAM` back.
 """
 
 import math
@@ -19,7 +20,14 @@ from gswarp import GaussianRasterizationSettings, GaussianRasterizer
 if not torch.cuda.is_available():
     raise SystemExit("Gaussian splat rendering (gswarp) needs CUDA")
 DEVICE = "cuda:0"
-wp.set_stream(wp.stream_from_torch(torch.cuda.current_stream(DEVICE)), device=DEVICE, sync=True)
+STREAM = wp.Stream(DEVICE)
+torch.cuda.set_stream(torch.cuda.ExternalStream(STREAM.cuda_stream, device=DEVICE))
+wp.set_stream(STREAM, device=DEVICE, sync=True)
+
+
+def _rebind() -> None:
+    """Warp back on :data:`STREAM` after gswarp (the same CUDA stream: no sync)."""
+    wp.set_stream(STREAM, device=DEVICE, sync=False)
 
 
 def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
@@ -56,8 +64,10 @@ class Camera:
         self.raster = GaussianRasterizer(settings)
 
     def __call__(self, means, cov6, colours, opacity) -> torch.Tensor:
-        return self.raster(means3D=means, means2D=torch.zeros_like(means), cov3D_precomp=cov6,
-                           colors_precomp=colours, opacities=opacity.reshape(-1, 1))[0]
+        image = self.raster(means3D=means, means2D=torch.zeros_like(means), cov3D_precomp=cov6,
+                            colors_precomp=colours, opacities=opacity.reshape(-1, 1))[0]
+        _rebind()
+        return image
 
     def project(self, x) -> np.ndarray:
         """Pixel coordinates ``(..., 2)`` of world points ``(..., 3)``."""
@@ -85,6 +95,7 @@ def backprop(arrays, loss) -> float:
     leaves = [view(a).detach().requires_grad_() for a in arrays]
     value = loss(*leaves)
     value.backward()
+    _rebind()
     for a, t in zip(arrays, leaves):
         if t.grad is not None:
             view(a.grad).add_(t.grad)

@@ -195,6 +195,11 @@ class DiSMechSolver(SolverBase):
         """Iterations of the last step (a device read)."""
         return int(self._count.numpy()[0])
 
+    @property
+    def iteration_count(self) -> wp.array:
+        """Iterations of the last step on the device, ``(1,)`` int32: for kernels (no host sync, graph-safe)."""
+        return self._count
+
     def _particle_f(self, state: State) -> wp.array:
         return state.particle_f if state.particle_f is not None else self._no_force
 

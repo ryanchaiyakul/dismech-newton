@@ -21,7 +21,9 @@ stiffness. Everything else it reads off the data:
    its nearest edge, in that edge's material frame at twist 0: the paint's orientation comes with the Gaussians,
    so the clamp's angle is no unknown.
 3. Bend stiffness and damping by L-BFGS from the video, from a guess off by 2.5-3x: the bound Gaussians, skinned to
-   a rod released from the recovered pose, rendered and compared pixel by pixel.
+   a rod released from the recovered pose, rendered and compared pixel by pixel. The fit simulates with
+   :class:`~dismech_newton.ADMMDiSMechSolver` at its defaults (at most 50 iterations a step), restarted for every
+   rollout, and takes the gradient through its steps; the video is simulated with Newton.
 
 The start pose limits the fit: a node off by a millimetre on 5 cm edges is a kink as curved as the rod, the released
 rod rings with it, and the damping absorbs that (from the density's centreline alone, EI and c came out 5% and 15%
@@ -46,10 +48,10 @@ import warp as wp
 from PIL import Image, ImageDraw
 from scipy.interpolate import make_smoothing_spline
 from scipy.optimize import minimize
-from utils.common import cached, capsule_poses, inset, inset_scale
+from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale
 from utils.gaussians import DEVICE, Camera, backprop, cov6, rotation_matrix, to_uint8, view
 
-from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
+from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, fix_segment, flatten_state
 from dismech_newton.solver import advance_frames_kernel
 from dismech_newton.splat import Splats, skin, tube
 from dismech_newton.triplet import advance_ref_twist_kernel
@@ -96,9 +98,9 @@ def held_pose() -> np.ndarray:
     return CLAMP + np.concatenate([[np.zeros(3)], np.cumsum(LENGTH / SEGMENTS * t, 0)])
 
 
-def build(length=LENGTH, radius=RADIUS, mass=None):
+def build(length=LENGTH, radius=RADIUS, mass=None, admm: bool = False):
     """A rod straight at rest from the clamp along +x, its first edge clamped; ``mass``: the total (else the
-    default density's)."""
+    default density's). ``admm``: the ADMM solver at its defaults (else Newton)."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     rod = newton.Rod.create_straight(tuple(CLAMP), (1.0, 0.0, 0.0), length, segment_count=SEGMENTS, radius=radius)
     ids = add_rod(builder, rod, stretch_stiffness=EA, bend_stiffness=TRUE["EI"], twist_stiffness=GJ,
@@ -109,7 +111,7 @@ def build(length=LENGTH, radius=RADIUS, mass=None):
         m = model.particle_mass
         assert m is not None
         m.assign(m.numpy() * (mass / m.numpy().sum()))
-    solver = DiSMechSolver(model)
+    solver = ADMMDiSMechSolver(model) if admm else DiSMechSolver(model)
     solver.refresh_mass()
     return model, solver
 
@@ -123,7 +125,8 @@ def states(model, count: int, requires_grad: bool = False) -> list:
 
 def start(solver, rest, st, q):
     """``st`` = ``rest`` moved to the DOFs ``q``, still: the edge frames transported from rest, reference twists
-    and strains measured there."""
+    and strains measured there. The solver starts its next step from ``st`` (no ADMM warm start from the last
+    rollout)."""
     for k in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
         getattr(st.dismech, k).assign(getattr(rest.dismech, k))
     st.dismech.q.assign(np.asarray(q, dtype=np.float32))
@@ -136,6 +139,7 @@ def start(solver, rest, st, q):
               inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, rest.dismech.triplet_ref_twist_q],
               outputs=[st.dismech.triplet_ref_twist_q])
     tr.measure(st, st.dismech.triplet_strain_q)
+    solver.reset(st)
 
 
 def held_q(nodes, twist: float) -> np.ndarray:
@@ -545,7 +549,7 @@ class VideoFit:
     ``theta = log (EI, c) / truth``, the bound Gaussians skinned to a rod released from the recovered pose."""
 
     def __init__(self, rod: dict, mass: float, video):
-        self.model, self.solver = build(float(rod["length"]), float(rod["radius"]), mass)
+        self.model, self.solver = build(float(rod["length"]), float(rod["radius"]), mass, admm=True)
         d = self.model.dismech
         self.params = d.triplet_params.numpy().copy()
         d.triplet_params.requires_grad = True
@@ -558,6 +562,7 @@ class VideoFit:
                                       for k in ("colour", "opacity"))
         self.camera = video_camera()
         self.video = video
+        self.taped = TapedGraph(self.run, self.solver)
 
     def render(self, means, cov, camera=None):
         return (camera or self.camera)(means, cov, self.colours, self.opacity)
@@ -580,25 +585,24 @@ class VideoFit:
         return frames
 
     def __call__(self, theta) -> tuple[float, np.ndarray]:
+        """The taped rollout and its backward replay as CUDA graphs after the first call (:class:`TapedGraph`; they
+        hold the solver's factorization, which :meth:`set` leaves alone); the rendering (gswarp, sizes that change
+        per frame) runs eagerly between them."""
         self.set(theta)
-        d = self.model.dismech
-        d.triplet_params.grad.zero_()
-        tape = wp.Tape()
-        with tape:
-            frames = self.run()
+        self.model.dismech.triplet_params.grad.zero_()
+        frames = self.taped.forward()
         n = len(frames)
         loss = sum(backprop(f, lambda m, c, t=t: ((self.render(m, c) - t) ** 2).sum() / n)
                    for f, t in zip(frames, self.video))
-        tape.backward()
+        self.taped.backward()
+        d = self.model.dismech
         p, gp = d.triplet_params.numpy(), d.triplet_params.grad.numpy()
-        grad = np.array([np.sum(gp[:, BEND] * p[:, BEND]), np.sum(gp[:, DAMP] * p[:, DAMP])])
-        tape.zero()
-        return loss, grad
+        return loss, np.array([np.sum(gp[:, BEND] * p[:, BEND]), np.sum(gp[:, DAMP] * p[:, DAMP])])
 
     def replay(self, theta) -> tuple[np.ndarray, np.ndarray]:
         """``q`` and ``edge_d1_q`` at every recorded frame."""
         self.set(theta)
-        self.run()
+        self.taped.forward()
         recorded = self.states[::EVERY]
         return (np.stack([s.dismech.q.numpy() for s in recorded]),
                 np.stack([s.dismech.edge_d1_q.numpy() for s in recorded]))
@@ -642,7 +646,7 @@ def results(data: dict, fresh: bool = False) -> dict:
     gaussians = cached("fit_capture-gaussians", gs, lambda: train(data["photos"]), fresh)
     rod_config = dict(gaussians=gs, rod=[OPAQUE, END_WINDOW, list(CLAMP_AXIS)], version=2)
     rod = cached("fit_capture-rod", rod_config, lambda: recover(gaussians, data["mass"]), fresh)
-    out = cached("fit_capture-fit", dict(rod=rod_config, guess=GUESS, version=1),
+    out = cached("fit_capture-fit", dict(rod=rod_config, guess=GUESS, version=2),
                  lambda: fit(VideoFit(rod, data["mass"], data["video"])), fresh)
     return dict(gaussians=gaussians, rod=rod, **out)
 

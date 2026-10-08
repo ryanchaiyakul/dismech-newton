@@ -78,8 +78,11 @@ class ADMMDiSMechSolver(DiSMechSolver):
         self._factored_alpha = None
 
     def refresh_mass(self) -> None:
+        """Re-read the masses and twist inertias; ``H`` holds ``M alpha``, so refactorise it now, in place: a step
+        captured in a CUDA graph stays valid (with its linear solver's arrays)."""
         super().refresh_mass()
-        self._factored_alpha = None  # H holds M alpha
+        if self._factored_alpha is not None:
+            self._factorize(self._factored_alpha)
 
     def reset(self, state: State, world_mask: wp.array | None = None, flags: int | None = None) -> None:
         """Start the next step from ``state`` without the last step's warm start (``z = S q``, ``u = 0``, no
@@ -110,9 +113,12 @@ class ADMMDiSMechSolver(DiSMechSolver):
         rows, cols = np.concatenate([np.arange(n), r]), np.concatenate([np.arange(n), c])
         vals = np.concatenate([np.where(fixed, 1.0, mass * alpha), v])
         keep = (~fixed[rows] & ~fixed[cols]) | (np.arange(len(rows)) < n)
-        H = SymmetricCSR.from_scipy(sp.csr_matrix((vals[keep], (rows[keep], cols[keep])), shape=(n, n)), self.device)
+        host = sp.csr_matrix((vals[keep], (rows[keep], cols[keep])), shape=(n, n))  # both triangles
+        H = SymmetricCSR.from_scipy(host, self.device)
         kind = self.linear_solver
-        host = H.to_scipy() if kind in ("auto", "tridiagonal", "dense") else None  # one copy for fits and setup
+        if self._linear is not None and self._linear.update(H, host):  # in place: captured graphs stay valid
+            self._factored_alpha = alpha
+            return
         if kind == "auto":
             if TridiagonalSolver.fits(H, host):
                 kind = "tridiagonal"

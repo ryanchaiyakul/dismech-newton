@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
 from dismech_newton.dofs import dof_constants
-from dismech_newton.splat import Splats, skin, tube
+from dismech_newton.splat import SH_C0, Splats, edge_gaussians, export_usd, skin, tube
 
 RADIUS, SIGMA = 0.02, (0.003, 0.008, 0.01)
 
@@ -196,3 +196,96 @@ def test_skin_invariants(scene, rng):
     assert_close(g2["q"], g["q"], 1.0e-5, "theta + 2 pi grads")
     t, _, _ = frames_ref(q, d1, n0, n1)
     assert_close(np.sum(g["d1"] * np.cross(t, d1), 1), g["q"][nodes:], 1.0e-5, "gauge")
+
+
+# -- export ---------------------------------------------------------------------------------
+
+
+def rigid_ref(q, d1, n0, n1, sp, l0):
+    """The skin with every edge at its rest length about its midpoint: what rides on the proxies."""
+    E = len(n0)
+    x = q[:-E].reshape(-1, 3)
+    t, m1, m2 = frames_ref(q, d1, n0, n1)
+    e = sp.edge
+    mid = 0.5 * (x[n0] + x[n1])
+    mean = mid[e] + ((sp.s - 0.5) * l0[e])[:, None] * t[e] + sp.uv[:, :1] * m1[e] + sp.uv[:, 1:] * m2[e]
+    return mean, skin_ref(q, d1, n0, n1, sp)[1]
+
+
+def world(gaussians, X):
+    """World means and cov6 of per-body Gaussians at poses ``X`` (bodies, 7)."""
+    means, covs = [], []
+    for g, x in zip(gaussians, X):
+        R = Rotation.from_quat(x[3:]).as_matrix() @ Rotation.from_quat(g.rotations).as_matrix()
+        means.append(g.positions @ Rotation.from_quat(x[3:]).as_matrix().T + x[:3])
+        covs.append((R * g.scales[:, None, :] ** 2) @ R.transpose(0, 2, 1))
+    return np.concatenate(means), np.concatenate(covs)[:, IU[0], IU[1]]
+
+
+def assert_appearance(gaussians, colours, opacity):
+    """The Gaussians' degree-0 SH and opacities = ``colours`` and ``opacity`` (in their order)."""
+    assert all(g.sh_degree == 0 for g in gaussians)
+    sh = np.concatenate([g.sh_coeffs for g in gaussians])
+    assert_close(SH_C0 * sh + 0.5, colours, 1.0e-6, "colours", scale=1.0)
+    assert_close(np.concatenate([g.opacities for g in gaussians]), opacity, 1.0e-6, "opacity", scale=1.0)
+
+
+def test_edge_gaussians_ride_the_proxies(rng):
+    """The Gaussians of :func:`edge_gaussians` posed by the proxies = the skin at rest length; appearance as SH."""
+    model, solver, state = bent(proxies=True)
+    solver.update_proxies(state)
+    splats, _ = tube(model, rings=2, per_ring=4, radius=RADIUS, sigma=SIGMA)
+    sp, d, S = splats.numpy(), model.dismech, len(splats)
+    colours, opacity = rng.random((S, 3)), rng.random(S)
+    gaussians = edge_gaussians(splats, d.edge_length.numpy(), colours, opacity)
+    order = np.argsort(sp.edge, kind="stable")
+    means, cov6 = world(gaussians, state.body_q.numpy()[d.edge_body.numpy()])
+    m, c = rigid_ref(state.dismech.q.numpy().astype(np.float64), state.dismech.edge_d1_q.numpy().astype(np.float64),
+                     d.edge_node0.numpy(), d.edge_node1.numpy(), sp, d.edge_length.numpy())
+    assert_close(means, m[order], 1.0e-6, "means", scale=1.0)
+    assert_close(cov6, c[order], 1.0e-5, "cov6")
+    assert_appearance(gaussians, colours[order], opacity[order])
+
+
+def read_frame(stage, prims, k):
+    """The fields ``prims`` at time ``k`` as Gaussians and their world poses ``(len(prims), 7)``."""
+    from pxr import UsdGeom
+
+    cache = UsdGeom.XformCache(k)
+    gaussians, X = [], []
+    for p in prims:
+        gaussians.append(newton.Gaussian(*(np.array(p.GetAttribute(a).Get(k)) for a in
+                                           ("positions", "orientations", "scales"))))
+        M = np.array(cache.GetLocalToWorldTransform(p)).T  # USD: row vectors
+        X.append(np.concatenate([M[:3, 3], Rotation.from_matrix(M[:3, :3]).as_quat()]))
+    return gaussians, X
+
+
+@pytest.mark.parametrize("baked", [False, True], ids=["rigged", "baked"])
+def test_export_usd_round_trip(scene, tmp_path, rng, baked):
+    """Two frames written and read back (appearance with Newton's reader): baked = the skin, rigged = the skin at
+    rest length, grouped by edge."""
+    pytest.importorskip("pxr.UsdVol")
+    from pxr import Usd, UsdGeom
+
+    sc = scene
+    model, splats, sp = sc["model"], sc["splats"], sc["sp"]
+    l0 = model.dismech.edge_length.numpy()
+    E, S = len(l0), len(sp.edge)
+    q1 = sc["q"].copy()
+    q1[-E:] += rng.normal(size=E)  # twisted
+    frames = [(sc["q"], sc["d1"]), (q1, sc["d1"])]
+    colours, opacity = rng.random((S, 3)), rng.random(S)
+    path = tmp_path / "rod.usda"
+    export_usd(path, model, splats, colours, opacity, frames, fps=30.0, baked=baked)
+    stage = Usd.Stage.Open(str(path))
+    assert UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z and stage.GetTimeCodesPerSecond() == 30.0
+    paths = ["/rod/splats"] if baked else [f"/rod/edge_{e}/splats" for e in range(E)]
+    prims = [stage.GetPrimAtPath(p) for p in paths]
+    order = np.arange(S) if baked else np.argsort(sp.edge, kind="stable")
+    for k, (q, d1) in enumerate(frames):
+        ref = skin_ref(q, d1, sc["n0"], sc["n1"], sp) if baked else rigid_ref(q, d1, sc["n0"], sc["n1"], sp, l0)
+        means, cov6 = world(*read_frame(stage, prims, k))
+        assert_close(means, ref[0][order], 1.0e-6, f"frame {k} means", scale=1.0)
+        assert_close(cov6, ref[1][order], 1.0e-5, f"frame {k} cov6")
+    assert_appearance([newton.Gaussian.create_from_usd(p) for p in prims], colours[order], opacity[order])

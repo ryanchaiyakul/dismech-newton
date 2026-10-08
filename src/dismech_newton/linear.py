@@ -26,6 +26,16 @@ except ImportError:
 _CUDA_R_64F, _CUDA_R_32I = 1, 10  # cudaDataType codes
 
 
+def _copy_values(dst: SymmetricCSR | GeneralCSR, src: SymmetricCSR | GeneralCSR) -> bool:
+    """``dst.vals = src.vals`` (in place) if the two have one pattern; else ``False``, ``dst`` untouched."""
+    if dst is src:
+        return True
+    if type(dst) is not type(src) or not all(np.array_equal(a, b) for a, b in zip(dst.pattern, src.pattern)):
+        return False
+    wp.copy(dst.vals, src.vals)
+    return True
+
+
 def csr_entries(A: SymmetricCSR | GeneralCSR) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Host ``(rows, cols, slot)`` of every entry of the full matrix, ``slot`` its index in ``A.vals`` (a
     :class:`SymmetricCSR`'s strict upper triangle mirrored after its stored entries)."""
@@ -105,6 +115,19 @@ class CudssSolver:
         """``A``'s values changed: refactorise on the next solve."""
         self._factored = False
 
+    def update(self, A: SymmetricCSR | GeneralCSR, H: sp.spmatrix | None = None) -> bool:
+        """Take ``A``'s values (the same pattern) into this solver's arrays and refactorise now, outside any graph:
+        a captured solve stays valid. ``False``: another pattern, build a new solver."""
+        if not _copy_values(self.A, A):
+            return False
+        if self._handle is None:
+            self._factored = False
+        else:
+            with wp.ScopedDevice(self.device):
+                self._execute(cudss.Phase.FACTORIZATION)
+            self._factored = True
+        return True
+
     def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
         """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
         if self._residual is not None:
@@ -155,6 +178,13 @@ class ScipySolver:
     def invalidate(self) -> None:
         self._lu = None
 
+    def update(self, A: SymmetricCSR | GeneralCSR, H: sp.spmatrix | None = None) -> bool:
+        """Take ``A``'s values (the same pattern); refactorised on the next solve. ``False``: another pattern."""
+        if not _copy_values(self.A, A):
+            return False
+        self._lu = None
+        return True
+
     def _factorize(self) -> None:
         A = self.A
         if isinstance(A, GeneralCSR):
@@ -204,7 +234,24 @@ class BlockInverseSolver:
         """``H``: ``A.to_scipy()``, if already at hand."""
         self.A = A
         self.device = A.vals.device
-        H = A.to_scipy() if H is None else H
+        perm, slot_block, start, size, offset, inv = self._layout(A.to_scipy() if H is None else H)
+
+        def ints(a):
+            return wp.array(np.asarray(a).astype(np.int32), dtype=wp.int32, device=self.device)
+
+        self.perm = ints(perm)
+        self.slot_block = ints(slot_block)
+        self.block_start = ints(start)
+        self.block_size = ints(size)
+        self.block_offset = ints(offset)
+        self.inv = wp.array(inv, dtype=float, device=self.device)
+        self._empty = wp.zeros(0, dtype=float, device=self.device)
+        self._residual = _Residual(A) if increment else None
+        self._r = wp.zeros(A.n if increment else 0, dtype=wp.float64, device=self.device)
+
+    @staticmethod
+    def _layout(H: sp.spmatrix) -> tuple[np.ndarray, ...]:
+        """``perm, slot_block, start, size, offset, inverses``: the blocks, identical ones inverted once."""
         n_blocks, label = connected_components(H, directed=False)
         perm = np.argsort(label, kind="stable")
         size = np.bincount(label, minlength=n_blocks)
@@ -220,19 +267,20 @@ class BlockInverseSolver:
                 inverses.append(np.linalg.inv(B).astype(np.float32).ravel())
                 total += B.size
             offset[k] = seen[key]
+        return perm, np.repeat(np.arange(n_blocks), size), start, size, offset, np.concatenate(inverses)
 
-        def ints(a):
-            return wp.array(np.asarray(a).astype(np.int32), dtype=wp.int32, device=self.device)
-
-        self.perm = ints(perm)
-        self.slot_block = ints(np.repeat(np.arange(n_blocks), size))
-        self.block_start = ints(start)
-        self.block_size = ints(size)
-        self.block_offset = ints(offset)
-        self.inv = wp.array(np.concatenate(inverses), dtype=float, device=self.device)
-        self._empty = wp.zeros(0, dtype=float, device=self.device)
-        self._residual = _Residual(A) if increment else None
-        self._r = wp.zeros(A.n if increment else 0, dtype=wp.float64, device=self.device)
+    def update(self, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
+        """Take ``A``'s values (the same pattern, so the same blocks) and invert the blocks again, into the same
+        arrays: a captured solve stays valid. ``False``: another pattern, or more distinct blocks than the inverses'
+        array holds (identical blocks that no longer are): build a new solver."""
+        if not _copy_values(self.A, A):
+            return False
+        *_, offset, inv = self._layout(A.to_scipy() if H is None else H)
+        if len(inv) > self.inv.shape[0]:
+            return False
+        self.inv[: len(inv)].assign(inv)
+        self.block_offset.assign(offset.astype(np.int32))
+        return True
 
     @classmethod
     def fits(cls, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
@@ -275,19 +323,13 @@ class TridiagonalSolver:
         self.A = A
         self.device = dev = A.vals.device
         self.increment = increment
-        chains, singles = _chains(A.to_scipy() if H is None else H)
-        self.batch = len(chains)
-        self.m = m = max([3] + [len(c) for c, _ in chains])  # gtsv2 needs m >= 3
-        total = max(self.batch * m, 1)
-        slot_dof = np.full(total, -1, dtype=np.int32)
-        dl, d, du = np.zeros(total), np.ones(total), np.zeros(total)
-        for k, (chain, (lo, mid, up)) in enumerate(chains):
-            s = k * m + np.arange(len(chain))
-            slot_dof[s], dl[s], d[s], du[s] = chain, lo, mid, up
+        H = (A.to_scipy() if H is None else H).tocsr()
+        self.batch, self.m, self._slot_dof = self._layout(H)
+        dl, d, du, single_diag = self._values(H)
+        slot_dof = self._slot_dof
+        total = len(slot_dof)
         dof_slot = np.full(A.n, -1, dtype=np.int32)
         dof_slot[slot_dof[slot_dof >= 0]] = np.flatnonzero(slot_dof >= 0)
-        single_diag = np.zeros(A.n)
-        single_diag[singles[0]] = singles[1]
 
         def arr(a, dtype):
             return wp.array(a, dtype=dtype, device=dev)
@@ -314,6 +356,49 @@ class TridiagonalSolver:
         n_blocks = connected_components(H, directed=False)[0]
         return degree.max(initial=0) <= 2 and off.nnz == A.n - n_blocks  # a forest of paths
 
+    @staticmethod
+    def _layout(H: sp.spmatrix) -> tuple[int, int, np.ndarray]:
+        """``batch, m, slot_dof``: the chains, each padded to ``m`` slots (``-1``: an identity row)."""
+        chains = _chains(H)
+        m = max([3] + [len(c) for c in chains])  # gtsv2 needs m >= 3
+        slot_dof = np.full(max(len(chains) * m, 1), -1, dtype=np.int32)
+        for k, chain in enumerate(chains):
+            slot_dof[k * m + np.arange(len(chain))] = chain
+        return len(chains), m, slot_dof
+
+    def update(self, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
+        """Take ``A``'s values (the same pattern, so the same chains) into the same diagonals: a captured solve
+        stays valid (gtsv2 factors on every solve). ``False``: another pattern, build a new solver."""
+        if not _copy_values(self.A, A):
+            return False
+        dl, d, du, single_diag = self._values(A.to_scipy() if H is None else H)
+        for dst, v in zip((self.dl, self.d, self.du), (dl, d, du)):
+            dst.assign(v.astype(np.float32))
+        if self.increment:
+            for dst, v in zip((self.dl64, self.d64, self.du64), (dl, d, du)):
+                dst.assign(v)
+        self.single_diag.assign(single_diag)
+        return True
+
+    def _values(self, H: sp.spmatrix) -> tuple[np.ndarray, ...]:
+        """``dl, d, du`` of ``H`` on this solver's chains (one gather, no chain search) and the single DOFs'
+        diagonal."""
+        H = H.tocsr()
+        slot_dof, m = self._slot_dof, self.m
+        total = len(slot_dof)
+        diag = H.diagonal()
+        dl, d, du = np.zeros(total), np.ones(total), np.zeros(total)
+        valid = slot_dof >= 0
+        d[valid] = diag[slot_dof[valid]]
+        s = np.flatnonzero(valid[:-1] & (np.arange(total - 1) % m != m - 1) & (slot_dof[1:] >= 0))  # s, s + 1 linked
+        up = np.asarray(H[slot_dof[s], slot_dof[s + 1]]).ravel()
+        du[s], dl[s + 1] = up, up
+        single_diag = np.zeros(self.A.n)
+        single = np.ones(self.A.n, dtype=bool)
+        single[slot_dof[valid]] = False
+        single_diag[single] = diag[single]
+        return dl, d, du, single_diag
+
     def _setup(self) -> None:
         self._handle = cusparse.create()
         weakref.finalize(self, cusparse.destroy, self._handle)
@@ -339,8 +424,8 @@ class TridiagonalSolver:
                   device=self.device)
 
 
-def _chains(H: sp.spmatrix):
-    """The components of ``H`` in chain order with ``(dl, d, du)``, and the single-DOF ones ``(dofs, diag)``."""
+def _chains(H: sp.spmatrix) -> list[np.ndarray]:
+    """The DOFs of every component of ``H`` with more than one, in chain order."""
     H = H.tocsr()
     n_blocks, label = connected_components(H, directed=False)
     off = H.copy()
@@ -349,11 +434,10 @@ def _chains(H: sp.spmatrix):
     degree = np.diff(off.indptr)
     order = np.argsort(label, kind="stable")
     bounds = np.searchsorted(label[order], np.arange(n_blocks + 1))
-    chains, single = [], []
+    chains = []
     for k in range(n_blocks):
         members = order[bounds[k] : bounds[k + 1]]
         if len(members) == 1:
-            single.append(members[0])
             continue
         ends = members[degree[members] == 1]
         if len(ends) != 2 or degree[members].max() > 2:
@@ -363,12 +447,8 @@ def _chains(H: sp.spmatrix):
             row = off.indices[off.indptr[chain[-1]] : off.indptr[chain[-1] + 1]]
             prev, nxt = chain[-1], row[row != prev][0]
             chain.append(nxt)
-        chain = np.asarray(chain)
-        up = np.asarray(H[chain[:-1], chain[1:]]).ravel()
-        chains.append((chain, (np.concatenate([[0.0], up]), np.asarray(H[chain, chain]).ravel(),
-                               np.concatenate([up, [0.0]]))))
-    single = np.asarray(single, dtype=np.int64)
-    return chains, (single, H.diagonal()[single])
+        chains.append(np.asarray(chain))
+    return chains
 
 
 @wp.kernel

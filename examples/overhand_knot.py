@@ -12,11 +12,17 @@ Neukirch, PRL 99, 164301 (2007), ``F h^2 / B = eps^4 / 2 + mu sigma eps^3``, ``e
 import newton
 import newton.examples
 import numpy as np
+import warp as wp
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from utils.common import MUTED, SIM, THEORY, CableExample, Drive, close_pairs, inset, segment_dofs, smoothstep
 
 from dismech_newton import ADMMDiSMechSolver
+
+
+@wp.kernel
+def _scale(a: wp.array[float], factor: float):
+    a[wp.tid()] *= factor
 
 SIGMA_TREFOIL = 0.492  # Audoly et al. (2007), the trefoil's friction constant
 
@@ -72,7 +78,8 @@ class Example(CableExample):
         # the first fifth of the pull (before comparison() reads any frame).
         damping = 0.1 * (1.0 - smoothstep(self.sim_time, self.settle, self.settle + 0.2 * self.pull_time))
         if damping > 0.0:
-            self.state_0.dismech.qd.assign((1.0 - damping) * self.state_0.dismech.qd.numpy())
+            qd = self.state_0.dismech.qd
+            wp.launch(_scale, dim=qd.shape[0], inputs=[qd, 1.0 - damping], device=qd.device)
         self.record()
 
     def gaps(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

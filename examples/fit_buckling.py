@@ -35,7 +35,7 @@ import warp as wp
 from scipy.optimize import minimize
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
-from utils.common import cached, capsule_poses, inset, inset_scale, smoothstep
+from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale, smoothstep
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, flatten_state, suspended_tape
 from dismech_newton.solver import advance_frames_kernel
@@ -365,23 +365,26 @@ class WindowFit:
         x_obs, f_obs = data["x_obs"], data["f_obs"]
         v_obs = np.zeros_like(x_obs)  # free nodes only
         v_obs[:, :, 2:-2] = savgol_filter(x_obs[:, :, 2:-2], VELOCITY, 2, deriv=1, delta=OBS_EVERY * DT, axis=1)
-        self.vals, self.obs, self.f_obs, self.q0, self.qd0 = [], [], [], [], []
+        self.data = {k: [] for k in ("vals", "obs", "f_obs", "q0", "qd0")}  # per chunk
         for c in range(self.chunks):
             k0 = np.arange(c * self.G, (c + 1) * self.G) * W  # first frame of every window in the batch
             steps = k0[:, None] * OBS_EVERY + np.arange(self.L + 1)[None]  # (G, L + 1)
-            self.vals.append(wp.array(vals[steps.T].reshape(self.L + 1, -1).astype(np.float32), dtype=float))
+            self.data["vals"].append(wp.array(vals[steps.T].reshape(self.L + 1, -1).astype(np.float32), dtype=float))
             frames = k0[:, None] + np.arange(1, W + 1)[None]  # (G, W)
             o = x_obs[:, frames]  # (trials, G, W, NODES, 3)
-            self.obs.append(wp.array(o.transpose(2, 1, 0, 3, 4).reshape(W, R * NODES, 3), dtype=wp.vec3))
-            self.f_obs.append(wp.array(f_obs[:, frames].transpose(2, 1, 0, 3).reshape(W, R, 3), dtype=wp.vec3))
+            self.data["obs"].append(wp.array(o.transpose(2, 1, 0, 3, 4).reshape(W, R * NODES, 3), dtype=wp.vec3))
+            self.data["f_obs"].append(wp.array(f_obs[:, frames].transpose(2, 1, 0, 3).reshape(W, R, 3), dtype=wp.vec3))
             x0 = np.where((k0 > 0)[:, None, None, None], x_obs[:, k0].transpose(1, 0, 2, 3), data["x_rest"])
             q = q_rest.copy()
             q[: 3 * NODES * R] = x0.ravel()
             q[fixed] = vals[steps[:, 0]].ravel()
-            self.q0.append(wp.array(q.astype(np.float32), dtype=float))
+            self.data["q0"].append(wp.array(q.astype(np.float32), dtype=float))
             qd = np.zeros_like(q)
             qd[: 3 * NODES * R] = (v_obs[:, k0].transpose(1, 0, 2, 3) * (k0 > 0)[:, None, None, None]).ravel()
-            self.qd0.append(wp.array(qd.astype(np.float32), dtype=float))
+            self.data["qd0"].append(wp.array(qd.astype(np.float32), dtype=float))
+        # the chunk being run: its data copied here, so one taped rollout (one pair of CUDA graphs) serves all
+        self.chunk = {k: wp.empty_like(v[0]) for k, v in self.data.items()}
+        self.taped = TapedGraph(self.run, solver)
 
     def set(self, theta: np.ndarray):
         m, d = self.model, self.model.dismech
@@ -395,14 +398,16 @@ class WindowFit:
         d.edge_inertia.assign((self.i_true * self.rho).astype(np.float32))
         self.solver.refresh_mass()
 
-    def run(self, c: int):
+    def run(self):
+        """The windows of :attr:`chunk`, taped: the losses in ``loss_x`` and ``loss_f``."""
+        ch = self.chunk
         with suspended_tape():  # the start and the drive are data: no adjoint through them
             for a in (self.loss_x, self.loss_f, *self.force):
                 a.zero_()
-            start(self.solver, self.states[0], self.rest, self.q0[c], self.qd0[c])
+            start(self.solver, self.states[0], self.rest, ch["q0"], ch["qd0"])
         for i in range(self.L):
             with suspended_tape():
-                wp.launch(set_fixed, dim=len(self.fixed), inputs=[self.fixed, self.vals[c], i],
+                wp.launch(set_fixed, dim=len(self.fixed), inputs=[self.fixed, ch["vals"], i],
                           outputs=[self.states[i].dismech.q])
             self.solver.step(self.states[i], self.states[i + 1], None, None, DT)
             if (i + 1) % OBS_EVERY == 0:
@@ -411,10 +416,10 @@ class WindowFit:
                 # the tape replays a kernel's adjoint on its arrays as they are then, so the sensor reads a copy
                 wp.launch(copy, dim=len(self.q_read[j]), inputs=[new.dismech.q], outputs=[self.q_read[j]])
                 sense(self.solver, self.q_read[j], new, self.states[i], self.force[j])
-                wp.launch(force_loss, dim=len(self.force[j]), inputs=[self.force[j], self.f_obs[c][j], 1.0 / FRAMES],
+                wp.launch(force_loss, dim=len(self.force[j]), inputs=[self.force[j], ch["f_obs"][j], 1.0 / FRAMES],
                           outputs=[self.loss_f])
                 wp.launch(frame_loss, dim=self.model.particle_count,
-                          inputs=[new.particle_q, self.obs[c][j], self.free, self.scale], outputs=[self.loss_x])
+                          inputs=[new.particle_q, ch["obs"][j], self.free, self.scale], outputs=[self.loss_x])
 
     def weights(self) -> np.ndarray:
         """The loss's weights of the positions' and the force's squared errors."""
@@ -427,21 +432,20 @@ class WindowFit:
         self.set(theta)
         m, d = self.model, self.model.dismech
         w = self.weights()
-        seeds = [wp.full(len(self.loss_x), float(v) / self.trials, dtype=float) for v in w]
         gp, gm, gi, sq = 0.0, 0.0, 0.0, np.zeros(2)
         for c in range(self.chunks):
+            for k, v in self.data.items():
+                wp.copy(self.chunk[k], v[c])
             for a in (d.triplet_params, m.particle_mass, d.edge_inertia):
                 a.grad.zero_()
-            tape = wp.Tape()
-            with tape:
-                self.run(c)
-            tape.backward(grads=dict(zip((self.loss_x, self.loss_f), seeds)))
+            self.taped.forward()  # a CUDA graph after the first call (TapedGraph); set() refactorises in place
+            for loss, v in zip((self.loss_x, self.loss_f), w):  # the seeds
+                loss.grad.fill_(float(v) / self.trials)
+            self.taped.backward()
             gp = gp + d.triplet_params.grad.numpy().reshape(self.p.shape)
             gm = gm + m.particle_mass.grad.numpy()
             gi = gi + d.edge_inertia.grad.numpy()
             sq += [a.numpy().sum() / self.trials for a in (self.loss_x, self.loss_f)]
-            tape.zero()
-            tape.reset()
         self.sq = sq
         g = [self.rho * (gm @ self.m_true + gi @ self.i_true) if kind == "rho"
              else np.sum(gp[..., COLUMNS[kind]] * self.p[..., COLUMNS[kind]]) for kind in KINDS]

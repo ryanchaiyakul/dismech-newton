@@ -10,6 +10,7 @@ class _CSR:
 
     def _set(self, n, indptr, indices, vals, device) -> None:
         self.n = n
+        self.pattern = (np.asarray(indptr, dtype=np.int32), np.asarray(indices, dtype=np.int32))  # host copy
         self.indptr = wp.array(indptr, dtype=wp.int32, device=device)
         self.indices = wp.array(indices, dtype=wp.int32, device=device)
         self.vals = wp.array(vals, dtype=wp.float64, device=device)

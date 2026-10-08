@@ -1,6 +1,7 @@
 """What the examples share, none of it part of the ``dismech_newton`` package.
 
 - :class:`CableExample`: the frame loop in Newton's example format (drive, collide, step, CUDA graph replay).
+- :class:`FrameGraph`, :class:`TapedGraph`: device work run eagerly once, then replayed as CUDA graphs.
 - :class:`Drive`, :func:`segment_dofs`: move clamped segments along a prescribed path.
 - :func:`frame_box`: point the viewer's camera at a box.
 - :func:`contact_pipeline`: Newton's collision pipeline, rigid contacts only.
@@ -105,6 +106,71 @@ def contact_pipeline(model, radius: float, **options) -> newton.CollisionPipelin
                                     speculative_contact_gap_max=2.0 * radius, **options)
 
 
+# -- CUDA graphs ---------------------------------------------------------------------------
+
+
+def capturable(solver) -> bool:
+    """Whether work stepping ``solver`` can be captured: on CUDA, and as the solver says (DER solvers decide on their
+    first step; Newton's are taken as capturable)."""
+    return wp.get_device(solver.model.device).is_cuda and getattr(solver, "graph_capturable", True)
+
+
+class FrameGraph:
+    """``self()`` runs ``work`` (device work only): eagerly until the solver can be captured (it sets itself up on
+    its first step), then captured once and replayed. ``work`` must leave the arrays it reads where they were (e.g.
+    an even count of state swaps); ``enabled=False`` keeps it eager."""
+
+    def __init__(self, work, solver, enabled: bool = True):
+        self.work, self.solver, self.enabled = work, solver, enabled
+        self.graph = None
+
+    def __call__(self) -> None:
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+            return
+        self.work()
+        if self.enabled and capturable(self.solver):
+            with wp.ScopedCapture() as capture:
+                self.work()
+            self.graph = capture.graph
+
+
+class TapedGraph:
+    """A taped ``run()`` and its backward: eagerly until the solver can be captured, then two CUDA graphs.
+
+    :meth:`forward` returns ``run``'s output (the same arrays on every replay); seed the outputs' ``.grad`` between it
+    and :meth:`backward`, which leaves the inputs' gradients. Every :meth:`forward` zeroes the tape's gradients."""
+
+    def __init__(self, run, solver):
+        self.run, self.solver = run, solver
+        self.tape, self.output, self.graphs = None, None, None
+
+    def forward(self):
+        if self.tape is not None:
+            self.tape.zero()
+        if self.graphs is not None:
+            wp.capture_launch(self.graphs[0])
+        else:
+            self.tape = wp.Tape()
+            with self.tape:
+                self.output = self.run()
+        return self.output
+
+    def backward(self) -> None:
+        if self.graphs is not None:
+            wp.capture_launch(self.graphs[1])
+            return
+        self.tape.backward()
+        if capturable(self.solver):  # a capture runs nothing: the gradients just computed stay
+            tape = wp.Tape()
+            with wp.ScopedCapture() as forward:
+                with tape:
+                    output = self.run()
+            with wp.ScopedCapture() as backward:
+                tape.backward()
+            self.tape, self.output, self.graphs = tape, output, (forward.graph, backward.graph)
+
+
 # -- the frame loop -----------------------------------------------------------------------
 
 
@@ -134,7 +200,7 @@ class CableExample:
         self.state_0, self.state_1 = model.state(), model.state()
         flatten_state(self.state_0)
         flatten_state(self.state_1)
-        self.graph = None
+        self.graph = FrameGraph(self.simulate, solver, enabled=self.capture)
         if viewer is not None:  # None: a simulation another example draws
             viewer.set_model(model)
 
@@ -155,14 +221,7 @@ class CableExample:
 
     def step(self):
         self.drive(self.sim_time, self.sim_time + self.frame_dt)
-        if self.graph is not None:
-            wp.capture_launch(self.graph)
-        else:
-            self.simulate()
-            if self.capture and self.solver.graph_capturable:
-                with wp.ScopedCapture() as capture:
-                    self.simulate()
-                self.graph = capture.graph
+        self.graph()
         self.sim_time += self.frame_dt
         self.frame += 1
 

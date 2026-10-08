@@ -12,7 +12,7 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from utils.common import THEORY, capsules, frame_box, inset, inset_scale
+from utils.common import THEORY, FrameGraph, frame_box, inset, inset_scale
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, flatten_state
 
@@ -230,8 +230,30 @@ class Example:
                 assert abs(row["sag / beam"] - 1.0) < 0.05, f"{name}: sag {row['sag / beam']:.3f} of the beam's"
 
 
+@wp.kernel
+def _record_tip(body_q: wp.array[wp.transform], body: int, half: float, z0: float,
+                iterations: wp.array[wp.int32], count: wp.array[wp.int32],
+                # outputs
+                sag: wp.array[float], iters: wp.array[wp.int32]):
+    """Append the tip's sag (its capsule's far end, below its start) and the step's iterations at ``count``."""
+    k = count[0]
+    if k < sag.shape[0]:
+        X = body_q[body]
+        tip = wp.transform_get_translation(X) + half * wp.quat_rotate(wp.transform_get_rotation(X), wp.vec3(0.0, 0.0, 1.0))
+        sag[k] = z0 - tip[2]
+        if iterations.shape[0] > 0:
+            iters[k] = iterations[0]
+    count[0] = k + 1
+
+
 class _Sim:
-    """One rod, its solver and its tip-sag history (sampled every substep)."""
+    """One rod, its solver and its tip-sag history (sampled every substep).
+
+    The history is recorded on the device, so a frame's substeps are one CUDA graph (:class:`FrameGraph`); reading
+    ``t``, ``sag`` or ``iterations`` copies it to the host (a sync), as does a full device buffer (every
+    ``buffer_frames`` frames)."""
+
+    buffer_frames = 600
 
     def __init__(self, model, solver, bodies: list[int], substeps: int, offset):
         self.model, self.solver, self.bodies, self.substeps = model, solver, bodies, substeps
@@ -240,19 +262,59 @@ class _Sim:
         if model.particle_count:  # a DER rod
             flatten_state(self.state_0)
             flatten_state(self.state_1)
+        shape = list(model.shape_body.numpy()).index(bodies[-1])
+        self.tip, self.half = bodies[-1], float(model.shape_scale.numpy()[shape, 1])  # the capsule's half length
         self.z0 = float(model.body_q.numpy()[bodies[-1], 2])
-        self.dt, self.t, self.sag, self.iterations = None, [], [], []
+        n, dev = substeps * self.buffer_frames, model.device
+        self._iterations = getattr(solver, "iteration_count", wp.zeros(0, dtype=wp.int32, device=dev))
+        self._count = wp.zeros(1, dtype=wp.int32, device=dev)
+        self._sag, self._iters = wp.zeros(n, dtype=float, device=dev), wp.zeros(n, dtype=wp.int32, device=dev)
+        self._pending = 0  # substeps recorded on the device since the last read
+        self._t, self._z, self._it = [], [], []
+        self.dt = None
+        self.frame = FrameGraph(self._substeps, solver, enabled=substeps % 2 == 0)  # even: state_0 stays in place
 
-    def run(self, frame_dt: float):
-        self.dt = frame_dt / self.substeps
+    def _substeps(self):
         for _ in range(self.substeps):
             self.solver.step(self.state_0, self.state_1, None, None, self.dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
-            tip = capsules(self.model, self.state_0, [self.bodies])[0][1][-1, 2]
-            self.t.append((len(self.t) + 1) * self.dt)
-            self.sag.append(self.z0 - tip)
-            if hasattr(self.solver, "last_iterations"):
-                self.iterations.append(self.solver.last_iterations)
+            wp.launch(_record_tip, dim=1,
+                      inputs=[self.state_0.body_q, self.tip, self.half, self.z0, self._iterations, self._count],
+                      outputs=[self._sag, self._iters], device=self.model.device)
+
+    def run(self, frame_dt: float):
+        self.dt = frame_dt / self.substeps
+        if self._pending + self.substeps > self._sag.shape[0]:
+            self._flush()
+        self.frame()
+        self._pending += self.substeps
+
+    def _flush(self) -> None:
+        """Move the device's records to the host."""
+        k = self._pending
+        if not k:
+            return
+        self._t.extend((len(self._t) + np.arange(1, k + 1)) * self.dt)
+        self._z.extend(self._sag.numpy()[:k].tolist())
+        if self._iterations.shape[0]:
+            self._it.extend(self._iters.numpy()[:k].tolist())
+        self._count.zero_()
+        self._pending = 0
+
+    @property
+    def t(self) -> list[float]:
+        self._flush()
+        return self._t
+
+    @property
+    def sag(self) -> list[float]:
+        self._flush()
+        return self._z
+
+    @property
+    def iterations(self) -> list[int]:
+        self._flush()
+        return self._it
 
 
 if __name__ == "__main__":

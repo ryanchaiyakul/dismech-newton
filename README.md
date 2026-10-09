@@ -33,17 +33,17 @@ Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newt
   <tr>
     <th width="33%">Flagella Bundling</th>
     <th width="33%">System Identification</th>
-    <th width="33%">Two-way Coupled Solvers</th>
+    <th width="33%">RGB-D Capture</th>
   </tr>
   <tr>
     <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_flagella.webp" alt="Flagella bundling" width="260"></td>
     <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/fit_buckling.webp" alt="Fitting stiffness, density and damping to buckling recordings" width="260"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_franka.webp" alt="Pick and place" width="260"></td>
+    <td><img src="docs/fit_capture.webp" alt="A rod's geometry, stiffness and damping from one RGB-D camera" width="260"></td>
   </tr>
   <tr>
     <td valign="top">Flagella bundle in a viscous fluid <a href="https://arxiv.org/abs/2205.10309">Tong et al. (2022)</a>.<br><code>uv run examples/flagella.py --flagella 10</code></td>
-    <td valign="top">L-BFGS fits stiffness, density and damping to video and a gripper force sensor by differentiating through the solver.<br><code>uv run examples/fit_buckling.py</code></td>
-    <td valign="top">A MuJoCo Franka carries a rod with two-way coupling (experimental).<br><code>uv run --extra mujoco examples/experimental/franka_rod.py</code></td>
+    <td valign="top">L-BFGS fits parameters from positions and a gripper force sensor.<br><code>uv run examples/fit_buckling.py</code></td>
+    <td valign="top">Fitting rod geometry and parameters from a single RGB-D camera.<br><code>uv run --extra splat examples/fit_capture.py</code></td>
   </tr>
 </table>
 

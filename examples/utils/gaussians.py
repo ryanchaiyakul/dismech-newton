@@ -44,11 +44,16 @@ def look_at(eye, target, up=(0.0, 0.0, 1.0)) -> np.ndarray:
 
 class Camera:
     """A square pinhole camera at ``eye`` looking at ``target``: ``self(means, cov6, colours, opacity)`` is the
-    image ``(3, size, size)``, differentiable in all four; :meth:`project` gives pixel coordinates."""
+    image ``(3, size, size)``, differentiable in all four; :meth:`project` gives pixel coordinates.
+
+    ``background``: a colour, or an image ``(3, size, size)`` (torch) the splats are composited over."""
 
     def __init__(self, eye, target, size: int = 256, fov: float = math.radians(45.0),
                  background=(0.05, 0.05, 0.08), near: float = 0.01, far: float = 100.0):
         self.eye, self.size, self.fov = np.asarray(eye, dtype=float), size, fov
+        self.plate = background if isinstance(background, torch.Tensor) else None
+        if self.plate is not None:
+            background = (0.0, 0.0, 0.0)
         self.V = look_at(eye, target)
         tan = math.tan(fov / 2)
         P = torch.zeros(4, 4)  # Inria's projection
@@ -64,10 +69,16 @@ class Camera:
         self.raster = GaussianRasterizer(settings)
 
     def __call__(self, means, cov6, colours, opacity) -> torch.Tensor:
-        image = self.raster(means3D=means, means2D=torch.zeros_like(means), cov3D_precomp=cov6,
-                            colors_precomp=colours, opacities=opacity.reshape(-1, 1))[0]
+        return self.layers(means, cov6, colours, opacity)[0]
+
+    def layers(self, means, cov6, colours, opacity) -> tuple[torch.Tensor, torch.Tensor]:
+        """The image and the splats' opacity ``(1, size, size)``, both differentiable."""
+        image, _, meta = self.raster(means3D=means, means2D=torch.zeros_like(means), cov3D_precomp=cov6,
+                                     colors_precomp=colours, opacities=opacity.reshape(-1, 1))
         _rebind()
-        return image
+        if self.plate is not None:
+            image = image + (1.0 - meta.alpha) * self.plate
+        return image, meta.alpha
 
     def project(self, x) -> np.ndarray:
         """Pixel coordinates ``(..., 2)`` of world points ``(..., 3)``."""

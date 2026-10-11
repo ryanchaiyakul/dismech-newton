@@ -6,10 +6,10 @@ import pytest
 import warp as wp
 from fd import assert_close, derivative
 from scipy.spatial.transform import Rotation
+from utils.splat import SH_C0, Splats, edge_gaussians, export_usd, skin, tube
 
 from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
 from dismech_newton.dofs import dof_constants
-from dismech_newton.splat import SH_C0, Splats, edge_gaussians, export_usd, skin, tube
 
 RADIUS, SIGMA = 0.02, (0.003, 0.008, 0.01)
 

@@ -1,7 +1,7 @@
 """Recover a rod from one RGB-D image, then fit its bending stiffness and damping to a video from the same camera.
 
 Shows: a rod model built from data instead of given (its length, radius and held pose fitted to one colour image
-and one depth image, as a chain of plain cylinders); :mod:`dismech_newton.splat`, the rod painted with Gaussian
+and one depth image, as a chain of plain cylinders); :mod:`utils.splat`, the rod painted with Gaussian
 splats rigid in each edge's material frame; gradients from pixels, the image loss of a differentiable rasterizer
 (gswarp, in torch) handed back to Warp and taken through the skin and every solver step by one ``tape.backward``.
 
@@ -58,10 +58,10 @@ from PIL import Image, ImageDraw
 from scipy.optimize import minimize
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale
 from utils.gaussians import DEVICE, Camera, backprop, to_uint8, view
+from utils.splat import Splats, skin
 
 from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, fix_segment, flatten_state
 from dismech_newton.solver import advance_frames_kernel
-from dismech_newton.splat import Splats, skin
 from dismech_newton.triplet import advance_ref_twist_kernel
 
 # -- the rod and the truth -----------------------------------------------------------------

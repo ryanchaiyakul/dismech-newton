@@ -73,6 +73,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["examples"]  # tests/test_splat.py: examples/utils/splat.py
 addopts = ["-rs"]  # list why tests skipped (most need --device cuda)
 
 [tool.ruff]

@@ -40,5 +40,6 @@ graph after the first frame. Clamped DOFs move only through `state.dismech.q`, w
 [`utils/`](utils) holds what the examples share and the package does not: the frame loop, drives, camera
 framing, geometry checks, the theory plots, the fluid drag of `flagella.py` and `cached`, which stores
 results that take minutes (`fit_buckling.py`'s recordings and fit) in `.cache/examples`, once per configuration.
-[`utils/gaussians.py`](utils/gaussians.py) renders Gaussian splats with gswarp for `fit_capture.py` and hands
-the image loss's gradient back to Warp.
+[`utils/splat.py`](utils/splat.py) skins Gaussian splats to the rod's edges (differentiable, with USD export);
+[`utils/gaussians.py`](utils/gaussians.py) renders them with gswarp for `fit_capture.py` and hands the image
+loss's gradient back to Warp.

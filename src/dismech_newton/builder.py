@@ -7,7 +7,7 @@ import warp as wp
 from newton import Model, ModelBuilder, ParticleFlags, Rod
 from newton._src.core.types import Vec3
 
-from .strains import vec5f, vec10f
+from .strains import vec5f, vec6f, vec10f, vec12f
 
 NAMESPACE = "dismech"
 _P = f"{NAMESPACE}:"
@@ -23,6 +23,16 @@ ATTRIBUTES = [
     ("triplet", "triplet_edge0", wp.int32, _P + "edge"),  # scalar int32, so merging builders offsets them
     ("triplet", "triplet_edge1", wp.int32, _P + "edge"),
     ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
+    # Midedge shells (unified/shell.py): a hinge per mesh edge, its midedge angle a DOF.
+    ("hinge", "hinge_node0", wp.int32, "particle"),
+    ("hinge", "hinge_node1", wp.int32, "particle"),
+    ("hinge", "hinge_fixed", wp.int32, None),
+    *(("face", f"face_node{k}", wp.int32, "particle") for k in range(6)),  # its 3 vertices, then the 3 flaps
+    *(("face", f"face_hinge{k}", wp.int32, _P + "hinge") for k in range(3)),  # hinge k: the edge opposite node k
+    ("face", "face_sign", wp.vec3, None),  # +-1: the hinge's angle as the face sees it
+    ("face", "face_flap", wp.vec3, None),  # 1 where the hinge has a second face
+    ("face", "face_strain_map", wp.mat33, None),  # (m00, m01, m11) -> whitened strains in the rest frame
+    ("face", "face_params", vec12f, None),  # [stiffness, damping] per strain (membrane 3, bending 3)
 ]
 
 # Time-evolving state: (frequency, name, dtype, default).
@@ -33,12 +43,15 @@ STATE_ATTRIBUTES = [
     ("triplet", "triplet_ref_twist_q", float, None),
     # The strains at the end of the last step (strain-rate damping); NaN until a step measures them.
     ("triplet", "triplet_strain_q", vec5f, vec5f(*([float("nan")] * 5))),
+    ("hinge", "hinge_q", float, None),  # midedge angle
+    ("hinge", "hinge_qd", float, None),
+    ("face", "face_strain_q", vec6f, vec6f(*([float("nan")] * 6))),
 ]
 
 
 def register_custom_attributes(builder: ModelBuilder) -> None:
     """Register the ``dismech`` frequencies and attributes on ``builder`` (idempotent)."""
-    for name in ("edge", "triplet"):
+    for name in ("edge", "triplet", "hinge", "face"):
         builder.add_custom_frequency(ModelBuilder.CustomFrequency(name=name, namespace=NAMESPACE))
     for frequency, name, dtype, references in ATTRIBUTES:
         builder.add_custom_attribute(
@@ -53,6 +66,13 @@ def register_custom_attributes(builder: ModelBuilder) -> None:
                 namespace=NAMESPACE, default=default,
             )
         )
+
+
+def complete(ns, attributes: list, device) -> None:
+    """Empty arrays for the ``attributes`` Newton leaves out of ``ns`` (those of a frequency without rows)."""
+    for _, name, dtype, *_ in attributes:
+        if getattr(ns, name, None) is None:
+            setattr(ns, name, wp.zeros(0, dtype=dtype, device=device))
 
 
 def _resolve(explicit, rigidity, length, default, n: int) -> np.ndarray:
@@ -218,11 +238,16 @@ def add_colliding_rod(
 ) -> list[int]:
     """:func:`add_rod` with colliding proxies; pairs closer than ``contact_exclusion`` thicknesses along the rod
     are filtered. Without ``cfg.gap``, the capsules report pairs within ``contact_gap`` radii of touching (fast
-    motion is covered by the pipeline's speculative contacts); a larger gap adds far contacts that slow ADMM."""
+    motion is covered by the pipeline's speculative contacts); a larger gap adds far contacts that slow ADMM.
+    Without ``cfg``, the builder's default shape config with Coulomb ``mu = 0.3``."""
     if not kwargs.get("proxies", True):
         raise ValueError("add_colliding_rod: collision needs the capsule proxies (proxies=True)")
     radius = rod._resolve_radius() or 0.1
-    cfg = copy.copy(cfg or builder.default_shape_cfg)
+    if cfg is None:
+        cfg = copy.copy(builder.default_shape_cfg)
+        cfg.mu = 0.3
+    else:
+        cfg = copy.copy(cfg)
     if cfg.gap is None:
         cfg.gap = contact_gap * radius
     bodies = add_rod(builder, rod, cfg=cfg, collide=True, **kwargs)

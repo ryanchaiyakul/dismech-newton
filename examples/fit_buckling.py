@@ -109,7 +109,7 @@ def build(rods: int, ratios: np.ndarray | None = None, admm: bool = False):
     model.particle_mass.assign(model.particle_mass.numpy() * np.repeat(rho, NODES))
     d.edge_inertia.assign(d.edge_inertia.numpy() * np.repeat(rho, SEGMENTS))
     solver = ADMMDiSMechSolver(model, theta=1.0, iterations=50, tol=0.0) if admm else DiSMechSolver(model, theta=1.0)
-    solver.refresh_mass()
+    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
 
 
@@ -396,7 +396,7 @@ class WindowFit:
         d.triplet_params.assign(p.reshape(-1, 10).astype(np.float32))
         m.particle_mass.assign((self.m_true * self.rho).astype(np.float32))
         d.edge_inertia.assign((self.i_true * self.rho).astype(np.float32))
-        self.solver.refresh_mass()
+        self.solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
 
     def run(self):
         """The windows of :attr:`chunk`, taped: the losses in ``loss_x`` and ``loss_f``."""

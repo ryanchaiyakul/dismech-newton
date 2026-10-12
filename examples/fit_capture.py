@@ -140,7 +140,7 @@ def build(length=LENGTH, radius=RADIUS, mass=None, admm: bool = False):
         assert m is not None
         m.assign(m.numpy() * (mass / m.numpy().sum()))
     solver = ADMMDiSMechSolver(model) if admm else DiSMechSolver(model)
-    solver.refresh_mass()
+    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
 
 

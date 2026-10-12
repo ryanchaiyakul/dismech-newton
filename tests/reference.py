@@ -27,7 +27,7 @@ OUT = ROOT / ".cache" / "reference"
 EXAMPLES = ["cable_twist", "cable_pile", "cantilever", "overhand_knot", "plectoneme", "flagella", "fit_buckling"]
 EXTRA_ARGS = {"fit_buckling": ["--fresh"]}  # re-run the fit, not the cached replay
 EVERY = 10
-KEEP = ("friction", "self_contact")  # the old solvers' options the unified one takes
+KEEP = ("self_contact",)  # the old solvers' options the unified one takes
 
 
 def _install_unified() -> None:
@@ -36,6 +36,9 @@ def _install_unified() -> None:
 
     def variant(name, **fixed):
         def __init__(self, model, **options):
+            if "friction" in options:  # the old solvers' one mu: every shape's, so each contact's mean is it
+                model.shape_material_mu.fill_(options["friction"])
+                model.particle_mu = options["friction"]
             Unified.__init__(self, model, **fixed, **{k: v for k, v in options.items() if k in KEEP})
 
         return type(name, (Unified,), {"__init__": __init__})

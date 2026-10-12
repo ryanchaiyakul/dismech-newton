@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import warp as wp
-from newton import Contacts, Control, JointType, Model, State
+from newton import Contacts, Control, JointType, Model, ModelFlags, State
 from newton.solvers import SolverBase
 
 from .builder import add_rod, fix_segment, register_custom_attributes
@@ -82,6 +82,11 @@ class DiSMechSolver(SolverBase):
     def refresh_mass(self) -> None:
         """Re-read the masses and twist inertias after they changed."""
         self.mass.assign(dof_constants(self.model)[0])
+
+    def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        """``MODEL_PROPERTIES``: :meth:`refresh_mass`."""
+        if flags & ModelFlags.MODEL_PROPERTIES:
+            self.refresh_mass()
 
     def vjp(self, state_in: State, state_out: State, dt: float, contacts: ContactSnapshot | None = None) -> None:
         """Backpropagate the step from ``state_out``'s ``.grad``; ``contacts`` from :meth:`contact_snapshot`.

@@ -7,6 +7,8 @@ import warp as wp
 
 vec5f = wp.types.vector(5, float)
 vec10f = wp.types.vector(10, float)
+vec6f = wp.types.vector(6, float)
+vec12f = wp.types.vector(12, float)
 mat55f = wp.types.matrix((5, 5), float)
 vec11f = wp.types.vector(11, float)
 vec8f = wp.types.vector(8, float)

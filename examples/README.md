@@ -13,6 +13,7 @@ Read them in this order: each adds one thing to the last.
 | [`flagella.py`](flagella.py) | External forces on the nodes (`state.particle_f`: fluid drag) and contact between rods. |
 | [`fit_buckling.py`](fit_buckling.py) | Gradients through the ADMM solver: `wp.Tape`, `tape.backward` in a batched model, `solver.reset` per window, L-BFGS on stiffness, density and damping from noisy 30 fps recordings and a gripper force sensor (positions alone only fix their ratios), windowed so every rollout stays on the recorded buckling branch. |
 | [`fit_capture.py`](fit_capture.py) | The rod model itself from one RGB-D camera with simulated real-camera flaws: length, radius and held pose fitted as a chain of plain cylinders (analytic outline and depth), splats on it painted from the still; then gradients from pixels (gswarp in torch, the image loss handed back to `wp.Tape`): a coarse scan and L-BFGS on bend stiffness and damping from the same camera's video. Needs `--extra splat` and CUDA. |
+| [`shell_drape.py`](shell_drape.py) | A midedge shell on Newton's cloth mesh (`add_cloth_mesh`) draped over a sphere, shell contact with shapes; on the unified solver (`dismech_newton.unified`). |
 | [`experimental/franka_rod.py`](experimental/franka_rod.py) | Two-way coupling with a MuJoCo robot arm (`--extra mujoco`). |
 
 ```bash

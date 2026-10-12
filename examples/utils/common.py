@@ -100,10 +100,10 @@ class Drive:
 
 
 def contact_pipeline(model, radius: float, **options) -> newton.CollisionPipeline:
-    """The rod nodes are particles, but the solver reads rigid contacts only: skip the soft ones."""
-    options = {"contact_matching": "latest", **options}
-    return newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
-                                    speculative_contact_gap_max=2.0 * radius, **options)
+    """The rod nodes are particles, but the solver reads rigid contacts only: skip the soft ones unless
+    ``soft_contact_max`` (shell vertices) says otherwise."""
+    options = {"contact_matching": "latest", "soft_contact_max": 0, **options}
+    return newton.CollisionPipeline(model, verify_buffers=False, speculative_contact_gap_max=2.0 * radius, **options)
 
 
 # -- CUDA graphs ---------------------------------------------------------------------------

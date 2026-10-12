@@ -23,7 +23,7 @@ try:
 except ImportError:
     cudss = cusparse = None
 
-_CUDA_R_64F, _CUDA_R_32I = 1, 10  # cudaDataType codes
+_CUDA_R_32F, _CUDA_R_64F, _CUDA_R_32I = 0, 1, 10  # cudaDataType codes
 
 
 def _copy_values(dst: SymmetricCSR | GeneralCSR, src: SymmetricCSR | GeneralCSR) -> bool:
@@ -71,13 +71,15 @@ class _Residual:
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`); without ``refactorize``, factorised once. Capturable,
-    but not inside a device-side loop (a conditional graph node fails to instantiate)."""
+    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`); without ``refactorize``, factorised once; ``single``:
+    factorised and solved in float32 (2.5x faster on a GeForce's float64, for an ``A`` that only has to be
+    approximate). Capturable, but not inside a device-side loop (a conditional graph node fails to instantiate)."""
 
     graph_capturable = True
     loop_capturable = False
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False) -> None:
+    def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False,
+                 single: bool = False) -> None:
         if cudss is None:
             raise ImportError("CudssSolver requires nvmath (install the 'gpu' extra)")
         if not A.vals.device.is_cuda:
@@ -85,9 +87,14 @@ class CudssSolver:
         self.A = A
         self.device = A.vals.device
         self.refactorize = refactorize
+        if increment and single:
+            raise ValueError("CudssSolver: increment needs the float64 solve")
         self._residual = _Residual(A) if increment else None
-        self._b = wp.zeros(A.n, dtype=wp.float64, device=self.device)
-        self._x = wp.zeros(A.n, dtype=wp.float64, device=self.device)
+        dtype = wp.float32 if single else wp.float64
+        self._type = _CUDA_R_32F if single else _CUDA_R_64F
+        self._vals = wp.zeros(A.nnz, dtype=dtype, device=self.device) if single else A.vals
+        self._b = wp.zeros(A.n, dtype=dtype, device=self.device)
+        self._x = wp.zeros(A.n, dtype=dtype, device=self.device)
         self._handle = None
         self._factored = False
 
@@ -100,14 +107,16 @@ class CudssSolver:
             kind = cudss.MatrixType.GENERAL, cudss.MatrixViewType.FULL
         else:
             kind = cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
-        self._A = cudss.matrix_create_csr(A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, A.vals.ptr, _CUDA_R_32I,
-                                          _CUDA_R_32I, _CUDA_R_64F, *kind, cudss.IndexBase.ZERO)
-        self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
-        self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, _CUDA_R_64F, cudss.Layout.COL_MAJOR)
+        self._A = cudss.matrix_create_csr(A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, self._vals.ptr,
+                                          _CUDA_R_32I, _CUDA_R_32I, self._type, *kind, cudss.IndexBase.ZERO)
+        self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, self._type, cudss.Layout.COL_MAJOR)
+        self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, self._type, cudss.Layout.COL_MAJOR)
         self._execute(cudss.Phase.ANALYSIS)
         weakref.finalize(self, _destroy, self._handle, self._config, self._data, (self._xm, self._bm, self._A))
 
     def _execute(self, phase) -> None:
+        if phase == cudss.Phase.FACTORIZATION and self._vals is not self.A.vals:
+            wp.launch(_convert, dim=self.A.nnz, inputs=[self.A.vals], outputs=[self._vals], device=self.device)
         cudss.set_stream(self._handle, self.device.stream.cuda_stream)
         cudss.execute(self._handle, phase, self._config, self._data, self._A, self._xm, self._bm)
 
@@ -215,11 +224,11 @@ class ScipySolver:
             wp.copy(*reset)
 
 
-def sparse_solver(A: SymmetricCSR | GeneralCSR, refactorize: bool = True,
-                  increment: bool = False) -> CudssSolver | ScipySolver:
+def sparse_solver(A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False,
+                  single: bool = False) -> CudssSolver | ScipySolver:
     """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy."""
     if A.vals.device.is_cuda and cudss is not None:
-        return CudssSolver(A, refactorize, increment)
+        return CudssSolver(A, refactorize, increment, single)
     return ScipySolver(A, refactorize, increment)
 
 
@@ -458,7 +467,7 @@ def _convert(src: wp.array[Any], dst: wp.array[Any]):
 
 
 @wp.kernel
-def _accumulate(src: wp.array[wp.float64], increment: int, dst: wp.array[float]):
+def _accumulate(src: wp.array[Any], increment: int, dst: wp.array[float]):
     """``dst = src``, or ``dst += src`` with ``increment``."""
     i = wp.tid()
     v = float(src[i])

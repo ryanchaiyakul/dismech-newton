@@ -1,19 +1,25 @@
 """The flat DOF vector.
 
-DOF ``3 * node + k`` is ``particle_q[node][k]``; DOF ``3 * N + edge`` is ``edge_q[edge]``.
+DOF ``3 * node + k`` is ``particle_q[node][k]``; DOF ``3 * N + edge`` is ``edge_q[edge]``; DOF ``3 * N + E + hinge``
+is ``hinge_q[hinge]`` (a shell's midedge angle).
 """
 
 import numpy as np
 import warp as wp
 from newton import Model, ParticleFlags, State
 
+from .builder import ATTRIBUTES, STATE_ATTRIBUTES, complete
+
 
 def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
-    """Per-DOF ``(mass, fixed)``."""
+    """Per-DOF ``(mass, fixed)``; the midedge angles are massless."""
     der = model.dismech
+    complete(der, ATTRIBUTES, model.device)
     active = (model.particle_flags.numpy() & int(ParticleFlags.ACTIVE)) != 0
-    fixed = np.concatenate([np.repeat(~active, 3), der.edge_fixed.numpy() != 0])
-    mass = np.concatenate([np.repeat(model.particle_mass.numpy(), 3), der.edge_inertia.numpy()])
+    hinge_fixed = der.hinge_fixed.numpy()
+    fixed = np.concatenate([np.repeat(~active, 3), der.edge_fixed.numpy() != 0, hinge_fixed != 0])
+    mass = np.concatenate([np.repeat(model.particle_mass.numpy(), 3), der.edge_inertia.numpy(),
+                           np.zeros(len(hinge_fixed))])
     return (
         wp.array(mass.astype(np.float32), dtype=float, device=model.device),
         wp.array(fixed, dtype=wp.int32, device=model.device),
@@ -21,21 +27,27 @@ def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
 
 
 def flatten_state(state: State) -> None:
-    """Make ``state`` own flat ``dismech.q`` / ``qd``, node and edge arrays viewing them (idempotent)."""
+    """Make ``state`` own flat ``dismech.q`` / ``qd``, node, edge and hinge arrays viewing them (idempotent)."""
     ns = state.dismech
     if getattr(ns, "q", None) is not None:
         return
+    complete(ns, STATE_ATTRIBUTES, state.particle_q.device)
     n = state.particle_q.shape[0]
     nd = 3 * n
+    ne = ns.edge_q.shape[0]
     grad = state.particle_q.requires_grad
-    for flat_name, node_name, edge_name in (("q", "particle_q", "edge_q"), ("qd", "particle_qd", "edge_qd")):
-        flat = wp.zeros(nd + ns.edge_q.shape[0], dtype=float, device=state.particle_q.device, requires_grad=grad)
+    for flat_name, node_name, edge_name, hinge_name in (("q", "particle_q", "edge_q", "hinge_q"),
+                                                         ("qd", "particle_qd", "edge_qd", "hinge_qd")):
+        flat = wp.zeros(nd + ne + ns.hinge_q.shape[0], dtype=float, device=state.particle_q.device,
+                        requires_grad=grad)
         nodes = flat[:nd].reshape((n, 3)).view(wp.vec3)
-        edges = flat[nd:]
         nodes.assign(getattr(state, node_name))
-        edges.assign(getattr(ns, edge_name))
         setattr(state, node_name, nodes)
-        setattr(ns, edge_name, edges)
+        for name, start, stop in ((edge_name, nd, nd + ne), (hinge_name, nd + ne, flat.shape[0])):
+            if stop > start:  # Warp has no empty slice; an empty array stays
+                view = flat[start:stop]
+                view.assign(getattr(ns, name))
+                setattr(ns, name, view)
         setattr(ns, flat_name, flat)
 
 

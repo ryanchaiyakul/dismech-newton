@@ -27,6 +27,7 @@ The dataset, the fit and the replays are cached in ``.cache/examples`` (``--fres
 """
 
 import time
+from types import SimpleNamespace
 
 import newton
 import newton.examples
@@ -37,10 +38,9 @@ from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale, smoothstep
 
-from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, flatten_state, suspended_tape
-from dismech_newton.solver import advance_frames_kernel
-from dismech_newton.strains import strain_gradient, vec5f, vec10f
-from dismech_newton.triplet import advance_ref_twist_kernel, geometry_at, linear_energy, vec5i
+from dismech_newton import DiSMechSolver, add_rod, flatten_state, suspended_tape
+from dismech_newton.builder import vec5f, vec10f
+from dismech_newton.rod import Rod, rod_dofs, rod_jacobian, vec11f
 
 # -- the rod and the truth -----------------------------------------------------------------
 LENGTH, SEGMENTS, RADIUS = 0.5, 24, 0.01
@@ -108,41 +108,26 @@ def build(rods: int, ratios: np.ndarray | None = None, admm: bool = False):
     d.triplet_params.assign(p.reshape(-1, 10))
     model.particle_mass.assign(model.particle_mass.numpy() * np.repeat(rho, NODES))
     d.edge_inertia.assign(d.edge_inertia.numpy() * np.repeat(rho, SEGMENTS))
-    solver = ADMMDiSMechSolver(model, theta=1.0, iterations=50, tol=0.0) if admm else DiSMechSolver(model, theta=1.0)
+    solver = DiSMechSolver(model, iterations=50) if admm else DiSMechSolver(model, exact=True, iterations=20)
     solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
-
-
-STATE = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q")
 
 
 def start(solver, st, src, q=None, qd=None):
     """``st`` = ``src`` moved to the DOFs ``q``, with velocities ``qd`` (else at rest). The edge frames, reference
     twists and stored strains are state too: they are carried over from ``src`` as at the end of a step, or the rod
     is kicked. The solver starts its next step from ``st`` (no warm start)."""
-    for k in STATE:
-        getattr(st.dismech, k).assign(getattr(src.dismech, k))
-    if q is not None:
-        st.dismech.q.assign(q)
+    st.dismech.q.assign(src.dismech.q if q is None else q)
     if qd is None:
         st.dismech.qd.zero_()
     else:
         st.dismech.qd.assign(qd)
-    d, tr = solver.der, solver.triplets
-    wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0],
-              inputs=[src.particle_q, st.particle_q, d.edge_node0, d.edge_node1, src.dismech.edge_d1_q],
-              outputs=[st.dismech.edge_d1_q])
-    wp.launch(advance_ref_twist_kernel, dim=tr.count,
-              inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, src.dismech.triplet_ref_twist_q],
-              outputs=[st.dismech.triplet_ref_twist_q])
-    tr.measure(st, st.dismech.triplet_strain_q)
-    solver.reset(st)
+    solver.restart(st, src)
 
 
 def rest_state(model, solver):
     st = model.state()
-    flatten_state(st)
-    solver.triplets.measure(st, st.dismech.triplet_strain_q)
+    solver.restart(st, st)  # its strains measured
     return st
 
 
@@ -183,16 +168,22 @@ def copy(src: wp.array[float], dst: wp.array[float]):
 
 
 @wp.kernel
-def grip_force(q: wp.array[float], edge_d1: wp.array[wp.vec3], ref_twist: wp.array[float], conn: wp.array[vec5i],
-               edge_length: wp.array[float], params: wp.array[vec10f], rest: wp.array[vec5f],
+def grip_force(q: wp.array[float], v: Rod, params: wp.array[vec10f], rest: wp.array[vec5f],
                strain_prev: wp.array[vec5f], dt: float, force: wp.array[wp.vec3]):
     """The force sensor: what the triplet ``t`` adds to the force its rod's gripped nodes take from the rest of the
-    rod (the gradient of its elastic and viscous stresses)."""
+    rod (the gradient of its elastic and viscous stresses, ``J^T sigma``; ``v``'s frames current)."""
     t = wp.tid()
-    c = conn[t]
-    geom = geometry_at(q, q, edge_d1, ref_twist[t], c, edge_length, 3 * NODES * (conn.shape[0] // NT))
-    sigma, _ = linear_energy(geom.strain, strain_prev[t], rest[t], params[t], dt)
-    g = strain_gradient(geom, sigma)
+    c = v.conn[t]
+    d = rod_dofs(v, t)
+    x = vec11f()
+    for k in range(11):
+        x[k] = q[d[k]]
+    eps, J = rod_jacobian(x, v, t)
+    p = params[t]
+    sigma = vec5f()
+    for j in range(5):
+        sigma[j] = p[j] * (eps[j] - rest[t][j]) + p[5 + j] / dt * (eps[j] - strain_prev[t][j])
+    g = wp.transpose(J) * sigma
     a = (t // NT) * NODES + NODES - 2  # the first gripped node
     f = (wp.vec3(g[0], g[1], g[2]) * wp.where(c[2] >= a, 1.0, 0.0)
          + wp.vec3(g[4], g[5], g[6]) * wp.where(c[3] >= a, 1.0, 0.0)
@@ -202,10 +193,9 @@ def grip_force(q: wp.array[float], edge_d1: wp.array[wp.vec3], ref_twist: wp.arr
 
 def sense(solver, q, new, old, force):
     """The gripper's force in the state ``new`` (its DOFs ``q``), just stepped from ``old``, added to ``force``."""
-    tr = solver.triplets
-    wp.launch(grip_force, dim=tr.count,
-              inputs=[q, new.dismech.edge_d1_q, new.dismech.triplet_ref_twist_q, tr.conn, solver.der.edge_length,
-                      tr.params, tr.rest, old.dismech.triplet_strain_q, DT],
+    tr, s = solver.triplets, new.dismech
+    v = tr.bind(SimpleNamespace(q=q, edge_d1_q=s.edge_d1_q, triplet_ref_twist_q=s.triplet_ref_twist_q))
+    wp.launch(grip_force, dim=tr.count, inputs=[q, v, tr.params, tr.rest, old.dismech.triplet_strain_q, DT],
               outputs=[force])
 
 
@@ -542,7 +532,9 @@ def results(fresh: bool = False) -> dict:
         x, force = replay(data, trials, np.exp(out["theta"]))
         return dict(trials=trials, x=x, force=force)
 
-    shown = cached("fit_buckling-replay", dict(setup=setup, version=3), replays, fresh)
+    # keyed by the fit too: replays of another fit's iterates would not match its parameters
+    shown = cached("fit_buckling-replay", dict(setup=setup, version=3, theta=np.round(out["theta"], 6).tolist()),
+                   replays, fresh)
     return dict(data=data, **out, **shown)
 
 

@@ -31,7 +31,7 @@ from utils.common import (
     smoothstep,
 )
 
-from dismech_newton import ADMMDiSMechSolver
+from dismech_newton import DiSMechSolver
 
 A, RHO, E, NU = 1.55e-3, 1200.0, 1.3e6, 0.5  # radius [m], density, Young's modulus, Poisson's ratio
 B = E * np.pi * A**4 / 4.0  # bending stiffness EI
@@ -40,7 +40,7 @@ EA = E * np.pi * A**2
 
 
 class Example(CableExample):
-    substeps = 16  # at 4, the end loop snaps through its neck within a step under load
+    substeps = 32  # at 4, the end loop snaps through its neck within a step under load; at 16, F and M sit 2% off
     length, slack = 0.5, 0.3
     t_push, t_settle = 2.0, 2.0
     measure_every = plot_every = 15  # frames
@@ -66,13 +66,13 @@ class Example(CableExample):
         nodes = np.column_stack((x, np.zeros_like(x), 0.5 + z))
         builder = newton.ModelBuilder(gravity=0.0)
         rod = newton.Rod(nodes, radius=A, youngs_modulus=E, shear_modulus=E / (2.0 * (1.0 + NU)))
-        bodies = ADMMDiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=RHO),
+        bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=RHO),
                                            bend_damping=damping, twist_damping=damping)
         for body in (bodies[0], bodies[-1]):
-            ADMMDiSMechSolver.fix_segment(builder, body)
+            DiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        solver = ADMMDiSMechSolver(model, friction=friction, iterations=200) # phases through otherwise
-        self.start(None if display else viewer, model, solver, A)
+        solver = DiSMechSolver(model, friction=friction)
+        self.start(None if display else viewer, model, solver)
         self.end = Drive(model, segment_dofs(model, bodies[-1]))  # the last segment's nodes and twist
         self.drives = (self.end,)
         self.t_end = self.duration(self.turns, self.twist_rate)
@@ -135,7 +135,6 @@ class Example(CableExample):
         shown = self.display or self
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(shown.state_0)
-        self.viewer.log_contacts(shown.contacts, shown.state_0)
         self.viewer.end_frame()
 
     def image(self, size: tuple[int, int] = (400, 400)) -> np.ndarray:

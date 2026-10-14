@@ -5,12 +5,9 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![CUDA 13](https://img.shields.io/badge/CUDA-13-76B900)
 
-Discrete elastic rods for [NVIDIA Newton](https://github.com/newton-physics/newton).
+Discrete elastic rods and shells for [NVIDIA Newton](https://github.com/newton-physics/newton).
 
-- **`ADMMDiSMechSolver`**: implicit DER solved with ADMM, inspired by
-  [Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/), with rod-rod, rod-shape and
-  rod-ground contact and Coulomb friction.
-- **`DiSMechSolver`**: implicit DER solved with Newton-Raphson.
+**`DiSMechSolver`**: implicit discrete rods and shells inspired by [Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/).
 
 ## Examples
 

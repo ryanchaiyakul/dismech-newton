@@ -40,13 +40,6 @@ viewer = [
     "matplotlib>=3.8",
     "viser>=1.1.1",
 ]
-mujoco = [
-    "gitpython>=3.1",
-    "mujoco~=3.12.0",
-    "mujoco-warp~=3.12.0",
-    "pycollada>=0.9",
-    "trimesh>=4",
-]
 splat = [
     "torch>=2.9",
     "gswarp>=1.1",
@@ -69,6 +62,7 @@ torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_pla
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.10",
+    "usd-core>=25.11",  # tests/test_splat.py's USD export
 ]
 
 [tool.pytest.ini_options]

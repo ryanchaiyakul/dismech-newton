@@ -11,41 +11,27 @@ node and an edge decide their shared boundary with the same :func:`_ahead`. A bo
 a rod's node only if its edges lead away from the body, else the edge meets it at its interior's closest point.
 """
 
-import copy
-
 import numpy as np
 import warp as wp
-from newton import GeoType, Model, ModelBuilder, Rod, ShapeFlags, State
+from newton import GeoType, Model, ShapeFlags, State
 from newton._src.geometry import kernels as G  # its shape SDFs; triangle_...: exact zeros off the closest feature
 
-from ..builder import add_rod
-from ..dofs import node
+from .builder import _P
 from .contact import Slots, clear, contact_point, emit, engaged, pair_fixed
+from .state import node
 
-ROD_GROUP = -0x5DE7  # every rod capsule's collision group: a negative group collides with all but itself
 SLOTS = 8  # contacts per feature (node or edge): an edge on a sheet crosses several of its edges
 EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod are not contacts
 OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
 BISECT = 20  # bisections for a rod edge's closest point to a shape
 
 
-def add_colliding_rod(builder: ModelBuilder, rod: Rod, *, cfg: ModelBuilder.ShapeConfig | None = None,
-                      **kwargs) -> list[int]:
-    """:func:`~dismech_newton.add_rod` with colliding capsule proxies (their flags and ``mu`` are the rod's) in
-    :data:`ROD_GROUP`, so a collision pipeline, whose contacts the solver ignores, never pairs two of them. Without
-    ``cfg``, the builder's default with ``mu = 0.3``."""
-    default = cfg is None
-    cfg = copy.copy(builder.default_shape_cfg if default else cfg)
-    cfg.mu = 0.3 if default else cfg.mu
-    cfg.collision_group = ROD_GROUP
-    return add_rod(builder, rod, cfg=cfg, collide=True, **kwargs)
-
-
 @wp.struct
 class Mesh:
     """What collides: per edge (the rods', then the shells') its nodes, whether it collides and (a shell's) its faces'
-    opposite nodes (-1); per triangle its nodes and edges (edge ``k`` opposite node ``k``); per node its neighbours along colliding edges (CSR), radius, ``mu``, rod (-1 off rods), arc length and rest
-    position (flat, the model's initial state); per rod its length if closed, else 0."""
+    opposite nodes (-1); per triangle its nodes and edges (edge ``k`` opposite node ``k``); per node its neighbours
+    along colliding edges (CSR), radius, ``mu``, rod (-1 off rods), arc length and rest position (flat, the model's
+    initial state); per rod its length if closed, else 0."""
 
     edges: wp.array[wp.vec2i]
     edge_on: wp.array[wp.int32]
@@ -64,8 +50,9 @@ class Mesh:
 
 def _mesh(model: Model, device) -> Mesh:
     der = model.dismech
-    n0, n1, length, edge_body = (getattr(der, k).numpy() for k in ("edge_node0", "edge_node1", "edge_length",
-                                                                    "edge_body"))
+    n0, n1, length, edge_body = (
+        getattr(der, k).numpy() for k in ("edge_node0", "edge_node1", "edge_length", "edge_body")
+    )
     nb, n = max(model.body_count, 1), model.particle_count
     shape_body = model.shape_body.numpy()
     own = (shape_body >= 0) & ((model.shape_flags.numpy() & int(ShapeFlags.COLLIDE_SHAPES)) != 0)
@@ -88,11 +75,12 @@ def _mesh(model: Model, device) -> Mesh:
         if rod[start] == len(rod_len):
             rod_len.append(a if s == start else 0.0)
     # The shells' edges: edge k of a triangle is opposite its node k; an edge's faces' opposite nodes.
-    nf = model.custom_frequency_counts.get("dismech:face", 0)
+    nf = model.custom_frequency_counts.get(_P + "face", 0)
     tris = np.stack([getattr(der, f"face_node{k}").numpy() for k in range(3)], 1) if nf else np.zeros((0, 3), int)
     ends = np.stack([tris[:, [1, 2, 0]], tris[:, [2, 0, 1]]], 2).reshape(-1, 2)
-    uniq, first, inv, count = np.unique(np.sort(ends, 1), axis=0, return_index=True, return_inverse=True,
-                                        return_counts=True)
+    uniq, first, inv, count = np.unique(
+        np.sort(ends, 1), axis=0, return_index=True, return_inverse=True, return_counts=True
+    )
     inv = inv.ravel()
     last = len(inv) - 1 - np.unique(np.sort(ends, 1)[::-1], axis=0, return_index=True)[1]
     opp = np.stack([tris.ravel()[first], np.where(count > 1, tris.ravel()[last], -1)], 1)
@@ -101,15 +89,21 @@ def _mesh(model: Model, device) -> Mesh:
     a, b = edges[edge_on, 0], edges[edge_on, 1]
     src, dst = np.concatenate([a, b]), np.concatenate([b, a])
     m = Mesh()
-    for name, value, dtype in (("edges", edges, wp.vec2i), ("edge_on", edge_on.astype(np.int32), wp.int32),
-                               ("edge_opp", np.concatenate([np.full((len(n0), 2), -1), opp]), wp.vec2i),
-                               ("faces", tris, wp.vec3i), ("face_edge", len(n0) + inv.reshape(-1, 3), wp.vec3i),
-                               ("adj_ptr", np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))]), wp.int32),
-                               ("adj", dst[np.argsort(src, kind="stable")], wp.int32),
-                               ("radius", model.particle_radius.numpy() if n else np.zeros(1), float),
-                               ("mu", mu, float), ("rod", rod, wp.int32), ("arc", arc, float),
-                               ("rest", model.particle_q.numpy().ravel() if n else np.zeros(3), float),
-                               ("rod_len", rod_len + [0.0], float)):
+    for name, value, dtype in (
+        ("edges", edges, wp.vec2i),
+        ("edge_on", edge_on.astype(np.int32), wp.int32),
+        ("edge_opp", np.concatenate([np.full((len(n0), 2), -1), opp]), wp.vec2i),
+        ("faces", tris, wp.vec3i),
+        ("face_edge", len(n0) + inv.reshape(-1, 3), wp.vec3i),
+        ("adj_ptr", np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))]), wp.int32),
+        ("adj", dst[np.argsort(src, kind="stable")], wp.int32),
+        ("radius", model.particle_radius.numpy() if n else np.zeros(1), float),
+        ("mu", mu, float),
+        ("rod", rod, wp.int32),
+        ("arc", arc, float),
+        ("rest", model.particle_q.numpy().ravel() if n else np.zeros(3), float),
+        ("rod_len", rod_len + [0.0], float),
+    ):
         value = np.asarray(value)
         setattr(m, name, wp.array(value if dtype is float else value.astype(np.int32), dtype=dtype, device=device))
     return m
@@ -122,50 +116,66 @@ class Offset:
     the step, grown by a contact's reach, and are refit each step (graph-capturable); shapes are culled by their
     bounding spheres. Without ``self_contact``, no rod-rod or shell-shell pairs."""
 
-    def __init__(self, model: Model, fixed: wp.array, *, engage_gap: float, self_contact: bool):
+    def __init__(self, model: Model, fixed: wp.array, *, engage_gap: float, self_contact: bool,
+                 friction: float | None = None):
         dev = wp.get_device(model.device)
         self.mesh = mesh = _mesh(model, dev)
-        self.fixed, self.self_contact, self.engage_gap = fixed, int(self_contact), engage_gap
+        self.fixed, self.self_contact = fixed, int(self_contact)
         self.num_nodes, self.num_edges, self.num_faces = model.particle_count, mesh.edges.shape[0], mesh.faces.shape[0]
+        self.shape_key0 = self.num_nodes + self.num_edges + self.num_faces  # shape k's contact key: shape_key0 + k
+        self.num_rod_edges = model.dismech.edge_node0.shape[0]
         self.pad = 2.0 * float(mesh.radius.numpy().max()) * (1.0 + engage_gap)
         e, x = mesh.edges.numpy(), model.particle_q.numpy()
         elems = np.concatenate([e[:, [0, 1, 1]], mesh.faces.numpy()])  # the edges, then the triangles
         self._elems = wp.array(elems, dtype=wp.vec3i, device=dev)
-        self._lo, self._hi = (wp.array(f(x[elems], axis=1) + sign * self.pad, dtype=wp.vec3, device=dev)
-                              for f, sign in ((np.min, -1.0), (np.max, 1.0)))
+        self._lo, self._hi = (
+            wp.array(f(x[elems], axis=1) + sign * self.pad, dtype=wp.vec3, device=dev)
+            for f, sign in ((np.min, -1.0), (np.max, 1.0))
+        )
         E = self.num_edges
         self._bvh = wp.Bvh(self._lo[:E], self._hi[:E])
         self._face_bvh = wp.Bvh(self._lo[E:], self._hi[E:]) if self.num_faces else None
-        self.overflow = wp.zeros(1, dtype=wp.int32, device=dev)  # contacts beyond a feature's slots
         self.bodies = _bodies(model, dev)
+        if friction is not None:  # every contact's mu: each side's
+            mesh.mu.fill_(friction)
+            self.bodies.mu = wp.full(self.bodies.mu.shape[0], friction, dtype=float, device=dev)
+        sc = self.scene = Scene()  # the step's positions and slots set in fill
+        sc.m, sc.b, sc.fixed, sc.engage, sc.self_contact = mesh, self.bodies, fixed, engage_gap, self.self_contact
+        sc.num_nodes = self.num_nodes
+        sc.overflow = self.overflow = wp.zeros(1, dtype=wp.int32, device=dev)  # contacts beyond a feature's slots
 
     def slots(self) -> int:
-        return (self.num_nodes + self.num_edges) * SLOTS
+        """None where no pair can touch (recording a step for its adjoint then reads no count)."""
+        on = self.mesh.edge_on.numpy()
+        rods, shells = bool(on[: self.num_rod_edges].any()), self.num_faces > 0
+        if (rods or shells) and (self.self_contact or self.bodies.shapes.shape[0] or (rods and shells)):
+            return (self.num_nodes + self.num_edges) * SLOTS
+        return 0
 
     def fill(self, state_in: State, dt: float, q: wp.array, s: Slots, prev: Slots):
         """The contacts for the step to the prediction ``q``, warm-started from ``prev``."""
-        q0, dev, m = state_in.dismech.q, self.fixed.device, self.mesh
+        sc, b, dev = self.scene, self.bodies, self.fixed.device
+        sc.q, sc.q1, sc.s, sc.prev = state_in.dismech.q, q, s, prev
         wp.launch(_bounds_kernel, dim=self.num_edges + self.num_faces,
-                  inputs=[q0, q, self._elems, self.pad, self._lo, self._hi], device=dev)
+                  inputs=[sc.q, q, self._elems, self.pad, self._lo, self._hi], device=dev)
         self._bvh.refit()
         faces = wp.uint64(0)
         if self._face_bvh is not None:
             self._face_bvh.refit()
             faces = self._face_bvh.id
-        b = self.bodies
         b.body_q, b.h = state_in.body_q if state_in.body_q is not None else b.body_q, dt
         b.body_qd = state_in.body_qd if state_in.body_qd is not None else b.body_qd
+        sc.b = b
         wp.launch(_offset_kernel, dim=self.num_nodes + self.num_edges,
-                  inputs=[self._bvh.id, faces, self._lo, self._hi, q0, q, m, b, self.num_nodes, self.self_contact,
-                          self.engage_gap, self.fixed, prev, s, self.overflow], device=dev)
+                  inputs=[self._bvh.id, faces, self._lo, self._hi, sc], device=dev)
 
 
 @wp.struct
 class Bodies:
-    """Newton's shapes as nodes and rod edges meet them: per shape its geometry (type, scale, mesh, mesh properties), its
-    frame in its body (-1: the world's), margin, ``mu`` and bounding radius; the shapes that take part (colliding
-    with particles, not a rod's capsule); the bodies' poses, velocities and centres of mass at the step's start; the step
-    ``h``."""
+    """Newton's shapes as nodes and rod edges meet them: per shape its geometry (type, scale, mesh, mesh properties),
+    its frame in its body (-1: the world's), margin, ``mu`` and bounding radius; the shapes that take part (colliding
+    with particles, not a rod's capsule); the bodies' poses, velocities and centres of mass at the step's start; the
+    step ``h``."""
 
     kind: wp.array[wp.int32]
     scale: wp.array[wp.vec3]
@@ -191,8 +201,8 @@ def _bodies(model: Model, device) -> Bodies:
     on &= ~np.isin(body, edge_body[edge_body >= 0])  # not a rod's capsule
     on &= kind != int(GeoType.HFIELD)  # not supported
     props = getattr(model, "_shape_mesh_properties", None)
-    b.kind, b.scale, b.source, b.xform, b.body = (model.shape_type, model.shape_scale, model.shape_source_ptr,
-                                                  model.shape_transform, model.shape_body)
+    b.kind, b.scale, b.source = model.shape_type, model.shape_scale, model.shape_source_ptr
+    b.xform, b.body = model.shape_transform, model.shape_body
     b.margin, b.mu, b.radius = model.shape_margin, model.shape_material_mu, model.shape_collision_radius
     b.props = props if props is not None else wp.zeros(len(kind), dtype=wp.int32, device=device)
     b.shapes = wp.array(np.flatnonzero(on), dtype=wp.int32, device=device)
@@ -264,7 +274,9 @@ def _anchor(b: Bodies, k: int, x: wp.vec3):
     dx = wp.vec3(0.0)
     if b.body_qd.shape[0] > 0:
         v = b.body_qd[j]
-        dx = b.h * (wp.spatial_top(v) + wp.cross(wp.spatial_bottom(v), x - wp.transform_point(b.body_q[j], b.body_com[j])))
+        dx = b.h * (
+            wp.spatial_top(v) + wp.cross(wp.spatial_bottom(v), x - wp.transform_point(b.body_q[j], b.body_com[j]))
+        )
     return x + dx, dx
 
 
@@ -301,14 +313,16 @@ def _in_edge_region(q: wp.array[float], m: Mesh, e: int, x: wp.vec3) -> bool:
 
 
 @wp.func
-def _excluded(q: wp.array[float], m: Mesh, a0: int, a1: int, sa: float, b0: int, b1: int, sb: float,
-              cutoff: float) -> bool:
+def _excluded(
+    q: wp.array[float], m: Mesh, a0: int, a1: int, sa: float, b0: int, b1: int, sb: float, cutoff: float
+) -> bool:
     """Both points on one rod, closer than ``cutoff`` along it (around a loop either way)."""
     r = m.rod[a0]
     if r < 0 or m.rod[b0] != r:
         return False
-    d = wp.abs(m.arc[a0] + sa * wp.length(node(q, a1) - node(q, a0)) - m.arc[b0]
-               - sb * wp.length(node(q, b1) - node(q, b0)))
+    d = wp.abs(
+        m.arc[a0] + sa * wp.length(node(q, a1) - node(q, a0)) - m.arc[b0] - sb * wp.length(node(q, b1) - node(q, b0))
+    )
     if m.rod_len[r] > 0.0:
         d = wp.min(d, m.rod_len[r] - d)
     return d < cutoff
@@ -330,22 +344,40 @@ def _closest_st(q: wp.array[float], a0: int, a1: int, b0: int, b1: int) -> wp.ve
     return wp.vec2(b * wp.dot(d2, r) - e * wp.dot(d1, r), a * wp.dot(d2, r) - b * wp.dot(d1, r)) / den
 
 
+@wp.struct
+class Scene:
+    """A step's collision: positions at its start ``q`` and its prediction ``q1``, what collides, the shapes, the fixed
+    DOFs, the slots ``s`` filled (warm-started from ``prev``), the overflow count; ``engage``: the engage gap."""
+
+    q: wp.array[float]
+    q1: wp.array[float]
+    m: Mesh
+    b: Bodies
+    fixed: wp.array[wp.int32]
+    s: Slots
+    prev: Slots
+    overflow: wp.array[wp.int32]
+    engage: float
+    self_contact: int
+    num_nodes: int
+
+
 @wp.func
-def _keep(s: Slots, prev: Slots, base: int, key: int, q: wp.array[float], q1: wp.array[float], engage: float,
-          m: Mesh, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float, mu: float,
-          fixed: wp.array[wp.int32], overflow: wp.array[wp.int32]):
+def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float,
+          mu: float):
     """Emit the contact into a free slot of the feature's from ``base``, unless it is there already (found through
     another triangle or edge) or :func:`~.contact.engaged` drops it (a shell's with its motion), as
     :class:`~.contact.ContactBlock` would. ``n``: the normal, or zero for ``C q``'s direction; ``xb``, ``db``: a
     body's point at the end of the step and its motion over it. Rod-rod pairs are warm-started by ``key`` (a light
     shell vertex's warm-started impulse lingers and pumps energy); shell-shell points closer than :data:`EXCLUSION`
     thicknesses at rest are not contacts (the rods' rule is :func:`_excluded`)."""
-    d = contact_point(q, pair, w, xb - db)
+    s, prev, m = sc.s, sc.prev, sc.m
+    d = contact_point(sc.q, pair, w, xb - db)
     if wp.length(n) == 0.0:
         if wp.length(d) < 1.0e-9:
             return
         n = wp.normalize(d)
-    if pair_fixed(fixed, pair):
+    if pair_fixed(sc.fixed, pair):
         return
     shells = True  # all shell nodes
     rods = True  # all rod nodes
@@ -360,7 +392,7 @@ def _keep(s: Slots, prev: Slots, base: int, key: int, q: wp.array[float], q1: wp
         if rods and prev.key[base + k] == key:
             warm = base + k
     if (warm < 0 or prev.rho[warm] * wp.length(prev.u[warm]) == 0.0) and not engaged(
-        q, q1, pair, w, n, xb, th, engage, not rods
+        sc.q, sc.q1, pair, w, n, xb, th, sc.engage, not rods
     ):
         return
     slot = int(-1)
@@ -370,18 +402,38 @@ def _keep(s: Slots, prev: Slots, base: int, key: int, q: wp.array[float], q1: wp
         if slot < 0 and s.key[base + k] < 0:
             slot = base + k
     if slot < 0:
-        wp.atomic_add(overflow, 0, 1)
+        wp.atomic_add(sc.overflow, 0, 1)
         return
     s.key[slot] = key
-    emit(s, slot, q, pair, w, n, xb, db, th, mu)
+    emit(s, slot, sc.q, pair, w, n, xb, db, th, mu)
     if warm >= 0:
         s.u[slot] = prev.u[warm]
         s.rho[slot] = prev.rho[warm]
 
 
+@wp.func
+def _keep_pair(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, th: float, mu: float):
+    """:func:`_keep` for two features of rods and shells: the normal along ``C q``, no anchor."""
+    _keep(sc, base, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu)
+
+
+@wp.func
+def _keep_shape(sc: Scene, base: int, k: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3, th: float):
+    """:func:`_keep` against shape ``k``, at its world point ``x`` (the step's start) with the normal ``n``."""
+    xb, db = _anchor(sc.b, k, x)
+    key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + k
+    _keep(sc, base, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]))
+
+
 @wp.kernel
-def _bounds_kernel(q0: wp.array[float], q1: wp.array[float], elems: wp.array[wp.vec3i], pad: float,
-                   lo: wp.array[wp.vec3], hi: wp.array[wp.vec3]):
+def _bounds_kernel(
+    q0: wp.array[float],
+    q1: wp.array[float],
+    elems: wp.array[wp.vec3i],
+    pad: float,
+    lo: wp.array[wp.vec3],
+    hi: wp.array[wp.vec3],
+):
     """An edge's or triangle's box over the step (start ``q0``, prediction ``q1``), grown by ``pad``."""
     i = wp.tid()
     a = wp.vec3(1.0e30)
@@ -394,91 +446,77 @@ def _bounds_kernel(q0: wp.array[float], q1: wp.array[float], elems: wp.array[wp.
     hi[i] = b + wp.vec3(pad)
 
 
-@wp.kernel
-def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], hi: wp.array[wp.vec3],
-                   q: wp.array[float], q1: wp.array[float], m: Mesh, bodies: Bodies, num_nodes: int, self_contact: int,
-                   engage: float, fixed: wp.array[wp.int32], prev: Slots, s: Slots, overflow: wp.array[wp.int32]):
-    """Thread ``i < num_nodes``: node ``i``'s contacts with rods (node-node, node-edge), shapes and triangles, else
-    edge ``i - num_nodes``'s with shapes (a rod's) and edges, into its :data:`SLOTS` from ``i * SLOTS``. Query: the
-    node's box over the step, or the edge's own (the trees' boxes carry the pad). A rod's point must also be a local
-    minimum along its rod (in its own node's block); a shell vertex's need not (vertex-facet is one-sided)."""
-    i = wp.tid()
-    base = i * SLOTS
-    for k in range(SLOTS):
-        clear(s, base + k)
-    key0 = num_nodes + m.edges.shape[0] + m.faces.shape[0]  # shape k's key: key0 + k
-    if i >= num_nodes:
-        e = i - num_nodes
-        if m.edge_on[e] == 0:
-            return
-        a0 = m.edges[e][0]
-        a1 = m.edges[e][1]
-        xa = node(q, a0)
-        xb = node(q, a1)
-        for j in range(bodies.shapes.shape[0] if m.rod[a0] >= 0 else 0):  # a rod's interior against shapes
-            k = bodies.shapes[j]
-            X = _shape_pose(bodies, k)
-            th = 0.5 * (m.radius[a0] + m.radius[a1]) + bodies.margin[k]
-            reach = (1.0 + engage) * th + wp.max(wp.length(node(q1, a0) - xa), wp.length(node(q1, a1) - xb))
-            c = wp.transform_get_translation(X)
-            t = wp.clamp(_ahead(c, xa, xb) / wp.length_sq(xb - xa), 0.0, 1.0)
-            if wp.length(c - wp.lerp(xa, xb, t)) > bodies.radius[k] + reach:
-                continue
-            far = reach + wp.length(xb - xa)  # a mesh's query radius
-            d, n = _shape_gap(bodies, k, X, xa, far)
-            d1, n1 = _shape_gap(bodies, k, X, xb, far)
-            if _ahead(xa - n, xa, xb) <= 0.0 or _ahead(xb - n1, xb, xa) <= 0.0:
-                continue  # an end is the closest: its node's pair
-            t0 = float(0.0)
-            t1 = float(1.0)
-            for it in range(BISECT):  # the gap's slope along the edge changes sign once on a convex shape
-                d, n = _shape_gap(bodies, k, X, wp.lerp(xa, xb, 0.5 * (t0 + t1)), far)
-                if wp.dot(n, xb - xa) < 0.0:
-                    t0 = 0.5 * (t0 + t1)
-                else:
-                    t1 = 0.5 * (t0 + t1)
-            t = 0.5 * (t0 + t1)
-            d, n = _shape_gap(bodies, k, X, wp.lerp(xa, xb, t), far)
-            if d > reach:
-                continue
-            x, dx = _anchor(bodies, k, wp.lerp(xa, xb, t) - d * n)
-            _keep(s, prev, base, key0 + k, q, q1, engage, m, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - t, t, 0.0, 0.0),
-                  n, x, dx, th, 0.5 * (m.mu[a0] + bodies.mu[k]), fixed, overflow)
-        query = wp.bvh_query_aabb(bvh, lo[e], hi[e])
-        f = int(0)
-        while wp.bvh_query_next(query, f):
-            b0 = m.edges[f][0]
-            b1 = m.edges[f][1]
-            if f > e or m.edge_on[f] == 0 or b0 == a0 or b0 == a1 or b1 == a0 or b1 == a1:
-                continue  # the higher edge's pair (a shell's, not a long rod edge's); or neighbours
-            if (m.rod[a0] >= 0) == (m.rod[b0] >= 0) and self_contact == 0:
-                continue
-            st = _closest_st(q, a0, a1, b0, b1)
-            if wp.min(st) <= OPEN or wp.max(st) >= 1.0 - OPEN:
-                continue  # an end: a node's pair (found exactly on a node, rounding would duplicate it)
-            if _excluded(q, m, a0, a1, st[0], b0, b1, st[1],
-                         EXCLUSION * 0.5 * (m.radius[a0] + m.radius[a1] + m.radius[b0] + m.radius[b1])):
-                continue
-            _keep(s, prev, base, num_nodes + f, q, q1, engage, m, wp.vec4i(a0, a1, b0, b1),
-                  wp.vec4(1.0 - st[0], st[0], st[1] - 1.0, -st[1]), wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0),
-                  0.5 * (m.radius[a0] + m.radius[a1] + m.radius[b0] + m.radius[b1]), 0.5 * (m.mu[a0] + m.mu[b0]),
-                  fixed, overflow)
-        return
-    if m.adj_ptr[i + 1] == m.adj_ptr[i]:
-        return  # not on a colliding rod or a shell
+@wp.func
+def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, base: int):
+    """Edge ``e``'s contacts: a rod's interior against shapes, and against higher edges' interiors."""
+    m, b, q = sc.m, sc.b, sc.q
+    a0 = m.edges[e][0]
+    a1 = m.edges[e][1]
+    xa = node(q, a0)
+    xb = node(q, a1)
+    for j in range(b.shapes.shape[0] if m.rod[a0] >= 0 else 0):
+        k = b.shapes[j]
+        X = _shape_pose(b, k)
+        th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
+        reach = (1.0 + sc.engage) * th + wp.max(wp.length(node(sc.q1, a0) - xa), wp.length(node(sc.q1, a1) - xb))
+        c = wp.transform_get_translation(X)
+        t = wp.clamp(_ahead(c, xa, xb) / wp.length_sq(xb - xa), 0.0, 1.0)
+        if wp.length(c - wp.lerp(xa, xb, t)) > b.radius[k] + reach:
+            continue
+        far = reach + wp.length(xb - xa)  # a mesh's query radius
+        d, n = _shape_gap(b, k, X, xa, far)
+        d1, n1 = _shape_gap(b, k, X, xb, far)
+        if _ahead(xa - n, xa, xb) <= 0.0 or _ahead(xb - n1, xb, xa) <= 0.0:
+            continue  # an end is the closest: its node's pair
+        t0 = float(0.0)
+        t1 = float(1.0)
+        for it in range(BISECT):  # the gap's slope along the edge changes sign once on a convex shape
+            d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, 0.5 * (t0 + t1)), far)
+            if wp.dot(n, xb - xa) < 0.0:
+                t0 = 0.5 * (t0 + t1)
+            else:
+                t1 = 0.5 * (t0 + t1)
+        t = 0.5 * (t0 + t1)
+        d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, t), far)
+        if d <= reach:
+            _keep_shape(
+                sc, base, k, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - t, t, 0.0, 0.0), wp.lerp(xa, xb, t) - d * n, n, th
+            )
+    query = wp.bvh_query_aabb(bvh, lo, hi)
+    f = int(0)
+    while wp.bvh_query_next(query, f):
+        b0 = m.edges[f][0]
+        b1 = m.edges[f][1]
+        if f > e or m.edge_on[f] == 0 or b0 == a0 or b0 == a1 or b1 == a0 or b1 == a1:
+            continue  # the higher edge's pair (a shell's, not a long rod edge's); or neighbours
+        if (m.rod[a0] >= 0) == (m.rod[b0] >= 0) and sc.self_contact == 0:
+            continue
+        st = _closest_st(q, a0, a1, b0, b1)
+        if wp.min(st) <= OPEN or wp.max(st) >= 1.0 - OPEN:
+            continue  # an end: a node's pair (found exactly on a node, rounding would duplicate it)
+        th = 0.5 * (m.radius[a0] + m.radius[a1] + m.radius[b0] + m.radius[b1])
+        if not _excluded(q, m, a0, a1, st[0], b0, b1, st[1], EXCLUSION * th):
+            _keep_pair(sc, base, sc.num_nodes + f, wp.vec4i(a0, a1, b0, b1),
+                       wp.vec4(1.0 - st[0], st[0], st[1] - 1.0, -st[1]), th, 0.5 * (m.mu[a0] + m.mu[b0]))
+
+
+@wp.func
+def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base: int):
+    """Node ``i``'s contacts: against rods (node-node, node-edge), shapes and triangles."""
+    m, b, q = sc.m, sc.b, sc.q
     xv = node(q, i)
     on_rod = m.rod[i] >= 0
-    qlo = wp.min(xv, node(q1, i))
-    qhi = wp.max(xv, node(q1, i))
+    qlo = wp.min(xv, node(sc.q1, i))
+    qhi = wp.max(xv, node(sc.q1, i))
     query = wp.bvh_query_aabb(bvh, qlo, qhi)
     f = int(0)
     while wp.bvh_query_next(query, f):  # against rods
         b0 = m.edges[f][0]
         b1 = m.edges[f][1]
-        if m.edge_on[f] == 0 or m.rod[b0] < 0 or b0 == i or b1 == i or (on_rod and self_contact == 0):
+        if m.edge_on[f] == 0 or m.rod[b0] < 0 or b0 == i or b1 == i or (on_rod and sc.self_contact == 0):
             continue
         # The other feature: node b0 or b1 (closed blocks) or f's interior (open).
-        other = num_nodes + f
+        other = sc.num_nodes + f
         t = float(0.0)
         if _ahead(xv, node(q, b0), node(q, b1)) <= 0.0:
             other = b0
@@ -492,7 +530,7 @@ def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], h
         th = m.radius[i] + 0.5 * (m.radius[b0] + m.radius[b1])
         c0 = b0
         c1 = b1
-        if other < num_nodes:
+        if other < sc.num_nodes:
             if (on_rod and other < i) or not _in_node_region(q, m, other, xv):
                 continue  # the lower node's pair; or xv lies past it into its other edge
             pair = wp.vec4i(i, other, -1, -1)
@@ -505,29 +543,25 @@ def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], h
                 continue  # not a local minimum along this rod
             if _excluded(q, m, i, i, 0.0, c0, c1, t, EXCLUSION * th):
                 continue
-        _keep(s, prev, base, other, q, q1, engage, m, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th,
-              0.5 * (m.mu[i] + m.mu[c0]), fixed, overflow)
-    for j in range(bodies.shapes.shape[0]):  # against shapes: their surfaces offset outward (Sec. 3.9)
-        k = bodies.shapes[j]
-        X = _shape_pose(bodies, k)
-        th = m.radius[i] + bodies.margin[k]
-        reach = (1.0 + engage) * th + wp.length(node(q1, i) - xv)
-        if wp.length(xv - wp.transform_get_translation(X)) > bodies.radius[k] + reach:
+        _keep_pair(sc, base, other, pair, w, th, 0.5 * (m.mu[i] + m.mu[c0]))
+    for j in range(b.shapes.shape[0]):  # against shapes: their surfaces offset outward (Sec. 3.9)
+        k = b.shapes[j]
+        X = _shape_pose(b, k)
+        th = m.radius[i] + b.margin[k]
+        reach = (1.0 + sc.engage) * th + wp.length(node(sc.q1, i) - xv)
+        if wp.length(xv - wp.transform_get_translation(X)) > b.radius[k] + reach:
             continue
-        d, n = _shape_gap(bodies, k, X, xv, reach)
-        if d > reach or (on_rod and not _in_node_region(q, m, i, xv - n)):
-            continue  # a rod node's edge leading toward the body holds the pair
-        x, dx = _anchor(bodies, k, xv - d * n)
-        _keep(s, prev, base, key0 + k, q, q1, engage, m, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), n, x,
-              dx, th, 0.5 * (m.mu[i] + bodies.mu[k]), fixed, overflow)
+        d, n = _shape_gap(b, k, X, xv, reach)
+        if d <= reach and not (on_rod and not _in_node_region(q, m, i, xv - n)):  # else a rod edge holds it
+            _keep_shape(sc, base, k, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), xv - d * n, n, th)
     if m.faces.shape[0] == 0:
         return
     query = wp.bvh_query_aabb(face_bvh, qlo, qhi)
     while wp.bvh_query_next(query, f):  # against triangles: their closest feature (Algorithm 1)
         tri = m.faces[f]
-        if tri[0] == i or tri[1] == i or tri[2] == i or (not on_rod and self_contact == 0):
+        if tri[0] == i or tri[1] == i or tri[2] == i or (not on_rod and sc.self_contact == 0):
             continue
-        b = G.triangle_closest_point_barycentric(node(q, tri[0]), node(q, tri[1]), node(q, tri[2]), xv)
+        bary = G.triangle_closest_point_barycentric(node(q, tri[0]), node(q, tri[1]), node(q, tri[2]), xv)
         pair = wp.vec4i(i, -1, -1, -1)
         w = wp.vec4(1.0, 0.0, 0.0, 0.0)
         th = m.radius[i]
@@ -535,22 +569,39 @@ def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], h
         corner = int(0)
         side = int(0)
         for k in range(3):
-            if b[k] > 0.0:
+            if bary[k] > 0.0:
                 count += 1
                 corner = k
                 pair[k + 1] = tri[k]
-                w[k + 1] = -b[k]
-                th += b[k] * m.radius[tri[k]]
+                w[k + 1] = -bary[k]
+                th += bary[k] * m.radius[tri[k]]
             else:
                 side = k
-        key = num_nodes + m.edges.shape[0] + f
+        key = sc.num_nodes + m.edges.shape[0] + f
         if count == 1:
             key = tri[corner]
             if not _in_node_region(q, m, key, xv):
                 continue
         elif count == 2:
-            key = num_nodes + m.face_edge[f][side]
-            if not _in_edge_region(q, m, key - num_nodes, xv):
+            key = sc.num_nodes + m.face_edge[f][side]
+            if not _in_edge_region(q, m, key - sc.num_nodes, xv):
                 continue
-        _keep(s, prev, base, key, q, q1, engage, m, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th,
-              0.5 * (m.mu[i] + m.mu[tri[0]]), fixed, overflow)
+        _keep_pair(sc, base, key, pair, w, th, 0.5 * (m.mu[i] + m.mu[tri[0]]))
+
+
+@wp.kernel
+def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], hi: wp.array[wp.vec3], sc: Scene):
+    """Thread ``i < num_nodes``: node ``i``'s contacts, else edge ``i - num_nodes``'s, into its :data:`SLOTS` from
+    ``i * SLOTS``. Query: the node's box over the step, or the edge's own (the trees' boxes carry the pad). A rod's
+    point must also be a local minimum along its rod (in its own node's block); a shell vertex's need not
+    (vertex-facet is one-sided)."""
+    i = wp.tid()
+    base = i * SLOTS
+    for k in range(SLOTS):
+        clear(sc.s, base + k)
+    if i >= sc.num_nodes:
+        e = i - sc.num_nodes
+        if sc.m.edge_on[e] != 0:
+            _edge_contacts(sc, bvh, lo[e], hi[e], e, base)
+    elif sc.m.adj_ptr[i + 1] > sc.m.adj_ptr[i]:  # on a colliding rod or a shell
+        _node_contacts(sc, bvh, face_bvh, i, base)

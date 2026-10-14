@@ -1,8 +1,8 @@
-"""Clamped rods released straight under gravity: the DER solvers beside Newton's VBD cable.
+"""Clamped rods released straight under gravity: the DER solver beside Newton's VBD cable.
 
-Shows: both solvers (``ADMMDiSMechSolver``, ``DiSMechSolver``) and their integrators (``theta``: 1 implicit
-Euler, 1/2 implicit midpoint), each rod in its own model, over the Euler-Bernoulli curve. Bending damping
-is off, so what decays is the solvers' numerical damping.
+Shows: the solver's ADMM on implicit Euler and Gauss-Newton (``exact=True``) on implicit midpoint (``theta=0.5``),
+each rod in its own model, over the Euler-Bernoulli curve. Bending damping is off, so what decays is the integrator's
+numerical damping: implicit Euler's, while implicit midpoint keeps the swing.
 
     uv run examples/cantilever.py
     uv run examples/cantilever.py --viewer null --test
@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 from utils.common import THEORY, FrameGraph, frame_box, inset, inset_scale
 
-from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, flatten_state
+from dismech_newton import DiSMechSolver, flatten_state
 
 GRAVITY = 9.81
 
@@ -34,11 +34,9 @@ def _place_points(src: wp.array[wp.vec3], offset: wp.vec3, start: int, dst: wp.a
 
 # name: (solver, its options, color)
 DER_SOLVERS = {
-    "DER ADMM, implicit Euler": (ADMMDiSMechSolver, {}, (0.3, 0.8, 0.6)),
-    "DER Newton-Raphson, implicit Euler": (DiSMechSolver, {}, (0.6, 0.45, 0.9)),
-    # Undamped, ADMM's leftover residual pumps energy into the stiff modes unless it is solved tighter.
-    "DER ADMM, implicit midpoint": (ADMMDiSMechSolver, {"theta": 0.5, "tol": 1.0e-5}, (0.3, 0.6, 0.95)),
-    "DER Newton-Raphson, implicit midpoint": (DiSMechSolver, {"theta": 0.5}, (0.3, 0.75, 0.8)),
+    "DER ADMM, implicit Euler": (DiSMechSolver, {}, (0.3, 0.8, 0.6)),
+    # Undamped, ADMM's leftover residual would pump the stiff modes: midpoint on Gauss-Newton.
+    "DER Gauss-Newton, implicit midpoint": (DiSMechSolver, {"exact": True, "theta": 0.5}, (0.6, 0.45, 0.9)),
 }
 VBD_COLORS = ((0.95, 0.55, 0.2), (0.85, 0.25, 0.25), (0.95, 0.75, 0.25), (0.7, 0.3, 0.7))
 
@@ -50,67 +48,77 @@ class Example:
     bend_stiffness = 140.0  # per joint [N m / rad]: EI = K h
     bend_damping = 0.0  # per joint [N m s / rad]: off, so what decays is numerical damping
     height, gap, row_gap, columns = 1.0, 0.3, 1.2, 2  # bottom row's clamp height; spacing of the grid
+    # The view: room for a cantilever that droops nearly its length and swings back past its clamp (VBD at few
+    # iterations), in lengths; the theory curves' y.
+    swing, droop, line_y = 0.61, 0.944, 0.0
+    sag_tolerance = 0.05  # test_final: the DER cantilevers' mean sag against the theory's
+    solvers = DER_SOLVERS  # the DER cantilevers: name -> (solver, its options, color)
 
-    def __init__(self, viewer, args=None, *, der: tuple[str, ...] = ("DER ADMM, implicit midpoint", "DER ADMM, implicit Euler"),
+    def __init__(self, viewer, args=None, *, der: tuple[str, ...] | None = None,
                  vbd: tuple[tuple[int, int], ...] = ((10, 5), (100, 50)), der_substeps: int = 8):
         self.viewer = viewer
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
 
-        # (name, color, add the rod to a builder at a clamp, make its solver, substeps), DER first.
+        # (name, color, add the cantilever to a builder at a clamp, make its solver, substeps), DER first.
         rods = []
-        for name in der:
-            solver, options, color = DER_SOLVERS[name]
+        for name in self.solvers if der is None else der:
+            solver, options, color = self.solvers[name]
             rods.append((name, color, self._der_adder(solver, color), lambda m, s=solver, o=options: s(m, **o),
                          der_substeps))
         for k, (substeps, it) in enumerate(vbd):
             color = VBD_COLORS[k % len(VBD_COLORS)]
             rods.append((f"VBD, {it} iterations", color, self._vbd_adder(color),
-                         lambda m, it=it: newton.solvers.SolverVBD(m, iterations=it, rigid_compliant_alm=True),
-                         substeps))
+                         lambda m, it=it: self._vbd_solver(m, it), substeps))
         rows = -(-len(rods) // self.columns)
         clamps = [((k % self.columns) * (self.length + self.gap), self.height + (rows - 1 - k // self.columns) * self.row_gap)
                   for k in range(len(rods))]
 
-        # One model per rod, clamped at the origin, and a scene with every rod in place, only rendered:
+        # One model per cantilever, clamped at the origin, and a scene with every one in place, only rendered:
         # positions are float32, and a metre from the origin a substep's motion falls below their resolution.
         self.sims = {}
         scene = newton.ModelBuilder()
-        self.colors = {}  # each rod's color, for the plot's legend
+        self.colors = {}  # each cantilever's color, for the plot's legend
         for (name, color, add, make_solver, substeps), clamp in zip(rods, clamps):
             self.colors[name] = color
             builder = newton.ModelBuilder()
-            bodies = add(builder, (0.0, 0.0))
+            handle = add(builder, (0.0, 0.0))
             builder.color()
             model = builder.finalize()
-            self.sims[name] = _Sim(model, make_solver(model), bodies, substeps, offset=(clamp[0], 0.0, clamp[1]))
+            self.sims[name] = TipSim(model, make_solver(model), self._tip(model, handle), substeps,
+                                     offset=(clamp[0], 0.0, clamp[1]))
             add(scene, clamp)
         self.model = scene.finalize()
         self.state_0 = self.model.state()
         self._gather()
 
-        # Euler-Bernoulli: uniform load W. A joint's stiffness K = EI / h spreads the curvature over the half
-        # segments on either side, so the continuum clamp sits midway between the two fixed nodes, at h / 2.
-        h = self.length / self.segments
-        self.w = scene.default_shape_cfg.density * np.pi * self.radius**2 * GRAVITY  # load per length
-        self.ei = self.bend_stiffness * h
-        self.clamp = 0.5 * h
+        self._load(scene)
         self.span = self.length - self.clamp
         x = np.linspace(0.0, self.length, 101)
         starts, ends = [], []
         for x0, z0 in clamps:
-            p = np.column_stack((x0 + x, np.zeros_like(x), z0 - self.beam(x)))
+            p = np.column_stack((x0 + x, np.full_like(x, self.line_y), z0 - self.beam(x)))
             starts.append(p[:-1])
             ends.append(p[1:])
         self.beam_starts = wp.array(np.concatenate(starts), dtype=wp.vec3)
         self.beam_ends = wp.array(np.concatenate(ends), dtype=wp.vec3)
         viewer.set_model(self.model)
-        # The grid, with room for a rod that droops nearly its length and swings back past its clamp (VBD at
-        # few iterations) on both sides, and an equal margin around.
-        margin, swing, droop = 0.15, 0.61 * self.length, 0.944 * self.length
+        # The grid, with room for the swing on both sides, and an equal margin around.
+        margin, swing, droop = 0.15, self.swing * self.length, self.droop * self.length
         grid = min(len(rods), self.columns) * (self.length + self.gap) - self.gap + self.radius
         frame_box(viewer, -swing - margin, grid + swing + margin, self.height - droop - margin,
-                  self.height + (rows - 1) * self.row_gap + margin)
+                  self.height + (rows - 1) * self.row_gap + margin, y=self.line_y)
+
+    # -- what a subclass changes: the cantilever, its load and stiffness, its tip --------------
+
+    def _load(self, scene) -> None:
+        """Euler-Bernoulli: the uniform load ``w`` (per length), ``ei`` and the continuum clamp's offset. A joint's
+        stiffness K = EI / h spreads the curvature over the half segments on either side, so the continuum clamp sits
+        midway between the two fixed nodes, at h / 2."""
+        h = self.length / self.segments
+        self.w = scene.default_shape_cfg.density * np.pi * self.radius**2 * GRAVITY
+        self.ei = self.bend_stiffness * h
+        self.clamp = 0.5 * h
 
     def _rod(self, clamp) -> newton.Rod:
         return newton.Rod.create_straight((clamp[0], 0.0, clamp[1]), (1.0, 0.0, 0.0), self.length,
@@ -143,6 +151,18 @@ class Example:
 
         return add
 
+    def _vbd_solver(self, model, iterations: int):
+        return newton.solvers.SolverVBD(model, iterations=iterations, rigid_compliant_alm=True)
+
+    def _tip(self, model, bodies: list[int]) -> tuple:
+        """What :class:`TipSim` reads: the last capsule's far end (its pose, half length, start height)."""
+        shape = list(model.shape_body.numpy()).index(bodies[-1])
+        half = float(model.shape_scale.numpy()[shape, 1])
+        z0 = float(model.body_q.numpy()[bodies[-1], 2])
+        return "body_q", _record_tip, [bodies[-1], half, z0]
+
+    # -- theory ----------------------------------------------------------------------------
+
     def beam(self, x: np.ndarray) -> np.ndarray:
         """Euler-Bernoulli sag (positive down) at ``x``."""
         s = np.maximum(x - self.clamp, 0.0)
@@ -154,12 +174,13 @@ class Example:
         return 1.8751**2 / (2.0 * np.pi) * np.sqrt(self.ei / (mu * self.span**4))
 
     def _gather(self):
-        """Copy every rod's bodies (and the DER nodes) into the rendered state, moved to its place."""
+        """Copy every cantilever's bodies and particles into the rendered state, moved to its place."""
         bodies = particles = 0
         for sim in self.sims.values():
-            wp.launch(_place_bodies, dim=len(sim.bodies), inputs=[sim.state_0.body_q, sim.offset, bodies],
-                      outputs=[self.state_0.body_q])
-            bodies += len(sim.bodies)
+            if sim.model.body_count:
+                wp.launch(_place_bodies, dim=sim.model.body_count, inputs=[sim.state_0.body_q, sim.offset, bodies],
+                          outputs=[self.state_0.body_q])
+                bodies += sim.model.body_count
             if sim.model.particle_count:
                 wp.launch(_place_points, dim=sim.model.particle_count,
                           inputs=[sim.state_0.particle_q, sim.offset, particles], outputs=[self.state_0.particle_q])
@@ -180,18 +201,18 @@ class Example:
         self.viewer.end_frame()
 
     def image(self, size: tuple[int, int] = (400, 400)) -> np.ndarray:
-        """Each rod's tip sag over time against the Euler-Bernoulli beam's, as an RGBA image (see
-        :func:`utils.common.inset`): released straight and undamped, its first mode swings between 0 and twice
-        the static sag, ``1 - cos(2 pi f t)`` at :meth:`beam_frequency`."""
+        """Each cantilever's tip sag over time against the beam's, as an RGBA image (see :func:`utils.common.inset`):
+        released straight and undamped, its first mode swings between 0 and twice the static sag,
+        ``1 - cos(2 pi f t)`` at :meth:`beam_frequency`."""
         exact = float(self.beam(np.array([self.length]))[0])
 
         def draw(ax):
-            t = np.linspace(0.0, self.sim_time, max(2, round(200 * self.sim_time)))  # grows with the rods'
+            t = np.linspace(0.0, self.sim_time, max(2, round(200 * self.sim_time)))  # grows with the run
             ax.plot(t, 1.0 - np.cos(2.0 * np.pi * self.beam_frequency() * t), color=THEORY, ls="--",
                     lw=1.2 * inset_scale(size), zorder=3, label="Euler-Bernoulli")
             for name, sim in self.sims.items():
                 every = max(1, len(sim.t) // 3000)
-                label = name.removeprefix("DER ").replace("iterations", "iter.")
+                label = name.removeprefix("DER ").removeprefix("Shell ").replace("iterations", "iter.").replace("implicit ", "")
                 ax.plot(sim.t[::every], np.array(sim.sag[::every]) / exact, color=self.colors[name],
                         lw=1.4 * inset_scale(size), label=label)
             ax.set(xlim=(0.0, max(self.plot_time, self.sim_time)), ylim=(0.0, 3.6))
@@ -205,7 +226,7 @@ class Example:
 
     def summary(self) -> dict[str, dict[str, float]]:
         """Tip sag against the beam (averaged over the last period), frequency, amplitude decay, and
-        iterations per step (the DER solvers' adaptive count, VBD's fixed one)."""
+        iterations per step."""
         exact, freq = float(self.beam(np.array([self.length]))[0]), self.beam_frequency()
         out = {}
         for name, sim in self.sims.items():
@@ -218,7 +239,7 @@ class Example:
                 "frequency / beam": 1.0 / (up[1] - up[0]) / freq if len(up) > 1 else float("nan"),
                 "amplitude after 1 period": (np.ptp(osc[period:2 * period]) / np.ptp(osc[:period])
                                              if len(osc) >= 2 * period else float("nan")),
-                "iterations / step": np.mean(sim.iterations) if sim.iterations else sim.solver.iterations,
+                "iterations / step": sim.solver.iterations,
                 "dt": sim.dt,
             }
         return out
@@ -226,51 +247,48 @@ class Example:
     def test_final(self):
         for name, row in self.summary().items():
             assert np.isfinite(row["sag / beam"]), f"{name}: non-finite tip"
-            if name.startswith("DER"):
-                assert abs(row["sag / beam"] - 1.0) < 0.05, f"{name}: sag {row['sag / beam']:.3f} of the beam's"
+            if name in self.solvers:
+                assert abs(row["sag / beam"] - 1.0) < self.sag_tolerance, \
+                    f"{name}: sag {row['sag / beam']:.3f} of the beam's"
+            if name in self.solvers and self.solvers[name][1].get("theta", 1.0) < 1.0:  # midpoint keeps the swing
+                assert row["amplitude after 1 period"] > 0.95, f"{name}: the swing decays"
 
 
 @wp.kernel
-def _record_tip(body_q: wp.array[wp.transform], body: int, half: float, z0: float,
-                iterations: wp.array[wp.int32], count: wp.array[wp.int32],
-                # outputs
-                sag: wp.array[float], iters: wp.array[wp.int32]):
-    """Append the tip's sag (its capsule's far end, below its start) and the step's iterations at ``count``."""
+def _record_tip(body_q: wp.array[wp.transform], body: int, half: float, z0: float, count: wp.array[wp.int32],
+                sag: wp.array[float]):
+    """Append the tip's sag (its capsule's far end, below its start) at ``count``."""
     k = count[0]
     if k < sag.shape[0]:
         X = body_q[body]
         tip = wp.transform_get_translation(X) + half * wp.quat_rotate(wp.transform_get_rotation(X), wp.vec3(0.0, 0.0, 1.0))
         sag[k] = z0 - tip[2]
-        if iterations.shape[0] > 0:
-            iters[k] = iterations[0]
     count[0] = k + 1
 
 
-class _Sim:
-    """One rod, its solver and its tip-sag history (sampled every substep).
+class TipSim:
+    """One cantilever, its solver and its tip-sag history (sampled every substep). ``tip``: ``(state field, kernel,
+    inputs)``, launched once per substep as ``kernel(field, *inputs, count) -> sag``.
 
     The history is recorded on the device, so a frame's substeps are one CUDA graph (:class:`FrameGraph`); reading
-    ``t``, ``sag`` or ``iterations`` copies it to the host (a sync), as does a full device buffer (every
+    ``t`` or ``sag`` copies it to the host (a sync), as does a full device buffer (every
     ``buffer_frames`` frames)."""
 
     buffer_frames = 600
 
-    def __init__(self, model, solver, bodies: list[int], substeps: int, offset):
-        self.model, self.solver, self.bodies, self.substeps = model, solver, bodies, substeps
-        self.offset = wp.vec3(*offset)  # where the rod is drawn
+    def __init__(self, model, solver, tip: tuple, substeps: int, offset):
+        self.model, self.solver, self.substeps = model, solver, substeps
+        self.offset = wp.vec3(*offset)  # where it is drawn
         self.state_0, self.state_1 = model.state(), model.state()
-        if model.particle_count:  # a DER rod
+        if isinstance(solver, DiSMechSolver):
             flatten_state(self.state_0)
             flatten_state(self.state_1)
-        shape = list(model.shape_body.numpy()).index(bodies[-1])
-        self.tip, self.half = bodies[-1], float(model.shape_scale.numpy()[shape, 1])  # the capsule's half length
-        self.z0 = float(model.body_q.numpy()[bodies[-1], 2])
+        self.field, self.tip_kernel, self.tip_inputs = tip
         n, dev = substeps * self.buffer_frames, model.device
-        self._iterations = getattr(solver, "iteration_count", wp.zeros(0, dtype=wp.int32, device=dev))
         self._count = wp.zeros(1, dtype=wp.int32, device=dev)
-        self._sag, self._iters = wp.zeros(n, dtype=float, device=dev), wp.zeros(n, dtype=wp.int32, device=dev)
+        self._sag = wp.zeros(n, dtype=float, device=dev)
         self._pending = 0  # substeps recorded on the device since the last read
-        self._t, self._z, self._it = [], [], []
+        self._t, self._z = [], []
         self.dt = None
         self.frame = FrameGraph(self._substeps, solver, enabled=substeps % 2 == 0)  # even: state_0 stays in place
 
@@ -278,9 +296,9 @@ class _Sim:
         for _ in range(self.substeps):
             self.solver.step(self.state_0, self.state_1, None, None, self.dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
-            wp.launch(_record_tip, dim=1,
-                      inputs=[self.state_0.body_q, self.tip, self.half, self.z0, self._iterations, self._count],
-                      outputs=[self._sag, self._iters], device=self.model.device)
+            wp.launch(self.tip_kernel, dim=1,
+                      inputs=[getattr(self.state_0, self.field), *self.tip_inputs, self._count],
+                      outputs=[self._sag], device=self.model.device)
 
     def run(self, frame_dt: float):
         self.dt = frame_dt / self.substeps
@@ -296,8 +314,6 @@ class _Sim:
             return
         self._t.extend((len(self._t) + np.arange(1, k + 1)) * self.dt)
         self._z.extend(self._sag.numpy()[:k].tolist())
-        if self._iterations.shape[0]:
-            self._it.extend(self._iters.numpy()[:k].tolist())
         self._count.zero_()
         self._pending = 0
 
@@ -310,11 +326,6 @@ class _Sim:
     def sag(self) -> list[float]:
         self._flush()
         return self._z
-
-    @property
-    def iterations(self) -> list[int]:
-        self._flush()
-        return self._it
 
 
 if __name__ == "__main__":

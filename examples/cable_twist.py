@@ -14,7 +14,7 @@ import warp as wp
 from newton.examples.cable.example_cable_twist import Example as NewtonExample
 from utils.common import CableExample, Drive, segment_dofs
 
-from dismech_newton import ADMMDiSMechSolver
+from dismech_newton import DiSMechSolver
 
 
 class Example(CableExample):
@@ -32,15 +32,15 @@ class Example(CableExample):
                 None, pos=wp.vec3(-0.25 * length, y, self.radius), num_elements=self.num_elements,
                 length=length, radius=self.radius,
             )
-            bodies = ADMMDiSMechSolver.add_rod(
+            bodies = DiSMechSolver.add_rod(
                 builder, rod, stretch_stiffness=1.0e6, bend_stiffness=k, twist_stiffness=k,
                 bend_damping=1.0e-2 * k, twist_damping=1.0e-2 * k,
             )
-            ADMMDiSMechSolver.fix_segment(builder, bodies[0])  # clamped: its nodes and twist follow the drive
+            DiSMechSolver.fix_segment(builder, bodies[0])  # clamped: its nodes and twist follow the drive
             self.rods.append(bodies)
         builder.add_ground_plane()
         model = builder.finalize()
-        self.start(viewer, model, ADMMDiSMechSolver(model, friction=0.5), self.radius)
+        self.start(viewer, model, DiSMechSolver(model, friction=0.5))
         # The clamped segments' twist angles, prescribed every substep.
         self.spin = Drive(model, [d for bodies in self.rods for d in segment_dofs(model, bodies[0], True)])
         self.drives = (self.spin,)

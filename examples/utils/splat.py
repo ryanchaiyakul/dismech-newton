@@ -23,7 +23,7 @@ import warp as wp
 from newton import Gaussian, Model
 from scipy.spatial.transform import Rotation
 
-from dismech_newton.strains import material_frame
+from dismech_newton.rod import material_frame
 
 vec6 = wp.types.vector(6, float)
 SH_C0 = 0.28209479177387814  # the degree-0 spherical harmonic: colour = SH_C0 * coefficient + 0.5

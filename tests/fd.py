@@ -1,4 +1,5 @@
-"""Batched, Richardson-extrapolated central finite differences; ``f`` maps ``(N, n)`` to ``(N, m)``."""
+"""Richardson-extrapolated central finite differences (``jacobian``: batched, ``f`` maps ``(N, n)`` to
+``(N, m)``) and the tests' tolerance check."""
 
 import numpy as np
 
@@ -21,26 +22,6 @@ def jacobian(f, x: np.ndarray, h) -> np.ndarray:
         D = np.diag(np.broadcast_to(h, n))
         y = f(np.concatenate([x + D, x - D]))
         return ((y[:n] - y[n:]) / (2.0 * np.diag(D))[:, None]).T
-
-    return _richardson(central, np.asarray(h, dtype=np.float64))
-
-
-def hessian(f, x: np.ndarray, h) -> np.ndarray:
-    """Shape ``(m, n, n)``."""
-    x = np.asarray(x, dtype=np.float64)
-    n = x.size
-
-    def central(h):
-        D = np.diag(np.broadcast_to(h, n))
-        i, j = np.triu_indices(n)
-        pts = [x + si * D[i] + sj * D[j] for si, sj in ((1, 1), (1, -1), (-1, 1), (-1, -1))]
-        pp, pm, mp, mm = np.split(f(np.concatenate(pts)), 4)
-        d = np.diag(D)
-        upper = (pp - pm - mp + mm) / (4.0 * d[i] * d[j])[:, None]
-        H = np.zeros((upper.shape[1], n, n))
-        H[:, i, j] = upper.T
-        H[:, j, i] = upper.T
-        return H
 
     return _richardson(central, np.asarray(h, dtype=np.float64))
 

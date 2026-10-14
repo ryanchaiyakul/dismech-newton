@@ -17,7 +17,7 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 from utils.common import MUTED, SIM, THEORY, CableExample, Drive, close_pairs, inset, segment_dofs, smoothstep
 
-from dismech_newton import ADMMDiSMechSolver
+from dismech_newton import DiSMechSolver
 
 
 @wp.kernel
@@ -49,14 +49,14 @@ class Example(CableExample):
         h = self.radius
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         rod = newton.Rod(points, radius=h, youngs_modulus=self.youngs_modulus, poissons_ratio=0.3)
-        bodies = ADMMDiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0),
+        bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0),
                                            bend_damping=0.1)
         for body in (bodies[0], bodies[-1]):
-            ADMMDiSMechSolver.fix_segment(builder, body)
+            DiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        solver = ADMMDiSMechSolver(model, friction=self.friction)
+        solver = DiSMechSolver(model, friction=self.friction)
         solver.triplets.rest.zero_()  # a rope: straight and untwisted at rest, not knotted
-        self.start(viewer, model, solver, h, contact_matching_pos_threshold=h)
+        self.start(viewer, model, solver)
         # Both clamped segments' nodes (not their twist), moved along the end-to-end line.
         self.ends = Drive(model, segment_dofs(model, bodies[0])[:6] + segment_dofs(model, bodies[-1])[:6])
         self.drives = (self.ends,)

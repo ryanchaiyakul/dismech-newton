@@ -1,4 +1,5 @@
-"""Adding DER rods to a ``ModelBuilder``: nodes are particles, edges and triplets ``dismech`` frequencies."""
+"""Adding rods and shells to a ``ModelBuilder``: nodes are particles; a rod's edges and triplets, a shell's hinges
+and faces are ``dismech`` frequencies."""
 
 import copy
 
@@ -7,10 +8,14 @@ import warp as wp
 from newton import Model, ModelBuilder, ParticleFlags, Rod
 from newton._src.core.types import Vec3
 
-from .strains import vec5f, vec6f, vec10f, vec12f
+vec5f = wp.types.vector(5, float)  # a triplet's strains [eps_e, eps_f, kappa1, kappa2, tau]
+vec10f = wp.types.vector(10, float)  # [stiffness, damping] per triplet strain
+vec6f = wp.types.vector(6, float)  # a face's strains (membrane 3, bending 3)
+vec12f = wp.types.vector(12, float)
 
 NAMESPACE = "dismech"
 _P = f"{NAMESPACE}:"
+ROD_GROUP = -0x5DE7  # every colliding rod capsule's collision group: a negative group collides with all but itself
 
 # (frequency, name, dtype, references)
 ATTRIBUTES = [
@@ -23,9 +28,7 @@ ATTRIBUTES = [
     ("triplet", "triplet_edge0", wp.int32, _P + "edge"),  # scalar int32, so merging builders offsets them
     ("triplet", "triplet_edge1", wp.int32, _P + "edge"),
     ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
-    # Midedge shells (unified/shell.py): a hinge per mesh edge, its midedge angle a DOF.
-    ("hinge", "hinge_node0", wp.int32, "particle"),
-    ("hinge", "hinge_node1", wp.int32, "particle"),
+    # Midedge shells (shell.py): a hinge per mesh edge, its midedge angle a DOF.
     ("hinge", "hinge_fixed", wp.int32, None),
     *(("face", f"face_node{k}", wp.int32, "particle") for k in range(6)),  # its 3 vertices, then the 3 flaps
     *(("face", f"face_hinge{k}", wp.int32, _P + "hinge") for k in range(3)),  # hinge k: the edge opposite node k
@@ -113,13 +116,23 @@ def add_rod(
 ) -> list[int]:
     """Add an ordered chain of DER segments; returns the proxy bodies (edge indices without proxies).
 
-    Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend.
+    Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend. ``proxies``: a
+    kinematic capsule per segment, posed every step (rendering, and what Newton's pipeline sees). ``collide``: the
+    rod takes part in the solver's contacts (:mod:`.collide`), its friction ``cfg.mu`` (without ``cfg``, 0.3); its
+    capsules are in :data:`ROD_GROUP`, so a pipeline never pairs two of them.
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
     if not Rod._is_ordered_chain_topology(len(points), edges):
         raise NotImplementedError("add_rod: only ordered chains are supported")
+    if collide and not proxies:
+        raise ValueError("add_rod: a colliding rod needs its capsule proxies (proxies=True)")
+    default = cfg is None
     cfg = copy.copy(cfg or builder.default_shape_cfg)
-    if not collide:
+    if collide:
+        cfg.collision_group = ROD_GROUP
+        if default:
+            cfg.mu = 0.3
+    else:
         cfg.has_shape_collision = False
     radius = rod._resolve_radius() or 0.1
     points = np.asarray(points, dtype=float)
@@ -227,42 +240,121 @@ def add_rod(
     return bodies if proxies else list(range(edge0, edge0 + n_e))
 
 
-def add_colliding_rod(
-    builder: ModelBuilder,
-    rod: Rod,
-    *,
-    cfg: ModelBuilder.ShapeConfig | None = None,
-    contact_exclusion: float = 1.5,
-    contact_gap: float = 0.5,
-    **kwargs,
-) -> list[int]:
-    """:func:`add_rod` with colliding proxies; pairs closer than ``contact_exclusion`` thicknesses along the rod
-    are filtered. Without ``cfg.gap``, the capsules report pairs within ``contact_gap`` radii of touching (fast
-    motion is covered by the pipeline's speculative contacts); a larger gap adds far contacts that slow ADMM.
-    Without ``cfg``, the builder's default shape config with Coulomb ``mu = 0.3``."""
-    if not kwargs.get("proxies", True):
-        raise ValueError("add_colliding_rod: collision needs the capsule proxies (proxies=True)")
-    radius = rod._resolve_radius() or 0.1
-    if cfg is None:
-        cfg = copy.copy(builder.default_shape_cfg)
-        cfg.mu = 0.3
-    else:
-        cfg = copy.copy(cfg)
-    if cfg.gap is None:
-        cfg.gap = contact_gap * radius
-    bodies = add_rod(builder, rod, cfg=cfg, collide=True, **kwargs)
+# -- shells: Newton's cloth mesh --------------------------------------------------------------------------
 
-    cutoff = contact_exclusion * 2.0 * radius
-    points = np.asarray(rod._normalize_and_validate_geometry()[0], dtype=float)
-    length = np.linalg.norm(points[1:] - points[:-1], axis=1)
-    n_e = len(length)
-    shapes = [builder.body_shapes[b][0] for b in bodies]
-    for a in range(n_e):
-        dist = 0.0
-        for k in range(1, n_e if rod.closed else n_e - a):
-            if dist >= cutoff:
-                break
-            b = (a + k) % n_e
-            builder.add_shape_collision_filter_pair(shapes[min(a, b)], shapes[max(a, b)])
-            dist += length[b]
-    return bodies
+
+def add_cloth_mesh(
+    builder: ModelBuilder,
+    *,
+    vertices,
+    indices,
+    pos=(0.0, 0.0, 0.0),
+    rot=None,
+    scale: float = 1.0,
+    vel=(0.0, 0.0, 0.0),
+    bend_stiffness: float | None = None,
+    damping: float | None = None,
+    **kwargs,
+) -> np.ndarray:
+    """:meth:`newton.ModelBuilder.add_cloth_mesh` as a midedge shell; returns its vertices' particle indices.
+
+    Newton supplies the particles, their lumped masses (``density`` per area), ``particle_radius`` (the contact
+    thickness), the triangles and the bending edges; a hinge is a bending edge. The material comes from Newton's
+    parameters as its VBD solver reads them:
+
+    - membrane: ``tri_ke``, ``tri_ka``, the 2D Lame ``mu``, ``lam`` (exact at small strain);
+    - bending: the plate's ``D = edge_ke A_e / L_e`` per hinge (``A_e`` the area of its two faces), averaged over a
+      face's hinges: Newton's dihedral spring is anisotropic, so this is within about 10% along a regular grid's
+      axes and 30% across its diagonals. ``bend_stiffness`` sets ``D`` [N m] instead;
+    - damping as a time: ``4 tri_kd / (lam + 2 mu)`` (membrane), ``edge_kd / edge_ke`` (bending), or ``damping`` [s]
+      for both.
+
+    The rest shape is the initial one. Fix vertices through their particle flags; a clamped edge needs its
+    neighbouring row too (the midedge angles stay free).
+    """
+    register_custom_attributes(builder)
+    v0, t0, e0 = builder.particle_count, len(builder.tri_indices), len(builder.edge_indices)
+    builder.add_cloth_mesh(
+        pos=pos,
+        rot=wp.quat_identity() if rot is None else rot,
+        scale=scale,
+        vel=vel,
+        vertices=vertices,
+        indices=indices,
+        **kwargs,
+    )
+    tris = np.asarray(builder.tri_indices[t0:], dtype=np.int64).reshape(-1, 3)
+    edges = np.asarray(builder.edge_indices[e0:], dtype=np.int64).reshape(-1, 4)  # (o0, o1, v0, v1)
+    ke, ka, kd = np.asarray(builder.tri_materials[t0:], dtype=np.float64).reshape(-1, 5)[:, :3].T
+    edge_ke, edge_kd = np.asarray(builder.edge_bending_properties[e0:], dtype=np.float64).reshape(-1, 2).T
+    x = np.asarray(builder.particle_q, dtype=np.float32).astype(np.float64)  # as the model stores them
+
+    # -- topology: hinge i of a face is its edge opposite node i, the flap the other face's opposite node -------
+    hinge_of = {(min(a, b), max(a, b)): h for h, (_, _, a, b) in enumerate(edges)}
+    face_nodes = np.concatenate([tris, tris], axis=1)
+    face_hinges, sign, flap = np.zeros((len(tris), 3), np.int64), np.zeros((len(tris), 3)), np.zeros((len(tris), 3))
+    for f, tri in enumerate(tris):
+        for i in range(3):
+            a, b = tri[(i + 1) % 3], tri[(i + 2) % 3]
+            h = hinge_of[(min(a, b), max(a, b))]
+            o0, o1, h0, _ = edges[h]
+            face_hinges[f, i] = h
+            sign[f, i] = 1.0 if h0 == a else -1.0
+            other = o1 if o0 == tri[i] else o0
+            if other >= 0:
+                face_nodes[f, 3 + i], flap[f, i] = other, 1.0
+    if not np.allclose(np.bincount(face_hinges.ravel(), (sign * flap).ravel(), minlength=len(edges)), 0.0):
+        raise ValueError("add_cloth_mesh: inconsistently oriented faces")
+
+    # -- rest frame and material --------------------------------------------------------------------------------
+    p = x[tris]
+    eu, ev = p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]
+    metric = np.stack(
+        [np.stack([(eu * eu).sum(1), (eu * ev).sum(1)], -1), np.stack([(eu * ev).sum(1), (ev * ev).sum(1)], -1)], -2
+    )
+    area = 0.5 * np.sqrt(np.linalg.det(metric))
+    L = np.linalg.inv(np.linalg.cholesky(metric))  # L a L^T = I
+    lam_2mu = ka + 2.0 * ke  # 2D Lame: lam = tri_ka, mu = tri_ke
+    if bend_stiffness is None:
+        hinge_area = np.bincount(face_hinges.ravel(), np.repeat(area, 3), minlength=len(edges))
+        hinge_len = np.linalg.norm(x[edges[:, 3]] - x[edges[:, 2]], axis=1)
+        bend_stiffness = (edge_ke * hinge_area / hinge_len)[face_hinges].mean(1)
+    gamma = (4.0 * kd / lam_2mu, (edge_kd / np.where(edge_ke > 0, edge_ke, np.inf))[face_hinges].mean(1))
+    K = np.repeat(np.column_stack([0.25 * area * lam_2mu, area * bend_stiffness]), 3, axis=1)
+    C = K * (damping if damping is not None else np.repeat(np.column_stack(gamma), 3, axis=1))
+    params, nu = np.concatenate([K, C], axis=1), ka / lam_2mu
+    # W = R T: T takes (m00, m01, m11) to (S11, S22, S12) of S = L M L^T, R whitens (module docstring)
+    l00, l01, l10, l11 = L[:, 0, 0], L[:, 0, 1], L[:, 1, 0], L[:, 1, 1]
+    T = np.stack(
+        [
+            np.stack([l00 * l00, 2 * l00 * l01, l01 * l01], -1),
+            np.stack([l10 * l10, 2 * l10 * l11, l11 * l11], -1),
+            np.stack([l00 * l10, l00 * l11 + l01 * l10, l01 * l11], -1),
+        ],
+        -2,
+    )
+    R = np.zeros((len(tris), 3, 3))
+    R[:, 0, 0], R[:, 0, 1], R[:, 1, 1], R[:, 2, 2] = 1.0, nu, np.sqrt(1.0 - nu**2), np.sqrt(2.0 * (1.0 - nu))
+    W = R @ T
+
+    for _ in edges:
+        builder.add_custom_values(
+            **{
+                _P + "hinge_fixed": 0,
+                _P + "hinge_q": 0.0,
+                _P + "hinge_qd": 0.0,
+            }
+        )
+    hinge0 = len(builder.custom_attributes[_P + "hinge_fixed"].values) - len(edges)
+    for f in range(len(tris)):
+        builder.add_custom_values(
+            **{_P + f"face_node{k}": int(face_nodes[f, k]) for k in range(6)},
+            **{_P + f"face_hinge{k}": hinge0 + int(face_hinges[f, k]) for k in range(3)},
+            **{
+                _P + "face_sign": wp.vec3(*sign[f]),
+                _P + "face_flap": wp.vec3(*flap[f]),
+                _P + "face_strain_map": wp.mat33(*W[f].ravel().tolist()),
+                _P + "face_params": vec12f(*params[f].tolist()),
+            },
+        )
+    return np.arange(v0, builder.particle_count)

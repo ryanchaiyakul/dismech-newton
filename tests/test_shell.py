@@ -1,47 +1,28 @@
-"""Midedge shells in the unified solver: the geometry against its definition, rest, a plate against beam theory;
+"""Midedge shells: the geometry against its definition, rest, a plate against beam theory;
 Offset Geometric Contact with the ground, shapes, rods and other sheets; rods against shapes."""
 
 import newton
 import numpy as np
 import pytest
 import warp as wp
+from rollouts import cloth, grid
 
-from dismech_newton import flatten_state
-from dismech_newton.unified import DiSMechSolver
-from dismech_newton.unified import shell as S
-
-
-def grid(nx: int, ny: int, lx: float, ly: float, rng=None, jitter: float = 0.0):
-    """An ``nx x ny``-node plate in the xy plane, faces counter-clockwise; ``jitter`` moves interior nodes."""
-    xs, ys = np.linspace(0.0, lx, nx), np.linspace(0.0, ly, ny)
-    X, Y = np.meshgrid(xs, ys, indexing="ij")
-    v = np.column_stack([X.ravel(), Y.ravel(), np.zeros(X.size)])
-    if jitter:
-        inner = (X.ravel() > 0) & (X.ravel() < lx) & (Y.ravel() > 0) & (Y.ravel() < ly)
-        v[inner, :2] += jitter * rng.uniform(-1.0, 1.0, (inner.sum(), 2)) * [lx / (nx - 1), ly / (ny - 1)]
-    f = []
-    for i in range(nx - 1):
-        for j in range(ny - 1):
-            a, b, c, d = i * ny + j, (i + 1) * ny + j, (i + 1) * ny + j + 1, i * ny + j + 1
-            f += [(a, b, c), (a, c, d)] if (i + j) % 2 == 0 else [(a, b, d), (b, c, d)]
-    return v, np.array(f)
+from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import shell as S
 
 
-def cloth(builder, v, f, **kwargs):
-    return S.add_cloth_mesh(builder, vertices=v.tolist(), indices=f.ravel().tolist(), **kwargs)
-
-
-def run(model, solver, steps: int, dt: float, pipeline=None):
+def simulate(model, solver, steps: int, dt: float, every: int = 0):
+    """The last state, and the positions every ``every`` steps."""
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
     flatten_state(s1)
-    contacts = pipeline.contacts() if pipeline is not None else None
-    for _ in range(steps):
-        if pipeline is not None:
-            pipeline.collide(s0, contacts)
-        solver.step(s0, s1, None, contacts, dt)
+    frames = []
+    for k in range(steps):
+        solver.step(s0, s1, None, None, dt)
         s0, s1 = s1, s0
-    return s0
+        if every and k % every == 0:
+            frames.append(s0.particle_q.numpy().copy())
+    return s0, frames
 
 
 # -- geometry ----------------------------------------------------------------------------------------
@@ -73,11 +54,11 @@ def reference_forms(x: np.ndarray, flap: np.ndarray, sign: np.ndarray):
 
 
 @wp.kernel
-def _forms_kernel(P: wp.array[S.mat63d], th: wp.array[S.vec3d], sign: wp.array[wp.vec3], flap: wp.array[wp.vec3],
-                  out: wp.array2d[wp.float64], J: wp.array3d[wp.float64]):
+def _forms_kernel(P: wp.array[S.mat63f], th: wp.array[wp.vec3], sign: wp.array[wp.vec3], flap: wp.array[wp.vec3],
+                  out: wp.array2d[float], J: wp.array3d[float]):
     f = wp.tid()
     B = S._b_of_g()
-    m, g, Jf = S._derivatives(P[f], th[f], sign[f], flap[f], wp.identity(3, wp.float64), B)
+    m, g, Jf = S._derivatives(P[f], th[f], sign[f], flap[f], wp.identity(3, float), B)
     m2, g2 = S._forms(P[f], th[f], sign[f], flap[f])
     b = B * g
     for r in range(3):
@@ -86,8 +67,8 @@ def _forms_kernel(P: wp.array[S.mat63d], th: wp.array[S.vec3d], sign: wp.array[w
         out[f, 6 + r] = m2[r] - m[r]
         out[f, 9 + r] = g2[r] - g[r]
         for k in range(21):
-            J[f, r, k] = wp.float64(Jf[r, k])
-            J[f, 3 + r, k] = wp.float64(Jf[3 + r, k])
+            J[f, r, k] = Jf[r, k]
+            J[f, 3 + r, k] = Jf[3 + r, k]
 
 
 def test_forms_and_derivatives(rng):
@@ -99,23 +80,23 @@ def test_forms_and_derivatives(rng):
     th = 0.3 * rng.normal(size=(F, 3))
     sign = rng.choice([-1.0, 1.0], size=(F, 3))
     flap = (rng.random((F, 3)) < 0.7).astype(float)
-    out = wp.zeros((F, 12), dtype=wp.float64)
-    J = wp.zeros((F, 6, 21), dtype=wp.float64)
-    wp.launch(_forms_kernel, dim=F, inputs=[wp.array(X.reshape(F, 6, 3), dtype=S.mat63d), wp.array(th, dtype=S.vec3d),
+    out = wp.zeros((F, 12), dtype=float)
+    J = wp.zeros((F, 6, 21), dtype=float)
+    wp.launch(_forms_kernel, dim=F, inputs=[wp.array(X.reshape(F, 6, 3), dtype=S.mat63f), wp.array(th, dtype=wp.vec3),
                                             wp.array(sign, dtype=wp.vec3), wp.array(flap, dtype=wp.vec3)],
               outputs=[out, J])
     out, J = out.numpy(), J.numpy()
-    assert np.abs(out[:, 6:]).max() < 1.0e-12  # _forms and _derivatives agree
+    assert np.abs(out[:, 6:]).max() < 1.0e-6  # _forms and _derivatives agree (float32)
     for f in range(F):
         x = np.concatenate([X[f], th[f]])
-        np.testing.assert_allclose(out[f, :6], reference_forms(x, flap[f] > 0, sign[f]), rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(out[f, :6], reference_forms(x, flap[f] > 0, sign[f]), rtol=1e-5, atol=1e-5)
         fd = np.zeros((6, 21))
         for c in range(21):
             dx = np.zeros(21)
             dx[c] = 1.0e-6
             fd[:, c] = (reference_forms(x + dx, flap[f] > 0, sign[f]) - reference_forms(x - dx, flap[f] > 0, sign[f]))
         fd /= 2.0e-6
-        assert np.abs(J[f] - fd).max() < 1.0e-5 * max(np.abs(fd).max(), 1.0)  # J is float32
+        assert np.abs(J[f] - fd).max() < 1.0e-5 * max(np.abs(fd).max(), 1.0)
 
 
 def test_curved_shell_at_rest_stays(rng):
@@ -125,7 +106,7 @@ def test_curved_shell_at_rest_stays(rng):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     cloth(builder, v, f, density=1.0, tri_ke=1.0e4, tri_ka=1.0e4, edge_ke=1.0)
     model = builder.finalize()
-    moved = run(model, DiSMechSolver(model), 5, 0.01)
+    moved, _ = simulate(model, DiSMechSolver(model), 5, 0.01)
     assert np.abs(moved.particle_q.numpy() - v).max() < 1.0e-6
 
 
@@ -145,7 +126,7 @@ def test_plate_strip_converges_to_beam_theory(exact):
         for k in np.nonzero(v[:, 0] < 1.5 * dx)[0]:
             builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
         model = builder.finalize()
-        out = run(model, DiSMechSolver(model, iterations=10, exact=exact), 200, 0.02)
+        out, _ = simulate(model, DiSMechSolver(model, iterations=10, exact=exact), 200, 0.02)
         tip = out.particle_q.numpy()[v[:, 0] > length - 1.0e-9, 2].mean()
         ratios.append(tip / (-rho * h * 9.81 * (length - dx) ** 4 / (8.0 * D)))
     assert 1.0 < ratios[1] < ratios[0] < 1.2, ratios
@@ -162,26 +143,13 @@ def test_shell_lands_on_the_ground():
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
     model = builder.finalize()
     model.particle_mu = 0.5
-    out = run(model, DiSMechSolver(model, iterations=10), 240, 1.0 / 240.0)
+    out, _ = simulate(model, DiSMechSolver(model, iterations=10), 240, 1.0 / 240.0)
     x = out.particle_q.numpy()
     assert np.abs(x[:, 2] - 0.004).max() < 2.0e-4
     assert np.abs(x[:, :2] - v[:, :2]).max() < 1.0e-3
 
 
 # -- Offset Geometric Contact --------------------------------------------------------------------------
-
-
-def simulate(model, solver, steps, dt, every=0):
-    s0, s1 = model.state(), model.state()
-    flatten_state(s0)
-    flatten_state(s1)
-    worst = []
-    for k in range(steps):
-        solver.step(s0, s1, None, None, dt)
-        s0, s1 = s1, s0
-        if every and k % every == 0:
-            worst.append(s0.particle_q.numpy().copy())
-    return s0, worst
 
 
 def closest_on_triangle(p, a, b, c):
@@ -216,6 +184,11 @@ def mesh_distance(points, x, tris):
     return np.array([min(np.linalg.norm(p - closest_on_triangle(p, *x[t])) for t in tris) for p in points])
 
 
+def mesh_gaps(frames, points, tris) -> list:
+    """Per frame after the first five: the closest of ``points(x)`` to the triangles ``tris``."""
+    return [mesh_distance(points(x), x, tris).min() for x in frames[5:]]
+
+
 def overflow(solver):
     return int(solver.contact.source.overflow.numpy()[0])
 
@@ -237,7 +210,6 @@ def test_sheet_on_sheet(self_contact):
     solver = DiSMechSolver(model, self_contact=self_contact)
     out, _ = simulate(model, solver, 240, 1.0 / 240.0)
     z = out.particle_q.numpy()[upper, 2]
-    print("upper z: min", z.min(), "mean", z.mean(), "overflow", overflow(solver))
     if self_contact:
         assert overflow(solver) == 0
         assert np.abs(z - 2 * r).max() < 0.25 * r, (z.min(), z.max())
@@ -264,10 +236,8 @@ def test_sheet_over_rod():
     out, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     tris = np.asarray(ids)[f]
     seg = np.column_stack([np.zeros(61), np.linspace(-0.3, 0.3, 61), np.zeros(61)])
-    gaps = [mesh_distance(seg, x, tris).min() for x in frames[5:]]
+    gaps = mesh_gaps(frames, lambda x: seg, tris)
     x = out.particle_q.numpy()
-    print("min rod-sheet distance", min(gaps), "th", rs + rr, "sheet z range", x[ids, 2].min(), x[ids, 2].max(),
-          "overflow", overflow(solver))
     assert overflow(solver) == 0
     assert min(gaps) > 0.85 * (rs + rr)
     assert x[ids, 2].max() < 0.04 and x[ids, 2].min() < -0.05  # it hangs over the rod (coarse faces tent above it)
@@ -292,13 +262,8 @@ def test_rod_on_hammock():
     out, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     rod = np.arange(len(v), model.particle_count)
     tris = np.asarray(ids)[f]
-    gaps = []
-    for x in frames[5:]:
-        p = np.concatenate([x[rod], 0.5 * (x[rod[1:]] + x[rod[:-1]])])
-        gaps.append(mesh_distance(p, x, tris).min())
+    gaps = mesh_gaps(frames, lambda x: np.concatenate([x[rod], 0.5 * (x[rod[1:]] + x[rod[:-1]])]), tris)
     x = out.particle_q.numpy()
-    print("min rod-sheet distance", min(gaps), "th", rs + rr, "rod z", x[rod, 2].min(), "sheet z", x[ids, 2].min(),
-          "overflow", overflow(solver))
     assert overflow(solver) == 0
     assert min(gaps) > 0.85 * (rs + rr)
     assert gaps[-1] < 1.1 * (rs + rr)  # resting on it
@@ -315,19 +280,36 @@ def box_mesh(h):
     return newton.Mesh(v, np.array(tris).ravel())
 
 
-@pytest.mark.parametrize("shape", ["sphere", "box", "mesh"])
-def test_sheet_on_shape(shape):
-    """A sheet dropped on a shape (no collision pipeline): no vertex comes inside its offset surface, and the vertices
-    over the top rest on it at their thickness."""
-    r, h = 0.004, 0.08
-    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    xf = wp.transform((0.0, 0.0, h), wp.quat_identity())
+def add_shape(builder, shape: str, h: float, z: float = 0.0):
+    """A sphere of radius ``h``, or a box (primitive or mesh) of half extent ``h``, centred at height ``z``."""
+    xf = wp.transform((0.0, 0.0, z), wp.quat_identity())
     if shape == "sphere":
         builder.add_shape_sphere(-1, xform=xf, radius=h)
     elif shape == "box":
         builder.add_shape_box(-1, xform=xf, hx=h, hy=h, hz=h)
     else:
         builder.add_shape_mesh(-1, xform=xf, mesh=box_mesh(h))
+
+
+def sdf(p, shape: str, h: float, z: float = 0.0):
+    """The signed distance of the points ``p`` to :func:`add_shape`'s shape."""
+    p = p - [0.0, 0.0, z]
+    if shape == "sphere":
+        return np.linalg.norm(p, axis=1) - h
+    q = np.abs(p) - h
+    return np.linalg.norm(np.maximum(q, 0.0), axis=1) + np.minimum(q.max(1), 0.0)
+
+
+SHAPES = ["sphere", "box", "mesh"]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_sheet_on_shape(shape):
+    """A sheet dropped on a shape (no collision pipeline): no vertex comes inside its offset surface, and the vertices
+    over the top rest on it at their thickness."""
+    r, h = 0.004, 0.08
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    add_shape(builder, shape, h, z=h)
     builder.add_ground_plane()
     v, f = grid(15, 15, 0.42, 0.42)
     v += [-0.21, -0.21, 2 * h + 0.03]
@@ -337,59 +319,30 @@ def test_sheet_on_shape(shape):
     model.particle_mu = 0.5
     solver = DiSMechSolver(model)
     out, frames = simulate(model, solver, 360, 1.0 / 240.0, every=4)
-    c = np.array([0.0, 0.0, h])
-
-    def sdf(x):
-        p = x - c
-        if shape == "sphere":
-            return np.linalg.norm(p, axis=1) - h
-        q = np.abs(p) - h
-        return np.linalg.norm(np.maximum(q, 0.0), axis=1) + np.minimum(q.max(1), 0.0)
-
-    worst = min(min(sdf(x[ids]).min(), x[ids, 2].min()) for x in frames)
+    worst = min(min(sdf(x[ids], shape, h, h).min(), x[ids, 2].min()) for x in frames)
     x = out.particle_q.numpy()[ids]
     top = (np.abs(x[:, 0]) < 0.5 * h) & (np.abs(x[:, 1]) < 0.5 * h)
-    print(shape, "closest", worst, "top gap", (sdf(x[top]) - r).round(5).min(), (sdf(x[top]) - r).max(),
-          "overflow", overflow(solver))
     assert worst > 0.7 * r
-    gap = np.abs(sdf(x[top]) - r)
+    gap = np.abs(sdf(x[top], shape, h, h) - r)
     assert (gap.min() if shape == "sphere" else gap.max()) < 0.15 * r  # a sphere's top touches at one vertex
 
 
-@pytest.mark.parametrize("shape", ["sphere", "box", "mesh"])
+@pytest.mark.parametrize("shape", SHAPES)
 def test_rod_on_shape(shape):
     """A rod of three long edges dropped across a shape: its middle edge spans the top, so the contact is at the
     edge's interior (a sphere's top, a box's rims); no point of the rod comes inside the offset surface, and it
     rests on it at its radius."""
     r, h = 0.01, 0.1
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-    xf = wp.transform((0.0, 0.0, 0.0), wp.quat_identity())
-    if shape == "sphere":
-        builder.add_shape_sphere(-1, xform=xf, radius=h)
-    elif shape == "box":
-        builder.add_shape_box(-1, xform=xf, hx=h, hy=h, hz=h)
-    else:
-        builder.add_shape_mesh(-1, xform=xf, mesh=box_mesh(h))
+    add_shape(builder, shape, h)
     pts = np.column_stack([np.linspace(-0.45, 0.45, 4), np.full(4, 0.013), np.full(4, h + 2 * r)])
     DiSMechSolver.add_rod(builder, newton.Rod(pts, radius=r), stretch_stiffness=1.0e5, bend_stiffness=10.0,
                           twist_stiffness=10.0)
     model = builder.finalize()
     solver = DiSMechSolver(model)
-    out, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
-
-    def sdf(p):
-        if shape == "sphere":
-            return np.linalg.norm(p, axis=1) - h
-        q = np.abs(p) - h
-        return np.linalg.norm(np.maximum(q, 0.0), axis=1) + np.minimum(q.max(1), 0.0)
-
+    _, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     s = np.linspace(0.0, 1.0, 31)[:, None]
-    gaps = []
-    for x in frames:
-        pts = np.concatenate([(1 - s) * x[k] + s * x[k + 1] for k in range(3)])
-        gaps.append(sdf(pts).min())
-    print(shape, "closest", min(gaps), "final", gaps[-1], "r", r, "z", out.particle_q.numpy()[:, 2],
-          "overflow", overflow(solver))
+    gaps = [sdf(np.concatenate([(1 - s) * x[k] + s * x[k + 1] for k in range(3)]), shape, h).min() for x in frames]
     assert overflow(solver) == 0
     assert min(gaps) > 0.85 * r
     assert abs(gaps[-1] - r) < 0.1 * r  # resting on it

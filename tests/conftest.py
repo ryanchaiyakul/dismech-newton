@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from dismech_newton.linear import cudss, cusparse
+from dismech_newton.linear import cudss
 
 
 def pytest_addoption(parser):
@@ -47,9 +47,3 @@ def needs_cuda(device):
 def needs_cudss(needs_cuda):
     if cudss is None:
         pytest.skip("needs cuDSS (nvmath)")
-
-
-@pytest.fixture
-def needs_cusparse(needs_cuda):
-    if cusparse is None:
-        pytest.skip("needs cuSPARSE (nvmath)")

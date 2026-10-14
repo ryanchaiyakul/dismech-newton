@@ -1,10 +1,4 @@
-"""Solvers of ``A x = b`` for the matrices of :mod:`~dismech_newton.sparse`.
-
-With ``increment``, ``solve(b, x)`` takes ``x`` as the current iterate and updates it by the correction,
-``x += A^-1 (b - A x)``: the same answer, but the float32 solve rounds with the correction, not with ``b``.
-ADMM's ``b`` (``M alpha q_pred + ...``) is large and cancels, so without it the solve leaves an iteration-
-to-iteration noise floor that can sit above the convergence tolerance on long rods.
-"""
+"""Sparse matrices on the device and their direct solves: cuDSS on CUDA (the 'gpu' extra), SciPy otherwise."""
 
 import warnings
 import weakref
@@ -13,88 +7,113 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
-from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import splu
 
-from .sparse import GeneralCSR, SymmetricCSR
-
 try:
-    from nvmath.bindings import cudss, cusparse
+    from nvmath.bindings import cudss
 except ImportError:
-    cudss = cusparse = None
+    cudss = None
 
 _CUDA_R_32F, _CUDA_R_64F, _CUDA_R_32I = 0, 1, 10  # cudaDataType codes
 
 
-def _copy_values(dst: SymmetricCSR | GeneralCSR, src: SymmetricCSR | GeneralCSR) -> bool:
-    """``dst.vals = src.vals`` (in place) if the two have one pattern; else ``False``, ``dst`` untouched."""
-    if dst is src:
-        return True
-    if type(dst) is not type(src) or not all(np.array_equal(a, b) for a, b in zip(dst.pattern, src.pattern)):
-        return False
-    wp.copy(dst.vals, src.vals)
-    return True
+class _CSR:
+    """``n``, ``indptr``, ``indices`` and float64 ``vals`` on the device."""
+
+    @property
+    def nnz(self) -> int:
+        return self.vals.shape[0]
+
+    def to_scipy(self) -> sp.csr_matrix:
+        """The stored entries on the host."""
+        return sp.csr_matrix((self.vals.numpy(), self.indices.numpy(), self.indptr.numpy()), shape=(self.n, self.n))
 
 
-def csr_entries(A: SymmetricCSR | GeneralCSR) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Host ``(rows, cols, slot)`` of every entry of the full matrix, ``slot`` its index in ``A.vals`` (a
-    :class:`SymmetricCSR`'s strict upper triangle mirrored after its stored entries)."""
-    indptr, indices = A.indptr.numpy(), A.indices.numpy()
-    rows = np.repeat(np.arange(A.n), np.diff(indptr))
-    slot = np.arange(len(indices))
-    if not isinstance(A, SymmetricCSR):
-        return rows, indices, slot
-    off = indices != rows
-    return (np.concatenate([rows, indices[off]]), np.concatenate([indices, rows[off]]),
-            np.concatenate([slot, slot[off]]))
+class SymmetricCSR(_CSR):
+    """Upper-triangle float64 CSR; the pattern is the diagonal and every DOF pair within a row of each
+    ``(count, width)`` DOF array of ``stencils``."""
+
+    def __init__(self, n: int, stencils: tuple[np.ndarray, ...], device) -> None:
+        keys = [np.arange(n, dtype=np.int64) * (n + 1)] + [_pairs(d, n).ravel() for d in stencils]
+        keys = np.unique(np.concatenate(keys))
+        indptr = np.zeros(n + 1, dtype=np.int32)
+        np.cumsum(np.bincount(keys // n, minlength=n), out=indptr[1:])
+        self.n = n
+        self.pattern = (indptr, (keys % n).astype(np.int32))  # host copy
+        self.indptr = wp.array(indptr, dtype=wp.int32, device=device)
+        self.indices = wp.array(self.pattern[1], dtype=wp.int32, device=device)
+        self.vals = wp.zeros(len(keys), dtype=wp.float64, device=device)
+        self._keys = keys
+
+    def slots(self, d: np.ndarray) -> wp.array:
+        """``[p, r]``: the slot of row ``r``'s ``p``-th DOF pair of ``d`` (``np.triu_indices`` order, so kernels
+        scatter without searching); ``d`` within the pattern."""
+        slot = np.searchsorted(self._keys, _pairs(d, self.n)).T.astype(np.int32)
+        return wp.array(np.ascontiguousarray(slot), dtype=wp.int32, device=self.vals.device)
+
+    def entries(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Host ``(rows, cols, slot)`` of the full matrix's entries: the upper triangle mirrored."""
+        indptr, indices = self.pattern
+        rows = np.repeat(np.arange(self.n), np.diff(indptr))
+        off = indices != rows
+        return (np.concatenate([rows, indices[off]]), np.concatenate([indices, rows[off]]),
+                np.concatenate([np.arange(len(indices)), np.flatnonzero(off)]))
+
+    def to_scipy(self) -> sp.csr_matrix:
+        """The full symmetric matrix on the host."""
+        upper = super().to_scipy()
+        return (upper + upper.T - sp.diags(upper.diagonal())).tocsr()
 
 
-class _Residual:
-    """``r = b - A x`` in float64, one thread per row, reading ``A.vals`` live (full rows of a symmetric
-    upper-triangle CSR through an index map)."""
+class GeneralCSR(_CSR):
+    """CSR of a general float64 matrix (the pattern of ``A``, its values on the device)."""
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR) -> None:
-        self.A = A
-        n = A.n
-        rows, cols, slot = csr_entries(A)
-        order = np.lexsort((cols, rows))
-        full_indptr = np.zeros(n + 1, dtype=np.int32)
-        np.cumsum(np.bincount(rows, minlength=n), out=full_indptr[1:])
-        dev = A.vals.device
-        self.indptr = wp.array(full_indptr, dtype=wp.int32, device=dev)
-        self.cols = wp.array(cols[order].astype(np.int32), dtype=wp.int32, device=dev)
-        self.slot = wp.array(slot[order].astype(np.int32), dtype=wp.int32, device=dev)
+    def __init__(self, A: sp.spmatrix, device) -> None:
+        A = sp.csr_matrix(A)
+        A.sum_duplicates()
+        A.sort_indices()
+        self.n = A.shape[0]
+        self.indptr = wp.array(A.indptr.astype(np.int32), dtype=wp.int32, device=device)
+        self.indices = wp.array(A.indices.astype(np.int32), dtype=wp.int32, device=device)
+        self.vals = wp.array(A.data.astype(np.float64), dtype=wp.float64, device=device)
 
-    def __call__(self, b: wp.array, x: wp.array, r: wp.array) -> None:
-        wp.launch(_residual_kernel, dim=self.A.n, inputs=[self.indptr, self.cols, self.slot, self.A.vals, b, x],
-                  outputs=[r], device=self.A.vals.device)
+
+def _pairs(d: np.ndarray, n: int) -> np.ndarray:
+    i, j = np.triu_indices(d.shape[1])
+    a, b = d[:, i].astype(np.int64), d[:, j].astype(np.int64)
+    return np.minimum(a, b) * n + np.maximum(a, b)
+
+
+@wp.func
+def triu_slot(a: int, c: int, D: int) -> int:
+    """The index of the pair ``(a, c)``, ``a <= c``, among ``D`` DOFs in ``np.triu_indices`` order."""
+    return a * D - (a * (a - 1)) // 2 + (c - a)
+
+
+@wp.func
+def row_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], a: int, b: int) -> int:
+    """The slot of ``(a, b)`` in either order, by searching its row; ``-1`` outside the pattern."""
+    r = wp.min(a, b)
+    c = wp.max(a, b)
+    for s in range(indptr[r], indptr[r + 1]):
+        if indices[s] == c:
+            return s
+    return -1
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`); without ``refactorize``, factorised once; ``single``:
-    factorised and solved in float32 (2.5x faster on a GeForce's float64, for an ``A`` that only has to be
-    approximate). Capturable, but not inside a device-side loop (a conditional graph node fails to instantiate)."""
+    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`), analysed on the first solve and factorised on the
+    first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a GeForce's float64, for an ``A``
+    that only has to be approximate). Graph-capturable."""
 
     graph_capturable = True
-    loop_capturable = False
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False,
-                 single: bool = False) -> None:
-        if cudss is None:
-            raise ImportError("CudssSolver requires nvmath (install the 'gpu' extra)")
-        if not A.vals.device.is_cuda:
-            raise ValueError(f"CudssSolver needs a CUDA matrix, got one on {A.vals.device}")
-        self.A = A
-        self.device = A.vals.device
-        self.refactorize = refactorize
-        if increment and single:
-            raise ValueError("CudssSolver: increment needs the float64 solve")
-        self._residual = _Residual(A) if increment else None
+    def __init__(self, A: SymmetricCSR | GeneralCSR, single: bool = False) -> None:
+        self.A, self.device = A, A.vals.device
         dtype = wp.float32 if single else wp.float64
         self._type = _CUDA_R_32F if single else _CUDA_R_64F
         self._vals = wp.zeros(A.nnz, dtype=dtype, device=self.device) if single else A.vals
-        self._b = wp.zeros(A.n, dtype=dtype, device=self.device)
-        self._x = wp.zeros(A.n, dtype=dtype, device=self.device)
+        self._b, self._x = (wp.zeros(A.n, dtype=dtype, device=self.device) for _ in range(2))
         self._handle = None
         self._factored = False
 
@@ -124,36 +143,17 @@ class CudssSolver:
         """``A``'s values changed: refactorise on the next solve."""
         self._factored = False
 
-    def update(self, A: SymmetricCSR | GeneralCSR, H: sp.spmatrix | None = None) -> bool:
-        """Take ``A``'s values (the same pattern) into this solver's arrays and refactorise now, outside any graph:
-        a captured solve stays valid. ``False``: another pattern, build a new solver."""
-        if not _copy_values(self.A, A):
-            return False
-        if self._handle is None:
-            self._factored = False
-        else:
-            with wp.ScopedDevice(self.device):
-                self._execute(cudss.Phase.FACTORIZATION)
-            self._factored = True
-        return True
-
-    def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
-        """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
-        if self._residual is not None:
-            self._residual(b, x, self._b)
-        else:
-            wp.launch(_convert, dim=self.A.n, inputs=[b], outputs=[self._b], device=self.device)
+    def solve(self, b: wp.array, x: wp.array) -> None:
+        """``x = A^{-1} b``."""
+        wp.launch(_convert, dim=self.A.n, inputs=[b], outputs=[self._b], device=self.device)
         with wp.ScopedDevice(self.device):
             if self._handle is None:
                 self._setup()
-            if self.refactorize or not self._factored:
+            if not self._factored:
                 self._execute(cudss.Phase.FACTORIZATION)
                 self._factored = True
             self._execute(cudss.Phase.SOLVE)
-        wp.launch(_accumulate, dim=self.A.n, inputs=[self._x, int(self._residual is not None)], outputs=[x],
-                  device=self.device)
-        if reset is not None:
-            wp.copy(*reset)
+        wp.launch(_convert, dim=self.A.n, inputs=[self._x], outputs=[x], device=self.device)
 
 
 def _destroy(handle, config, data, matrices) -> None:
@@ -165,402 +165,43 @@ def _destroy(handle, config, data, matrices) -> None:
 
 
 class ScipySolver:
-    """``A x = b`` by SuperLU on the CPU, in float64; not graph-capturable."""
+    """``A x = b`` by SuperLU on the host, in float64; factorised on the first solve after :meth:`invalidate`. Not
+    graph-capturable."""
 
-    graph_capturable = loop_capturable = False
+    graph_capturable = False
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False) -> None:
+    def __init__(self, A: SymmetricCSR | GeneralCSR) -> None:
         self.A = A
-        self.device = A.vals.device
-        self.refactorize = refactorize
-        self.increment = increment
         self._lu = None
-        self._M = None
-        if self.device.is_cuda:
-            why = "nvmath is not installed (install the 'gpu' extra)" if cudss is None else "it was requested"
-            warnings.warn(
-                f"Solving a CUDA system with SciPy because {why}: every solve copies to the host and "
-                "synchronizes, and CUDA graph capture is unavailable. cuDSS keeps it on the GPU.",
-                RuntimeWarning, stacklevel=2,
-            )
+        if A.vals.device.is_cuda:
+            warnings.warn("Solving a CUDA system with SciPy (nvmath is not installed: the 'gpu' extra): every solve "
+                          "copies to the host and synchronizes, and CUDA graph capture is unavailable.",
+                          RuntimeWarning, stacklevel=3)
 
     def invalidate(self) -> None:
         self._lu = None
 
-    def update(self, A: SymmetricCSR | GeneralCSR, H: sp.spmatrix | None = None) -> bool:
-        """Take ``A``'s values (the same pattern); refactorised on the next solve. ``False``: another pattern."""
-        if not _copy_values(self.A, A):
-            return False
-        self._lu = None
-        return True
-
-    def _factorize(self) -> None:
-        A = self.A
-        if isinstance(A, GeneralCSR):
-            M = sp.csr_matrix((A.vals.numpy(), A.indices.numpy(), A.indptr.numpy()), shape=(A.n, A.n))
-        else:
-            M = A.to_scipy()
-        self._M = M.tocsr()
-        M = M.tocsc()
-        try:
-            self._lu = splu(M)
-        except RuntimeError:  # exactly singular
-            self._lu = splu((M + 1.0e-10 * abs(M).max() * sp.identity(A.n, format="csc")).tocsc())
-
-    def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
-        """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
-        if self.device.is_capturing:
+    def solve(self, b: wp.array, x: wp.array) -> None:
+        """``x = A^{-1} b``."""
+        if self.A.vals.device.is_capturing:
             raise RuntimeError("ScipySolver solves on the host and cannot be captured in a graph")
-        if self.refactorize or self._lu is None:
-            self._factorize()
-        rhs = b.numpy().astype(np.float64)
-        if self.increment:
-            x0 = x.numpy().astype(np.float64)
-            out = x0 + self._lu.solve(rhs - self._M @ x0)
-        else:
-            out = self._lu.solve(rhs)
-        x.assign(out.astype(wp.dtype_to_numpy(x.dtype)))
-        if reset is not None:
-            wp.copy(*reset)
+        if self._lu is None:
+            M = self.A.to_scipy().tocsc()
+            try:
+                self._lu = splu(M)
+            except RuntimeError:  # exactly singular
+                self._lu = splu(M + 1.0e-10 * abs(M).max() * sp.identity(self.A.n, format="csc"))
+        x.assign(self._lu.solve(b.numpy().astype(np.float64)).astype(wp.dtype_to_numpy(x.dtype)))
 
 
-def sparse_solver(A: SymmetricCSR | GeneralCSR, refactorize: bool = True, increment: bool = False,
-                  single: bool = False) -> CudssSolver | ScipySolver:
-    """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy."""
+def sparse_solver(A: SymmetricCSR | GeneralCSR, single: bool = False) -> CudssSolver | ScipySolver:
+    """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy; ``single``: cuDSS in float32."""
     if A.vals.device.is_cuda and cudss is not None:
-        return CudssSolver(A, refactorize, increment, single)
-    return ScipySolver(A, refactorize, increment)
-
-
-class BlockInverseSolver:
-    """``A x = b`` for a constant ``A`` by one dense inverse per connected component."""
-
-    max_block = 4096  # largest block, and largest total of stored entries, that fits() accepts
-    max_entries = 1 << 26
-    graph_capturable = loop_capturable = True
-
-    def __init__(self, A: SymmetricCSR, increment: bool = False, H: sp.spmatrix | None = None) -> None:
-        """``H``: ``A.to_scipy()``, if already at hand."""
-        self.A = A
-        self.device = A.vals.device
-        perm, slot_block, start, size, offset, inv = self._layout(A.to_scipy() if H is None else H)
-
-        def ints(a):
-            return wp.array(np.asarray(a).astype(np.int32), dtype=wp.int32, device=self.device)
-
-        self.perm = ints(perm)
-        self.slot_block = ints(slot_block)
-        self.block_start = ints(start)
-        self.block_size = ints(size)
-        self.block_offset = ints(offset)
-        self.inv = wp.array(inv, dtype=float, device=self.device)
-        self._empty = wp.zeros(0, dtype=float, device=self.device)
-        self._residual = _Residual(A) if increment else None
-        self._r = wp.zeros(A.n if increment else 0, dtype=wp.float64, device=self.device)
-
-    @staticmethod
-    def _layout(H: sp.spmatrix) -> tuple[np.ndarray, ...]:
-        """``perm, slot_block, start, size, offset, inverses``: the blocks, identical ones inverted once."""
-        n_blocks, label = connected_components(H, directed=False)
-        perm = np.argsort(label, kind="stable")
-        size = np.bincount(label, minlength=n_blocks)
-        start = np.concatenate(([0], np.cumsum(size)[:-1]))
-        offset = np.empty(n_blocks, dtype=np.int64)
-        inverses, seen, total = [], {}, 0
-        for k in range(n_blocks):
-            dofs = perm[start[k] : start[k] + size[k]]
-            B = H[dofs][:, dofs].toarray()
-            key = B.tobytes()
-            if key not in seen:
-                seen[key] = total
-                inverses.append(np.linalg.inv(B).astype(np.float32).ravel())
-                total += B.size
-            offset[k] = seen[key]
-        return perm, np.repeat(np.arange(n_blocks), size), start, size, offset, np.concatenate(inverses)
-
-    def update(self, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
-        """Take ``A``'s values (the same pattern, so the same blocks) and invert the blocks again, into the same
-        arrays: a captured solve stays valid. ``False``: another pattern, or more distinct blocks than the inverses'
-        array holds (identical blocks that no longer are): build a new solver."""
-        if not _copy_values(self.A, A):
-            return False
-        *_, offset, inv = self._layout(A.to_scipy() if H is None else H)
-        if len(inv) > self.inv.shape[0]:
-            return False
-        self.inv[: len(inv)].assign(inv)
-        self.block_offset.assign(offset.astype(np.int32))
-        return True
-
-    @classmethod
-    def fits(cls, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
-        """Whether ``A``'s blocks fit :attr:`max_block` and :attr:`max_entries`."""
-        size = np.bincount(connected_components(A.to_scipy() if H is None else H, directed=False)[1])
-        return int(size.max()) <= cls.max_block and int(np.sum(size.astype(np.int64) ** 2)) <= cls.max_entries
-
-    def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
-        """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
-        dst, src = reset if reset is not None else (self._empty, self._empty)
-        increment = self._residual is not None
-        if increment:
-            self._residual(b, x, self._r)
-        wp.launch(
-            _block_inverse_kernel,
-            dim=self.A.n,
-            inputs=[self.perm, self.slot_block, self.block_start, self.block_size, self.block_offset, self.inv, b,
-                    self._r, int(increment), src],
-            outputs=[x, dst],
-            device=self.device,
-        )
-
-
-class TridiagonalSolver:
-    """``A x = b`` for a constant ``A`` whose connected components are chains (one rod's x, y, z or twist DOFs),
-    by batched cuSPARSE ``gtsv2StridedBatch`` (cyclic + parallel cyclic reduction): ``O(n)`` per solve.
-
-    The chains are padded to the longest with identity rows; single-DOF components (fixed DOFs) are solved
-    apart, in the scatter. With ``increment`` the residual is formed in the gather (no extra launch).
-    """
-
-    graph_capturable = loop_capturable = True
-
-    def __init__(self, A: SymmetricCSR, increment: bool = False, H: sp.spmatrix | None = None) -> None:
-        """``H``: ``A.to_scipy()``, if already at hand."""
-        if cusparse is None:
-            raise ImportError("TridiagonalSolver requires nvmath (install the 'gpu' extra)")
-        if not A.vals.device.is_cuda:
-            raise ValueError(f"TridiagonalSolver needs a CUDA matrix, got one on {A.vals.device}")
-        self.A = A
-        self.device = dev = A.vals.device
-        self.increment = increment
-        H = (A.to_scipy() if H is None else H).tocsr()
-        self.batch, self.m, self._slot_dof = self._layout(H)
-        dl, d, du, single_diag = self._values(H)
-        slot_dof = self._slot_dof
-        total = len(slot_dof)
-        dof_slot = np.full(A.n, -1, dtype=np.int32)
-        dof_slot[slot_dof[slot_dof >= 0]] = np.flatnonzero(slot_dof >= 0)
-
-        def arr(a, dtype):
-            return wp.array(a, dtype=dtype, device=dev)
-
-        self.dl, self.d, self.du = (arr(v.astype(np.float32), float) for v in (dl, d, du))  # factor (float32)
-        # The residual's copy (float64), read only with increment.
-        self.dl64, self.d64, self.du64 = (arr(v if increment else v[:0], wp.float64) for v in (dl, d, du))
-        self.slot_dof, self.dof_slot = arr(slot_dof, wp.int32), arr(dof_slot, wp.int32)
-        self.single_diag = arr(single_diag, wp.float64)
-        self.X = wp.zeros(total, dtype=float, device=dev)
-        self._empty = wp.zeros(0, dtype=float, device=dev)
-        self._handle = None
-        self._buffer = None
-
-    @classmethod
-    def fits(cls, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
-        """Whether this solver can take ``A``: CUDA, nvmath, and every component a chain."""
-        if cusparse is None or not A.vals.device.is_cuda:
-            return False
-        H = A.to_scipy() if H is None else H
-        off = sp.triu(H, k=1, format="coo")
-        off.eliminate_zeros()
-        degree = np.bincount(np.concatenate([off.row, off.col]), minlength=A.n)
-        n_blocks = connected_components(H, directed=False)[0]
-        return degree.max(initial=0) <= 2 and off.nnz == A.n - n_blocks  # a forest of paths
-
-    @staticmethod
-    def _layout(H: sp.spmatrix) -> tuple[int, int, np.ndarray]:
-        """``batch, m, slot_dof``: the chains, each padded to ``m`` slots (``-1``: an identity row)."""
-        chains = _chains(H)
-        m = max([3] + [len(c) for c in chains])  # gtsv2 needs m >= 3
-        slot_dof = np.full(max(len(chains) * m, 1), -1, dtype=np.int32)
-        for k, chain in enumerate(chains):
-            slot_dof[k * m + np.arange(len(chain))] = chain
-        return len(chains), m, slot_dof
-
-    def update(self, A: SymmetricCSR, H: sp.spmatrix | None = None) -> bool:
-        """Take ``A``'s values (the same pattern, so the same chains) into the same diagonals: a captured solve
-        stays valid (gtsv2 factors on every solve). ``False``: another pattern, build a new solver."""
-        if not _copy_values(self.A, A):
-            return False
-        dl, d, du, single_diag = self._values(A.to_scipy() if H is None else H)
-        for dst, v in zip((self.dl, self.d, self.du), (dl, d, du)):
-            dst.assign(v.astype(np.float32))
-        if self.increment:
-            for dst, v in zip((self.dl64, self.d64, self.du64), (dl, d, du)):
-                dst.assign(v)
-        self.single_diag.assign(single_diag)
-        return True
-
-    def _values(self, H: sp.spmatrix) -> tuple[np.ndarray, ...]:
-        """``dl, d, du`` of ``H`` on this solver's chains (one gather, no chain search) and the single DOFs'
-        diagonal."""
-        H = H.tocsr()
-        slot_dof, m = self._slot_dof, self.m
-        total = len(slot_dof)
-        diag = H.diagonal()
-        dl, d, du = np.zeros(total), np.ones(total), np.zeros(total)
-        valid = slot_dof >= 0
-        d[valid] = diag[slot_dof[valid]]
-        s = np.flatnonzero(valid[:-1] & (np.arange(total - 1) % m != m - 1) & (slot_dof[1:] >= 0))  # s, s + 1 linked
-        up = np.asarray(H[slot_dof[s], slot_dof[s + 1]]).ravel()
-        du[s], dl[s + 1] = up, up
-        single_diag = np.zeros(self.A.n)
-        single = np.ones(self.A.n, dtype=bool)
-        single[slot_dof[valid]] = False
-        single_diag[single] = diag[single]
-        return dl, d, du, single_diag
-
-    def _setup(self) -> None:
-        self._handle = cusparse.create()
-        weakref.finalize(self, cusparse.destroy, self._handle)
-        size = cusparse.sgtsv2strided_batch_buffer_size_ext(self._handle, self.m, self.dl.ptr, self.d.ptr,
-                                                             self.du.ptr, self.X.ptr, self.batch, self.m)
-        self._buffer = wp.zeros(max(int(size), 1), dtype=wp.uint8, device=self.device)
-
-    def solve(self, b: wp.array, x: wp.array, reset: tuple[wp.array, wp.array] | None = None) -> None:
-        """``x = A^{-1} b``; ``reset = (dst, src)`` also copies ``src`` into ``dst``."""
-        dst, src = reset if reset is not None else (self._empty, self._empty)
-        inc = int(self.increment)
-        if self.batch:
-            if self._handle is None:
-                self._setup()
-            wp.launch(_tridiagonal_gather_kernel, dim=self.X.shape[0],
-                      inputs=[self.slot_dof, self.dl64, self.d64, self.du64, b, x, inc], outputs=[self.X],
-                      device=self.device)
-            cusparse.set_stream(self._handle, self.device.stream.cuda_stream)
-            cusparse.sgtsv2strided_batch(self._handle, self.m, self.dl.ptr, self.d.ptr, self.du.ptr, self.X.ptr,
-                                         self.batch, self.m, self._buffer.ptr)
-        wp.launch(_tridiagonal_scatter_kernel, dim=self.A.n,
-                  inputs=[self.dof_slot, self.X, self.single_diag, b, inc, src], outputs=[x, dst],
-                  device=self.device)
-
-
-def _chains(H: sp.spmatrix) -> list[np.ndarray]:
-    """The DOFs of every component of ``H`` with more than one, in chain order."""
-    H = H.tocsr()
-    n_blocks, label = connected_components(H, directed=False)
-    off = H.copy()
-    off.setdiag(0.0)
-    off.eliminate_zeros()
-    degree = np.diff(off.indptr)
-    order = np.argsort(label, kind="stable")
-    bounds = np.searchsorted(label[order], np.arange(n_blocks + 1))
-    chains = []
-    for k in range(n_blocks):
-        members = order[bounds[k] : bounds[k + 1]]
-        if len(members) == 1:
-            continue
-        ends = members[degree[members] == 1]
-        if len(ends) != 2 or degree[members].max() > 2:
-            raise ValueError("TridiagonalSolver needs every component of A to be a chain")
-        chain, prev = [ends[0]], -1
-        while len(chain) < len(members):
-            row = off.indices[off.indptr[chain[-1]] : off.indptr[chain[-1] + 1]]
-            prev, nxt = chain[-1], row[row != prev][0]
-            chain.append(nxt)
-        chains.append(np.asarray(chain))
-    return chains
+        return CudssSolver(A, single)
+    return ScipySolver(A)
 
 
 @wp.kernel
 def _convert(src: wp.array[Any], dst: wp.array[Any]):
     i = wp.tid()
     dst[i] = type(dst[i])(src[i])
-
-
-@wp.kernel
-def _accumulate(src: wp.array[Any], increment: int, dst: wp.array[float]):
-    """``dst = src``, or ``dst += src`` with ``increment``."""
-    i = wp.tid()
-    v = float(src[i])
-    if increment != 0:
-        v = dst[i] + v
-    dst[i] = v
-
-
-@wp.kernel
-def _residual_kernel(indptr: wp.array[wp.int32], cols: wp.array[wp.int32], slot: wp.array[wp.int32],
-                     vals: wp.array[wp.float64], b: wp.array[float], x: wp.array[float], r: wp.array[wp.float64]):
-    i = wp.tid()
-    acc = wp.float64(b[i])
-    for k in range(indptr[i], indptr[i + 1]):
-        acc -= vals[slot[k]] * wp.float64(x[cols[k]])
-    r[i] = acc
-
-
-@wp.kernel
-def _block_inverse_kernel(
-    perm: wp.array[wp.int32],
-    slot_block: wp.array[wp.int32],
-    block_start: wp.array[wp.int32],
-    block_size: wp.array[wp.int32],
-    block_offset: wp.array[wp.int32],
-    inv: wp.array[float],
-    b: wp.array[float],
-    r: wp.array[wp.float64],
-    increment: int,
-    reset_src: wp.array[float],
-    # outputs
-    x: wp.array[float],
-    reset_dst: wp.array[float],
-):
-    """One thread per DOF in block order: ``x = inv b``, or ``x += inv r`` with ``increment``; also
-    ``reset_dst = reset_src`` if given."""
-    p = wp.tid()
-    k = slot_block[p]
-    s = block_start[k]
-    n = block_size[k]
-    col = block_offset[k] + p - s  # the inverse is symmetric: column p - s of the block
-    acc = float(0.0)
-    i = perm[p]
-    if increment != 0:
-        for j in range(n):
-            acc += inv[col + j * n] * float(r[perm[s + j]])
-        acc += x[i]
-    else:
-        for j in range(n):
-            acc += inv[col + j * n] * b[perm[s + j]]
-    x[i] = acc
-    if reset_dst.shape[0] > 0:
-        reset_dst[i] = reset_src[i]
-
-
-@wp.kernel
-def _tridiagonal_gather_kernel(slot_dof: wp.array[wp.int32], dl: wp.array[wp.float64], d: wp.array[wp.float64],
-                               du: wp.array[wp.float64], b: wp.array[float], x: wp.array[float], increment: int,
-                               X: wp.array[float]):
-    """The padded right-hand side: ``b``, or with ``increment`` the residual ``b - A x`` (float64)."""
-    s = wp.tid()
-    i = slot_dof[s]
-    if i < 0:
-        X[s] = 0.0
-        return
-    acc = wp.float64(b[i])
-    if increment != 0:
-        acc -= d[s] * wp.float64(x[i])
-        if dl[s] != wp.float64(0.0):
-            acc -= dl[s] * wp.float64(x[slot_dof[s - 1]])
-        if du[s] != wp.float64(0.0):
-            acc -= du[s] * wp.float64(x[slot_dof[s + 1]])
-    X[s] = float(acc)
-
-
-@wp.kernel
-def _tridiagonal_scatter_kernel(dof_slot: wp.array[wp.int32], X: wp.array[float], single_diag: wp.array[wp.float64],
-                                b: wp.array[float], increment: int, reset_src: wp.array[float],
-                                x: wp.array[float], reset_dst: wp.array[float]):
-    """``x`` from the padded solution (single-DOF components: ``b / diag``); also the reset copy."""
-    i = wp.tid()
-    s = dof_slot[i]
-    if s >= 0:
-        v = X[s]
-        if increment != 0:
-            v = x[i] + v
-    else:
-        r = wp.float64(b[i])
-        if increment != 0:
-            r -= single_diag[i] * wp.float64(x[i])
-        v = float(r / single_diag[i])
-        if increment != 0:
-            v = x[i] + v
-    x[i] = v
-    if reset_dst.shape[0] > 0:
-        reset_dst[i] = reset_src[i]

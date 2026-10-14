@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 from utils.splat import SH_C0, Splats, edge_gaussians, export_usd, skin, tube
 
 from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
-from dismech_newton.dofs import dof_constants
+from dismech_newton.state import dof_constants
 
 RADIUS, SIGMA = 0.02, (0.003, 0.008, 0.01)
 
@@ -265,8 +265,7 @@ def read_frame(stage, prims, k):
 def test_export_usd_round_trip(scene, tmp_path, rng, baked):
     """Two frames written and read back (appearance with Newton's reader): baked = the skin, rigged = the skin at
     rest length, grouped by edge."""
-    pytest.importorskip("pxr.UsdVol")
-    from pxr import Usd, UsdGeom
+    from pxr import Usd, UsdGeom  # noqa: PLC0415 (usd-core: the dev group)
 
     sc = scene
     model, splats, sp = sc["model"], sc["splats"], sc["sp"]

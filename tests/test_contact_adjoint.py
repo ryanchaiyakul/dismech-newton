@@ -1,86 +1,79 @@
-"""The contact adjoint (ADMM, ground and rod-rod) against finite differences of a rollout."""
-
-from dataclasses import replace
+"""The contact adjoint against finite differences of a rollout (ground, rod-rod, a rod edge on a sphere), and its
+closest points against the collision's."""
 
 import numpy as np
 import pytest
 import warp as wp
-from fd import assert_close
-from rollouts import CrossingRollout, GroundRollout, contact_options
+from newton._src.geometry import kernels as G
+from rollouts import CrossingRollout, GroundRollout, SheetContactRollout, SphereRollout
 
-from dismech_newton import ADMMDiSMechSolver
-from dismech_newton.adjoint import StepAdjoint, _ContactSystem
+from dismech_newton.adjoint import _closest_weights
 
-SMOOTHING = pytest.mark.parametrize("smoothing", [0.0, 1.0e-3], ids=["exact", "smoothed"])
+OPTIONS = {"iterations": 500}  # converged: the adjoint is the converged step's
 
 
 @pytest.mark.parametrize(
     "mu, v_mean, checks",
     [
-        (0.3, (0.3, 0.1, 0.0), ("mass", "friction", "velocity", "position")),
+        (0.3, (0.3, 0.1, 0.0), ("mass", "velocity", "position")),
         (0.0, (0.3, 0.1, 0.0), ("mass", "velocity", "position")),
-        # Stuck: a stretching perturbation would break the stick (its linear range is ~1e-6 m).
         (2.0, (0.0, 0.0, 0.0), ("velocity", "translation")),
     ],
     ids=["slide", "frictionless", "stick"],
 )
-@SMOOTHING
-def test_ground_adjoint_matches_finite_differences(request, device, rng, mu, v_mean, checks, smoothing):
-    """Perturbations stay clear of the stick/slip and on/off switches. The adjoint is exact to ~1e-5 here; the
-    tolerance is the differences' round-off: ~1e-2 for a freely sliding (frictionless) rod, ~2% for the small
-    mass derivative (~3% on the CPU, whose float32 rounding moves the differences, not the adjoint)."""
-    if device.is_cpu and mu == 0.3 and smoothing == 0.0:
-        # Every interior node has two ground contacts (both capsules' end spheres): the same constraint twice
-        # leaves the contact adjoint system singular. cuDSS still solves it; SciPy's regularized fallback does not.
-        request.applymarker(pytest.mark.xfail(reason="duplicate ground contacts: singular adjoint system on the CPU"))
-    GroundRollout(rng, v_mean, checks).check(ADMMDiSMechSolver, contact_options(mu, smoothing), rtol=3.0e-2,
-                                             rtols={"mass": 5.0e-2} if device.is_cpu else None,
-                                             wrt_friction="friction" in checks)
+def test_ground_adjoint_matches_finite_differences(rng, mu, v_mean, checks):
+    """A rod's nodes on the ground plane (no self-contact: the copies overlap). The mass derivative is small against
+    its differences' round-off."""
+    GroundRollout(rng, v_mean, checks, mu).check(dict(OPTIONS, self_contact=False), rtol=1.0e-2,
+                                                 rtols={"mass": 3.0e-2})
 
 
 @pytest.mark.parametrize("mu", [0.0, 0.3], ids=["frictionless", "slide"])
-@SMOOTHING
-def test_rod_contact_adjoint_matches_finite_differences(rng, mu, smoothing):
-    """Rod-rod contact, whose closest points and normal the step takes from ``q_in``: tilting the top rod turns
-    the normal (missing that dependence was a 2.5-3% error). The mass and random-position derivatives are small
-    against their differences' round-off (~4e-3; they converge toward the adjoint only at larger steps, beyond
-    which the contact turns nonlinear)."""
-    CrossingRollout(rng).check(ADMMDiSMechSolver, contact_options(mu, smoothing), rtol=2.0e-3,
-                               rtols={"mass": 1.0e-2, "position": 1.0e-2}, wrt_friction=mu > 0.0)
+def test_rod_contact_adjoint_matches_finite_differences(rng, mu):
+    """Rod-rod (edge-edge): the closest points and normal the step takes from ``q_in`` recomputed from it. The
+    differences scatter by ~5e-3 with their step, the small mass, velocity and random position derivatives by a few
+    percent."""
+    CrossingRollout(rng, mu).check(OPTIONS, rtol=1.0e-2, rtols={"mass": 5.0e-2, "velocity": 3.0e-2, "position": 5.0e-2})
 
 
-def test_contact_adjoint_refinement_agrees(monkeypatch, rng):
-    """Refining the contact system against the exact ``J^T`` leaves the solve's gradients (round-off apart)."""
-    r = GroundRollout(rng, (0.3, 0.1, 0.0), ("mass", "velocity", "position", "translation"))
-    options = contact_options(0.3)
-    solved = r.adjoint(ADMMDiSMechSolver, **options)
-    monkeypatch.setattr(StepAdjoint, "refine", 2)
-    refined = r.adjoint(ADMMDiSMechSolver, **options)
-    for name in solved:
-        assert_close(refined[name], solved[name], 1.0e-3, name, scale=max(abs(solved[name]), 1.0e-12))
+@pytest.mark.parametrize("mu", [0.0, 0.3], ids=["frictionless", "slide"])
+def test_shape_contact_adjoint_matches_finite_differences(rng, mu):
+    """A rod edge sliding over a sphere: its closest point to the surface and the normal there turn with the rod.
+    The small mass derivative's differences scatter by a few percent."""
+    SphereRollout(rng, mu).check(OPTIONS, rtol=1.0e-2, rtols={"mass": 5.0e-2})
 
 
-def test_contact_pattern_ignores_slot_order(rng):
-    """The narrow phase fills contact slots in a varying order (across worlds): the same contacts in other slots
-    must reuse the cached pattern (a new one costs a cuDSS analysis) and give the same adjoint."""
-    r = GroundRollout(rng, (0.3, 0.1, 0.0), ("velocity",))
-    r.steps = 1
-    run = r.setup(ADMMDiSMechSolver, contact_options(0.3), grad=True)
-    r.record(run)
-    adjoint, snapshot, state_in = run.solver._adjoint, run.solver.contact_snapshot(), run.states[0]
-    h = run.solver.theta * r.dt
+@pytest.mark.parametrize("mu", [0.0, 0.3], ids=["frictionless", "slide"])
+@pytest.mark.parametrize("scene", ["ground", "sphere", "foot", "edge"])
+def test_sheet_contact_adjoint_matches_finite_differences(rng, scene, mu):
+    """A sheet's vertex on the ground and on a sphere, a rod's node on a triangle, a rod's edge across the sheet's
+    edge. Solved exactly: ADMM's elastic splitting leaves float32 noise that a light sheet's differences do not
+    resolve. The ground's small mass derivative scatters by ~1% with its differences' step."""
+    SheetContactRollout(rng, scene, mu).check({"exact": True, "iterations": 100}, rtol=1.0e-2, rtols={"mass": 3.0e-2})
 
-    def solve(snap):
-        system = _ContactSystem.build(adjoint, state_in, h, snap)
-        system.solve(state_in, h)
-        return system.pattern, adjoint._lam.numpy().copy()
 
-    perm = rng.permutation(snapshot.count)
-    permuted = replace(snapshot, **{f: wp.array(getattr(snapshot, f).numpy()[perm], dtype=getattr(snapshot, f).dtype)
-                                    for f in ("pairs", "bary", "normal", "anchor", "shift", "thickness",
-                                              "force", "rho")})
-    assert snapshot.count > 1
-    pattern, lam = solve(snapshot)
-    pattern_permuted, lam_permuted = solve(permuted)
-    assert pattern_permuted is pattern
-    np.testing.assert_allclose(lam_permuted, lam, rtol=1.0e-5, atol=1.0e-6 * np.abs(lam).max())
+@wp.kernel
+def _weights_kernel(q: wp.array[float], pairs: wp.array[wp.vec4i], w: wp.array[wp.vec4], out: wp.array[wp.vec4],
+                    bary: wp.array[wp.vec3]):
+    i = wp.tid()
+    out[i] = _closest_weights(q, pairs[i], w[i])
+    x = wp.vec3(q[0], q[1], q[2])
+    a = wp.vec3(q[3], q[4], q[5])
+    b = wp.vec3(q[6], q[7], q[8])
+    c = wp.vec3(q[9], q[10], q[11])
+    bary[i] = G.triangle_closest_point_barycentric(a, b, c, x)
+
+
+def test_closest_weights_match_the_collision():
+    """A node over a triangle's interior or one of its edges: the adjoint's weights (a projection onto the plane or
+    line of the feature the step found) are the collision's closest point."""
+    tri = np.array([[0.0, 0.0, 0.0], [1.0, 0.1, 0.05], [0.2, 0.9, -0.05]])
+    for x, pair in (([0.4, 0.3, 0.2], [0, 1, 2, 3]), ([0.5, -0.2, 0.1], [0, 1, 2, -1]),
+                    ([0.7, 0.8, 0.1], [0, -1, 2, 3])):
+        q = wp.array(np.concatenate([x, tri.ravel()]), dtype=float)
+        out, bary = wp.zeros(1, dtype=wp.vec4), wp.zeros(1, dtype=wp.vec3)
+        guess = wp.vec4(1.0, *(-0.3 if p >= 0 else 0.0 for p in pair[1:]))  # only the signs matter
+        wp.launch(_weights_kernel, dim=1, inputs=[q, wp.array([pair], dtype=wp.vec4i), wp.array([guess], dtype=wp.vec4)],
+                  outputs=[out, bary])
+        expected = np.concatenate([[1.0], -bary.numpy()[0]])
+        np.testing.assert_allclose(out.numpy()[0], expected, atol=1.0e-5, err_msg=str(pair))

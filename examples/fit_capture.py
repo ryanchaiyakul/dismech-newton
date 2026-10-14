@@ -28,8 +28,8 @@ twist stiffness. Everything else it reads off the data:
    recovered pose, rendered over the clean plate and compared pixel by pixel; from the best of a coarse scan over
    1/30-30x the truth (its basin is narrow in EI: a rod that swings at another rate barely overlaps the recorded
    one), the frames blurred by 4, then 2, then 0 px. The fit
-   simulates with :class:`~dismech_newton.ADMMDiSMechSolver` at its defaults (at most 50 iterations a step),
-   restarted for every rollout, and takes the gradient through its steps; the video is simulated with Newton.
+   simulates with :class:`~dismech_newton.DiSMechSolver` (ADMM, 50 iterations a step), restarted for every
+   rollout, and takes the gradient through its steps; the video is simulated with Newton.
 
 The start pose limits the fit: a node off by a millimetre on 5 cm edges is a kink as curved as the rod, the released
 rod rings with it, and the damping absorbs that. One colour view alone leaves depth to the outline's fine detail;
@@ -60,9 +60,7 @@ from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale
 from utils.gaussians import DEVICE, Camera, backprop, to_uint8, view
 from utils.splat import Splats, skin
 
-from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, add_rod, fix_segment, flatten_state
-from dismech_newton.solver import advance_frames_kernel
-from dismech_newton.triplet import advance_ref_twist_kernel
+from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
 
 # -- the rod and the truth -----------------------------------------------------------------
 LENGTH, SEGMENTS, RADIUS = 0.5, 10, 0.02
@@ -128,7 +126,7 @@ def held_pose() -> np.ndarray:
 
 def build(length=LENGTH, radius=RADIUS, mass=None, admm: bool = False):
     """A rod straight at rest from the clamp along +x, its first edge clamped; ``mass``: the total (else the
-    default density's). ``admm``: the ADMM solver at its defaults (else Newton)."""
+    default density's). ``admm``: ADMM at 50 iterations a step (else Gauss-Newton to convergence)."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     rod = newton.Rod.create_straight(tuple(CLAMP), (1.0, 0.0, 0.0), length, segment_count=SEGMENTS, radius=radius)
     ids = add_rod(builder, rod, stretch_stiffness=EA, bend_stiffness=TRUE["EI"], twist_stiffness=GJ,
@@ -139,7 +137,7 @@ def build(length=LENGTH, radius=RADIUS, mass=None, admm: bool = False):
         m = model.particle_mass
         assert m is not None
         m.assign(m.numpy() * (mass / m.numpy().sum()))
-    solver = ADMMDiSMechSolver(model) if admm else DiSMechSolver(model)
+    solver = DiSMechSolver(model, iterations=50) if admm else DiSMechSolver(model, exact=True, iterations=20)
     solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
 
@@ -155,19 +153,9 @@ def start(solver, rest, st, q):
     """``st`` = ``rest`` moved to the DOFs ``q``, still: the edge frames transported from rest, reference twists
     and strains measured there. The solver starts its next step from ``st`` (no ADMM warm start from the last
     rollout)."""
-    for k in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
-        getattr(st.dismech, k).assign(getattr(rest.dismech, k))
     st.dismech.q.assign(np.asarray(q, dtype=np.float32))
     st.dismech.qd.zero_()
-    d, tr = solver.der, solver.triplets
-    wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0],
-              inputs=[rest.particle_q, st.particle_q, d.edge_node0, d.edge_node1, rest.dismech.edge_d1_q],
-              outputs=[st.dismech.edge_d1_q])
-    wp.launch(advance_ref_twist_kernel, dim=tr.count,
-              inputs=[st.dismech.q, st.dismech.edge_d1_q, tr.conn, rest.dismech.triplet_ref_twist_q],
-              outputs=[st.dismech.triplet_ref_twist_q])
-    tr.measure(st, st.dismech.triplet_strain_q)
-    solver.reset(st)
+    solver.restart(st, rest)
 
 
 def held_q(nodes, twist: float) -> np.ndarray:

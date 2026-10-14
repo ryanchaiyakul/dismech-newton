@@ -1,131 +1,59 @@
-"""The linear solvers against SciPy, plain and in increment form."""
+"""The direct solves against dense ones: symmetric (upper CSR) and general; SciPy on the CPU, cuDSS (float64 and
+float32) on CUDA."""
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
-import scipy.sparse.linalg as sla
 import warp as wp
+from fd import assert_close
 
-from dismech_newton.linear import BlockInverseSolver, CudssSolver, ScipySolver, TridiagonalSolver, cudss, cusparse
-from dismech_newton.sparse import GeneralCSR, SymmetricCSR
-
-pytestmark = pytest.mark.filterwarnings("ignore:Solving a CUDA system with SciPy:RuntimeWarning")
+from dismech_newton.linear import CudssSolver, GeneralCSR, ScipySolver, SymmetricCSR, cudss
 
 
-def _array(x) -> wp.array:
-    return wp.array(np.asarray(x, dtype=np.float32), dtype=float)
+def _system(rng, device, n: int = 40):
+    """A random SPD matrix on the pattern of overlapping 4-DOF stencils, as an upper CSR, and the full matrix."""
+    stencils = np.array([np.arange(k, k + 4) for k in range(0, n - 3, 2)])
+    A = SymmetricCSR(n, (stencils,), device)
+    full = n * np.eye(n)
+    for d in stencils:
+        block = rng.normal(size=(4, 4))
+        full[np.ix_(d, d)] += block @ block.T
+    indptr, indices = A.pattern
+    rows = np.repeat(np.arange(n), np.diff(indptr))
+    A.vals.assign(full[rows, indices])
+    return A, full
 
 
-def _chains(rng, lengths=(1, 2, 3, 40, 117), singles=3, scale=2.0e4):
-    """A shuffled block-diagonal of SPD tridiagonal chains (an M-matrix, like ADMM's H) and single DOFs."""
-    blocks = []
-    for n in lengths:
-        off = -rng.uniform(0.5, 1.0, n - 1) * scale
-        diag = rng.uniform(1.0e-3, 1.0, n) * scale + np.abs(np.concatenate([off, [0.0]])) + np.abs(
-            np.concatenate([[0.0], off]))
-        blocks.append(sp.diags([off, diag, off], [-1, 0, 1]))
-    blocks += [sp.identity(1) * rng.uniform(0.5, 2.0) for _ in range(singles)]
-    H = sp.block_diag(blocks, format="csr")
-    p = rng.permutation(H.shape[0])
-    return H[p][:, p].tocsr()
+def _solvers(A, device):
+    """Each solver and its tolerance (the float32 solution's at best)."""
+    if not device.is_cuda or cudss is None:  # (SciPy on a CUDA matrix warns: only without nvmath)
+        return {"scipy": (ScipySolver(A), 1.0e-6)}
+    return {"cudss": (CudssSolver(A), 1.0e-6), "cudss float32": (CudssSolver(A, single=True), 1.0e-5)}
 
 
-def _solvers(A, device, refactorize: bool = True):
-    """Every solver available on ``device``, by name: ``make(increment)``; ``refactorize=False``: factor once (as
-    ADMM does), where that is an option."""
-    out = {"block": lambda inc: BlockInverseSolver(A, increment=inc),
-           "scipy": lambda inc: ScipySolver(A, refactorize=refactorize, increment=inc)}
-    if device.is_cuda and cudss is not None:
-        out["cudss"] = lambda inc: CudssSolver(A, refactorize=refactorize, increment=inc)
-    if device.is_cuda and cusparse is not None:
-        out["tridiagonal"] = lambda inc: TridiagonalSolver(A, increment=inc)
-    return out
+@pytest.mark.parametrize("general", [False, True], ids=["symmetric", "general"])
+def test_solvers_match_dense(device, rng, general):
+    A, full = _system(rng, device)
+    if general:  # make it nonsymmetric
+        full = full + np.triu(rng.normal(size=full.shape), 1) * (full != 0)
+        A = GeneralCSR(sp.csr_matrix(full), device)
+    b = rng.normal(size=full.shape[0])
+    expected = np.linalg.solve(full, b)
+    for name, (solver, rtol) in _solvers(A, device).items():
+        x = wp.zeros(len(b), dtype=float, device=device)
+        solver.solve(wp.array(b, dtype=wp.float64, device=device), x)
+        assert_close(x.numpy(), expected, rtol, name)
 
 
-@pytest.mark.parametrize("increment", [False, True])
-def test_solvers_match_scipy(device, rng, increment):
-    H = _chains(rng)
-    A = SymmetricCSR.from_scipy(H, device)
-    n = H.shape[0]
-    b = rng.normal(size=n) * 1.0e4  # large, like ADMM's M alpha q_pred
-    x_ref = sla.spsolve(H.tocsc(), b)
-    for name, make in _solvers(A, device).items():
-        solver = make(increment)
-        x = _array(x_ref + rng.normal(size=n) * 1.0e-2 if increment else np.zeros(n))  # a previous iterate
-        dst, src = wp.zeros(n, dtype=float), _array(np.arange(n))
-        solver.solve(_array(b), x, reset=(dst, src))
-        err = np.abs(x.numpy() - x_ref).max() / np.abs(x_ref).max()
-        assert err < 1.0e-5, f"{name}: relative error {err:.1e}"
-        np.testing.assert_array_equal(dst.numpy(), src.numpy(), err_msg=f"{name}: reset")
-
-
-def test_increment_rounds_with_the_correction(device, rng):
-    """Near the solution, the increment form's error scales with the correction, not with ``b``."""
-    H = _chains(rng, lengths=(400,), singles=0)
-    A = SymmetricCSR.from_scipy(H, device)
-    n = H.shape[0]
-    x_ref = rng.normal(size=n)
-    b = _array(H @ x_ref)
-    x_near = x_ref + 1.0e-4 * rng.normal(size=n)
-    for name, make in _solvers(A, device).items():
-        errs = []
-        for solver in (make(False), make(True)):
-            x = _array(x_near)
-            solver.solve(b, x)
-            errs.append(np.abs(x.numpy() - x_ref).max())
-        assert errs[1] <= errs[0] * 1.5 + 1.0e-6, f"{name}: increment {errs[1]:.1e} vs plain {errs[0]:.1e}"
-
-
-@pytest.mark.usefixtures("needs_cudss")
-def test_cudss_increment_general(device, rng):
-    n = 30
-    M = sp.random(n, n, density=0.2, random_state=1) + 10.0 * sp.identity(n)
-    b = rng.normal(size=n)
-    x = _array(rng.normal(size=n))
-    CudssSolver(GeneralCSR(M, device), increment=True).solve(_array(b), x)
-    np.testing.assert_allclose(x.numpy(), sla.spsolve(M.tocsc(), b), rtol=1e-4, atol=1e-5)
-
-
-@pytest.mark.usefixtures("needs_cusparse")
-def test_tridiagonal_fits(device, rng):
-    assert TridiagonalSolver.fits(SymmetricCSR.from_scipy(_chains(rng), device))
-    star = sp.identity(4, format="lil") * 4.0
-    for j in (1, 2, 3):
-        star[0, j] = star[j, 0] = -1.0
-    cycle = sp.diags([-np.ones(3), 4 * np.ones(4), -np.ones(3)], [-1, 0, 1], format="lil")
-    cycle[0, 3] = cycle[3, 0] = -1.0
-    for H in (star, cycle):
-        A = SymmetricCSR.from_scipy(H.tocsr(), device)
-        assert not TridiagonalSolver.fits(A)
-        with pytest.raises(ValueError):
-            TridiagonalSolver(A)
-
-
-def test_update_in_place(device, rng):
-    """New values of the same pattern, taken in place: a solve captured before the update solves the new system;
-    another pattern is refused."""
-    H1 = _chains(rng)
-    n = H1.shape[0]
-    H2 = (H1 + sp.diags(rng.uniform(0.5, 2.0, n) * 2.0e4)).tocsr()  # e.g. new masses
-    b = rng.normal(size=n) * 1.0e4
-    x_ref = sla.spsolve(H2.tocsc(), b)
-    for name in _solvers(None, device):
-        A = SymmetricCSR.from_scipy(H1, device)  # each solver its own: update writes into it
-        solver = _solvers(A, device, refactorize=False)[name](True)
-        x, b_dev = wp.zeros(n, dtype=float), _array(b)
-        solver.solve(b_dev, x)  # set-up and first factorization
-        graph = None
-        if device.is_cuda and solver.graph_capturable:
-            with wp.ScopedCapture() as capture:
-                solver.solve(b_dev, x)
-            graph = capture.graph
-        assert solver.update(SymmetricCSR.from_scipy(H2, device), H2), f"{name}: refused the same pattern"
-        x.zero_()
-        if graph is not None:
-            wp.capture_launch(graph)
-        else:
-            solver.solve(b_dev, x)
-        err = np.abs(x.numpy() - x_ref).max() / np.abs(x_ref).max()
-        assert err < 1.0e-5, f"{name}: relative error {err:.1e} after the update"
-        other = (H2 + sp.diags(np.ones(n - 1), 1) + sp.diags(np.ones(n - 1), -1)).tocsr()
-        assert not solver.update(SymmetricCSR.from_scipy(other, device), other), f"{name}: took another pattern"
+def test_invalidate_refactorises(device, rng):
+    """New values take effect only after ``invalidate``."""
+    A, full = _system(rng, device)
+    b = rng.normal(size=full.shape[0])
+    for name, (solver, _) in _solvers(A, device).items():
+        x = wp.zeros(len(b), dtype=float, device=device)
+        solver.solve(wp.array(b, dtype=wp.float64, device=device), x)
+        A.vals.assign(2.0 * A.vals.numpy())
+        solver.invalidate()
+        solver.solve(wp.array(b, dtype=wp.float64, device=device), x)
+        A.vals.assign(0.5 * A.vals.numpy())
+        np.testing.assert_allclose(x.numpy(), np.linalg.solve(2.0 * full, b), rtol=1.0e-4, err_msg=name)

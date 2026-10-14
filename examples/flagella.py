@@ -14,10 +14,10 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from utils.common import SIM, contact_pipeline, inset, segment_distance, segment_dofs
+from utils.common import SIM, inset, segment_distance, segment_dofs
 from utils.stokes import Stokeslets
 
-from dismech_newton import ADMMDiSMechSolver, flatten_state
+from dismech_newton import DiSMechSolver, flatten_state
 
 PAPER = {
     "youngs_modulus": 3.0e6,  # [Pa]
@@ -38,6 +38,9 @@ PAPER = {
 }
 
 TOP = 0.3  # height of the clamps [m]
+# Half the paper's dt: at its 1 ms and 10 iterations, ADMM's leftover contact residual damps the bundle's winding,
+# and two frictionless flagella never climb toward the clamps.
+DT = 0.5e-3  # [s]
 
 
 def flagellum(p: dict, offset: tuple[float, float]) -> np.ndarray:
@@ -101,15 +104,13 @@ class DERFlagella:
         self.rods = []
         for points in self.points:
             rod = _rod(points, p)
-            bodies = ADMMDiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=p["density"]))
-            ADMMDiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
+            bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=p["density"]))
+            DiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
             self.rods.append(bodies)
         self.model = model = builder.finalize()
-        self.solver = ADMMDiSMechSolver(model, friction=p["friction"])
+        self.solver = DiSMechSolver(model, friction=p["friction"])
         if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
             self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
-        self.pipeline = contact_pipeline(model, p["radius"])
-        self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = model.state(), model.state()
         for s in (self.state_0, self.state_1):
             flatten_state(s)
@@ -137,8 +138,7 @@ class DERFlagella:
         wp.launch(_spin_twist_kernel, dim=self.count,
                   inputs=[self._spin_dofs, self._spin_rest, self.p["omega"], self.dt, self._step],
                   outputs=[self.state_0.dismech.q])
-        self.pipeline.collide(self.state_0, self.contacts, dt=2.0 * self.dt)
-        self.solver.step(self.state_0, self.state_1, None, self.contacts, self.dt)
+        self.solver.step(self.state_0, self.state_1, None, None, self.dt)
         wp.launch(_advance_step, dim=1, inputs=[self._step])
 
     @property
@@ -182,7 +182,7 @@ class Example:
     def __init__(self, viewer, args=None):
         count = getattr(args, "flagella", 3)
         mu = getattr(args, "mu", PAPER["friction"])
-        self.sim = DERFlagella(count, {**PAPER, "friction": mu})
+        self.sim = DERFlagella(count, {**PAPER, "friction": mu, "dt": DT})
         self.viewer = viewer
         self.frame_dt = 1.0 / self.fps
         self.steps_per_frame = max(1, round(self.frame_dt / self.sim.dt))

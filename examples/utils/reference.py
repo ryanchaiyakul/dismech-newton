@@ -1,11 +1,7 @@
-"""Reference runs of the examples, the gate of the solver unification: record them on one branch, compare on another.
+"""Reference runs of the examples, a regression check: record them on one branch, compare on another.
 
-    uv run tests/reference.py record [names...]                    # into .cache/reference/<name>.npz
-    uv run tests/reference.py compare [names...] [--solver unified]  # against them
-
-``--solver unified`` runs the examples unchanged on :mod:`dismech_newton.unified`: both old solver classes are
-replaced before the example imports them, ``DiSMechSolver`` by its ``exact`` mode, their options dropped but for
-:data:`KEEP`.
+    uv run examples/utils/reference.py record [names...]   # into .cache/reference/<name>.npz
+    uv run examples/utils/reference.py compare [names...]  # against them (the run: .cache/reference/current/)
 
 Each example runs headless with ``--test`` in its own process; every ``EVERY`` frames (and at the end) it keeps
 ``state_0``'s node positions and twists (``fit_buckling``: the fitted ratios), plus the test's outcome and the
@@ -22,29 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / ".cache" / "reference"
-EXAMPLES = ["cable_twist", "cable_pile", "cantilever", "overhand_knot", "plectoneme", "flagella", "fit_buckling"]
-EXTRA_ARGS = {"fit_buckling": ["--fresh"]}  # re-run the fit, not the cached replay
+EXAMPLES = ["cable_twist", "cable_pile", "cantilever", "overhand_knot", "plectoneme", "flagella", "fit_buckling",
+            "fit_capture"]
+EXTRA_ARGS = {name: ["--fresh"] for name in ("fit_buckling", "fit_capture")}  # re-run the fit, not the cached replay
 EVERY = 10
-KEEP = ("self_contact",)  # the old solvers' options the unified one takes
-
-
-def _install_unified() -> None:
-    import dismech_newton
-    from dismech_newton.unified import DiSMechSolver as Unified
-
-    def variant(name, **fixed):
-        def __init__(self, model, **options):
-            if "friction" in options:  # the old solvers' one mu: every shape's, so each contact's mean is it
-                model.shape_material_mu.fill_(options["friction"])
-                model.particle_mu = options["friction"]
-            Unified.__init__(self, model, **fixed, **{k: v for k, v in options.items() if k in KEEP})
-
-        return type(name, (Unified,), {"__init__": __init__})
-
-    dismech_newton.ADMMDiSMechSolver = variant("ADMMDiSMechSolver")
-    dismech_newton.DiSMechSolver = variant("DiSMechSolver", exact=True)
 
 
 def _snapshot(example) -> dict[str, np.ndarray]:
@@ -58,13 +37,10 @@ def _snapshot(example) -> dict[str, np.ndarray]:
     return out
 
 
-def _run_one(name: str, path: Path, solver: str) -> None:
+def _run_one(name: str, path: Path) -> None:
     """In this process: run ``name`` and write ``path``."""
     import newton.examples
     import warp as wp
-
-    if solver == "unified":
-        _install_unified()
 
     frames, result = [], {"error": "", "step_seconds": 0.0, "frames": 0}
     original = newton.examples.run
@@ -107,9 +83,9 @@ def _load(path: Path) -> tuple[dict, list[dict]]:
     return result, frames
 
 
-def _record(name: str, path: Path, solver: str = "current") -> dict:
+def _record(name: str, path: Path) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([sys.executable, __file__, "_one", name, str(path), solver], check=True)
+    subprocess.run([sys.executable, __file__, "_one", name, str(path)], check=True)
     return _load(path)[0]
 
 
@@ -121,22 +97,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["record", "compare", "_one"])
     parser.add_argument("names", nargs="*")
-    parser.add_argument("--solver", choices=["current", "unified"], default="current")
     args = parser.parse_args()
     if args.command == "_one":
-        _run_one(args.names[0], Path(args.names[1]), args.names[2])
+        _run_one(args.names[0], Path(args.names[1]))
         return
     for name in args.names or EXAMPLES:
         ref = OUT / f"{name}.npz"
         if args.command == "record":
             print(f"{name}: {_status(_record(name, ref))}", flush=True)
             continue
-        new = OUT / args.solver / f"{name}.npz"
-        r_new, f_new = _record(name, new, args.solver), _load(new)[1]
+        new = OUT / "current" / f"{name}.npz"
+        r_new, f_new = _record(name, new), _load(new)[1]
         r_ref, f_ref = _load(ref)
         print(f"{name}: reference {_status(r_ref)}; now {_status(r_new)}")
         for key in ("x", "theta", "ratios"):
             pairs = [(a[key], b[key]) for a, b in zip(f_ref, f_new) if key in a and key in b]
+            if pairs and pairs[-1][0].shape != pairs[-1][1].shape:  # a fit's history: compare the common rows
+                print(f"    {key}: {len(pairs[-1][0])} rows, now {len(pairs[-1][1])}")
+                pairs = [(a[: min(len(a), len(b))], b[: min(len(a), len(b))]) for a, b in pairs]
             if pairs:
                 dev = [np.abs(a - b).max() for a, b in pairs]
                 size = max(np.ptp(a, axis=0).max() if a.ndim > 1 else np.abs(a).max() for a, _ in pairs)

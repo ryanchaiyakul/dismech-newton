@@ -7,17 +7,20 @@ from types import SimpleNamespace
 import newton
 import numpy as np
 import warp as wp
-from fd import assert_close, derivative, jacobian
+from fd import assert_close, jacobian
+from utils.common import grid
 
-from dismech_newton import ADMMDiSMechSolver, DiSMechSolver, flatten_state, suspended_tape
-from dismech_newton.dofs import dof_constants
+from dismech_newton import DiSMechSolver, add_cloth_mesh, flatten_state, suspended_tape
+from dismech_newton.state import dof_constants
 
 RADIUS = 0.01
 
 
-def contact_options(friction: float, smoothing: float = 1.0e-3) -> dict:
-    """ADMM with contact: a fixed iteration count keeps batched copies identical to lone rods."""
-    return dict(tol=0.0, iterations=500, friction=friction, contact_smoothing=smoothing)
+@wp.kernel
+def _drive(fixed: wp.array[wp.int32], num_node_dofs: int, dz: float, q: wp.array[float]):
+    i = wp.tid()
+    if i < num_node_dofs and i % 3 == 2 and fixed[i] != 0:
+        q[i] = q[i] + dz
 
 
 @wp.kernel
@@ -26,65 +29,112 @@ def _dot(x: wp.array[float], w: wp.array[float], out: wp.array[float]):
     wp.atomic_add(out, 0, x[i] * w[i])
 
 
-def _parameters(model, solver) -> dict:
-    """The differentiable arrays, rods contiguous in each."""
-    d = model.dismech
-    return {"params": d.triplet_params, "rest": solver.triplets.rest, "length": d.edge_length,
-            "particle_mass": model.particle_mass, "inertia": d.edge_inertia}
+def cloth(builder, v, f, **kwargs):
+    return add_cloth_mesh(builder, vertices=v.tolist(), indices=f.ravel().tolist(), **kwargs)
 
 
-def _group(builder, group: int):
+def _cfg(builder, mu: float):
     cfg = copy.copy(builder.default_shape_cfg)
-    cfg.collision_group = group
+    cfg.mu = mu
     return cfg
 
 
 def _dofs(model, copies: int) -> np.ndarray:
-    """``(copies, n)``: each copy's DOFs, nodes then edges."""
-    p, e = model.particle_count // copies, model.dismech.edge_q.shape[0] // copies
-    c = np.arange(copies)[:, None]
-    return np.hstack([3 * p * c + np.arange(3 * p), 3 * model.particle_count + e * c + np.arange(e)])
+    """``(copies, n)``: each copy's DOFs, nodes, edges, then hinges."""
+    d = model.dismech
+    ne, nh = d.edge_length.shape[0], d.hinge_fixed.shape[0]
+    p, e, h = model.particle_count // copies, ne // copies, nh // copies
+    c, nd = np.arange(copies)[:, None], 3 * model.particle_count
+    return np.hstack([3 * p * c + np.arange(3 * p), nd + e * c + np.arange(e), nd + ne + h * c + np.arange(h)])
 
 
 class Rollout:
-    """Copies of a scene, overlapping but not colliding, each perturbed along its row of ``X``; per copy
+    """Copies of a scene, each perturbed along its row of ``X``; per copy
     ``loss = sum_t w . (q_t + dt qd_t)`` over every step's end (``dt`` damps velocity round-off; the intermediate
     states take the loss's adjoint as well as the next step's).
 
     ``directions`` maps a name to ``(fd step, {array: perturbation per unit})``, arrays one copy's slice of
-    :func:`_parameters`, ``q`` or ``qd`` (the first state's) or ``force`` (``particle_f`` on every step). Every
-    evaluation builds a fresh model, so warm starts do not carry over.
+    :meth:`parameters`, ``q`` or ``qd`` (the first state's) or ``force`` (``particle_f`` on every step). Every
+    evaluation builds a fresh model, so warm starts do not carry over. The solver's contacts ignore collision groups:
+    copies that may touch need ``spacing`` (else ``self_contact=False``).
     """
 
     ground = False
-    colliding = False  # a collision pipeline every step (ADMM)
+    colliding = False  # the scene has contacts (asserted active)
+    drive = 0.0  # [m] the clamp raised before every step but the first, in place (a fit's drive moves the last output)
+    spacing = 0.0  # copies this far apart on a grid
     height = 1.0
     segments, steps, dt = 4, 3, 1.0e-2
     rod_options = dict(stretch_stiffness=1.0e4, bend_stiffness=2.0, twist_stiffness=1.0)
+    throw = 0.5  # [m/s] the free DOFs' random velocities
 
-    def __init__(self, rng, solver_cls=DiSMechSolver):
-        model = self.model(1, solver_cls)
+    def __init__(self, rng, mu: float = 0.3):
+        self.mu = mu  # the shapes' and rods' friction coefficient
+        model = self.model(1)
         self.fixed = dof_constants(model)[1].numpy() != 0
         self.nodes = model.particle_count
         self.w = rng.normal(size=len(self.fixed))
         self.v0 = self._velocity(rng, model)
         self.directions = self._directions(rng, model)
 
+    # -- the directions' and velocities' common parts, each drawing from ``rng`` once
+
+    def _free(self, rng, scale: float = 1.0) -> np.ndarray:
+        """Random on the free DOFs."""
+        return np.where(self.fixed, 0.0, scale * rng.normal(size=self.fixed.size))
+
+    def _clamp(self, rng) -> np.ndarray:
+        """Random on the prescribed DOFs."""
+        return np.where(self.fixed, rng.normal(size=self.fixed.size), 0.0)
+
+    def _force(self, rng, scale: float) -> np.ndarray:
+        """``scale`` [N] on every free node along one direction (a random force per node can all but miss the
+        loss)."""
+        return np.where(~self.fixed[: 3 * self.nodes].reshape(-1, 3), scale * rng.normal(size=3), 0.0)
+
+    @staticmethod
+    def _mass(rng, model) -> tuple:
+        mass = model.particle_mass.numpy()
+        return 0.1, {"particle_mass": mass * rng.normal(size=mass.shape)}
+
+    def _velocity(self, rng, model) -> np.ndarray:
+        return self._free(rng, self.throw)
+
+    def _slide(self, rng, model, first: int = 0) -> np.ndarray:
+        """Nodes from ``first`` on sliding along x, pressed down; the free twists random."""
+        nd = 3 * model.particle_count
+        v = np.zeros(self.fixed.size)
+        v[3 * first : nd : 3], v[3 * first + 2 : nd : 3] = 0.3, -0.1
+        v[nd:] = np.where(self.fixed[nd:], 0.0, 0.5 * rng.normal(size=v.size - nd))
+        return v
+
+    def offset(self, c: int, copies: int) -> np.ndarray:
+        """Copy ``c``'s offset: a square grid about the origin (small coordinates round off less in float32)."""
+        side = int(np.ceil(np.sqrt(copies)))
+        return self.spacing * np.array([c % side - 0.5 * (side - 1), c // side - 0.5 * (side - 1), 0.0])
+
+    def parameters(self, model, solver) -> dict:
+        """The differentiable arrays, copies contiguous in each."""
+        d = model.dismech
+        return {"params": d.triplet_params, "rest": solver.triplets.rest, "length": d.edge_length,
+                "particle_mass": model.particle_mass, "inertia": d.edge_inertia}
+
     def _rods(self) -> list:
         """A copy's rods: ``(start, direction, clamped)``."""
         return [((0.0, 0.0, self.height), (1.0, 0.0, 0.0), not self.ground)]
 
-    def model(self, copies: int, solver_cls):
+    def model(self, copies: int):
         builder = newton.ModelBuilder()
         if self.ground:
-            builder.add_ground_plane(cfg=_group(builder, -1))
+            builder.add_ground_plane(cfg=_cfg(builder, self.mu))
         for c in range(copies):
-            cfg = _group(builder, c + 1)  # copies apart; a copy's rods touch each other
+            cfg = _cfg(builder, self.mu)
             for start, direction, clamped in self._rods():
+                start = np.add(start, self.offset(c, copies))
                 rod = newton.Rod.create_straight(start, direction, 0.5, segment_count=self.segments, radius=RADIUS)
-                bodies = solver_cls.add_rod(builder, rod, cfg=cfg, **self.rod_options)
+                bodies = DiSMechSolver.add_rod(builder, rod, cfg=cfg, **self.rod_options)
                 if clamped:
-                    solver_cls.fix_segment(builder, bodies[0])
+                    DiSMechSolver.fix_segment(builder, bodies[0])
         return builder.finalize()
 
     def _matrix(self, key: str, size: int) -> np.ndarray:
@@ -92,19 +142,15 @@ class Rollout:
         return np.array([d[key].ravel() if key in d else np.zeros(size) for _, d in self.directions.values()]
                         ).reshape(len(self.directions), size)
 
-    @property
-    def fd_steps(self) -> np.ndarray:
-        return np.array([h for h, _ in self.directions.values()])
-
-    def setup(self, solver_cls, options: dict, grad: bool, X: np.ndarray | None = None) -> SimpleNamespace:
+    def setup(self, options: dict, grad: bool, X: np.ndarray | None = None) -> SimpleNamespace:
         """``len(X)`` perturbed copies (default one, unperturbed), their solver and states (the first set, the
         rest to step into)."""
         if X is None:
             X = np.zeros((1, len(self.directions)))
         copies = len(X)
-        model = self.model(copies, solver_cls)
-        solver = solver_cls(model, **options)
-        arrays = _parameters(model, solver)
+        model = self.model(copies)
+        solver = DiSMechSolver(model, **options)
+        arrays = self.parameters(model, solver)
         for key, a in arrays.items():
             base = a.numpy()
             a.assign((base.reshape(copies, -1) + X @ self._matrix(key, base.size // copies)).reshape(base.shape))
@@ -124,33 +170,29 @@ class Rollout:
         force = (X @ self._matrix("force", 3 * self.nodes)).reshape(-1, 3)
         for state in states[:-1]:
             state.particle_f.assign(force)
-        run = SimpleNamespace(model=model, solver=solver, states=states, arrays=arrays, dofs=dofs,
-                              pipeline=None, contacts=None)
-        if self.colliding:
-            run.pipeline = newton.CollisionPipeline(model, soft_contact_max=0, verify_buffers=False,
-                                                    speculative_contact_gap_max=2.0 * RADIUS,
-                                                    contact_matching="latest")
-            run.contacts = run.pipeline.contacts()
-            solver.contact.friction.requires_grad = grad
-        return run
+        return SimpleNamespace(model=model, solver=solver, states=states, arrays=arrays, dofs=dofs)
 
     def simulate(self, run: SimpleNamespace) -> None:
-        """Every step, after its collision detection (off the tape)."""
+        """Every step, after :attr:`drive` (off the tape)."""
         for t in range(self.steps):
-            if run.pipeline is not None:
+            if self.drive and t > 0:
                 with suspended_tape():
-                    run.pipeline.collide(run.states[t], run.contacts, dt=2.0 * self.dt)
-            run.solver.step(run.states[t], run.states[t + 1], None, run.contacts, self.dt)
+                    wp.launch(_drive, dim=run.solver.num_dofs, inputs=[run.solver.fixed, run.solver.num_node_dofs,
+                              self.drive], outputs=[run.states[t].dismech.q])
+            run.solver.step(run.states[t], run.states[t + 1], None, None, self.dt)
 
-    def losses(self, X: np.ndarray, solver_cls, **options) -> np.ndarray:
+    def losses(self, X: np.ndarray, **options) -> np.ndarray:
         """``(N,)`` at the rows of ``X`` ``(N, k)``, summed in float64: the float32 atomic sum rounds in a
         run-dependent order, by more than the finite differences resolve."""
-        run = self.setup(solver_cls, options, grad=False, X=np.atleast_2d(X))
+        run = self.setup(options, grad=False, X=np.atleast_2d(X))
         self.simulate(run)
+        copies = len(run.dofs)
+        shift = np.zeros(run.dofs.shape)  # each copy's offset, out of its loss
+        shift[:, : 3 * self.nodes] = [np.tile(self.offset(c, copies), self.nodes) for c in range(copies)]
         total = 0.0
         for state in run.states[1:]:
             q, qd = state.dismech.q.numpy().astype(np.float64), state.dismech.qd.numpy().astype(np.float64)
-            total = total + (q[run.dofs] + self.dt * qd[run.dofs]) @ self.w
+            total = total + (q[run.dofs] - shift + self.dt * qd[run.dofs]) @ self.w
         return total
 
     def record(self, run: SimpleNamespace, loss: wp.array | None = None) -> wp.Tape:
@@ -170,39 +212,30 @@ class Rollout:
         tape.backward(loss)
         return tape
 
-    def adjoint(self, solver_cls, **options) -> dict:
-        """The derivatives along ``directions`` (and in ``friction``, with contacts)."""
-        run = self.setup(solver_cls, options, grad=True)
+    def adjoint(self, **options) -> dict:
+        """The derivatives along ``directions``."""
+        run = self.setup(options, grad=True)
         self.record(run)
         if self.colliding:
-            assert run.solver.contact.active.numpy().sum() > 0
+            assert run.solver.contact.s.active.numpy().sum() > 0
         s0 = run.states[0].dismech
         grads = {key: a.grad.numpy().ravel() for key, a in run.arrays.items()}
         grads["q"], grads["qd"] = s0.q.grad.numpy()[run.dofs[0]], s0.qd.grad.numpy()[run.dofs[0]]
         grads["force"] = sum(state.particle_f.grad.numpy() for state in run.states[:-1]).ravel()
-        out = {name: sum(float(grads[key] @ delta.ravel()) for key, delta in deltas.items())
-               for name, (_, deltas) in self.directions.items()}
-        if self.colliding:
-            out["friction"] = float(run.solver.contact.friction.grad.numpy()[0])
-        return out
+        return {name: sum(float(grads[key] @ delta.ravel()) for key, delta in deltas.items())
+                for name, (_, deltas) in self.directions.items()}
 
-    def finite_differences(self, solver_cls, wrt_friction: bool = False, **options) -> dict:
-        """Along ``directions``; with ``wrt_friction``, also in the friction coefficient."""
-        J = jacobian(lambda X: self.losses(X, solver_cls, **options)[:, None], np.zeros(len(self.fd_steps)),
-                     self.fd_steps)
-        out = dict(zip(self.directions, J[0]))
-        if wrt_friction:
-            zero, mu = np.zeros((1, len(self.directions))), options["friction"]
-            out["friction"] = derivative(lambda e: self.losses(zero, solver_cls, **dict(options, friction=mu + e))[0],
-                                         0.05)
-        return out
+    def finite_differences(self, **options) -> dict:
+        """Along ``directions``."""
+        h = np.array([h for h, _ in self.directions.values()])
+        J = jacobian(lambda X: self.losses(X, **options)[:, None], np.zeros(len(h)), h)
+        return dict(zip(self.directions, J[0]))
 
-    def check(self, solver_cls, options: dict, rtol: float, rtols: dict | None = None, fd_solver_cls=None,
-              fd_options: dict | None = None, wrt_friction: bool = False) -> None:
-        """The adjoint of ``solver_cls`` against finite differences (of ``fd_solver_cls``, ``fd_options`` if
-        given); ``rtols`` overrides ``rtol`` per name."""
-        adjoint = self.adjoint(solver_cls, **options)
-        fd = self.finite_differences(fd_solver_cls or solver_cls, wrt_friction=wrt_friction, **(fd_options or options))
+    def check(self, options: dict, rtol: float, rtols: dict | None = None, fd_options: dict | None = None) -> None:
+        """The adjoint against finite differences (with ``fd_options`` if given); ``rtols`` overrides ``rtol`` per
+        name."""
+        adjoint = self.adjoint(**options)
+        fd = self.finite_differences(**(fd_options or options))
         for name, f in fd.items():
             assert_close(adjoint[name], f, (rtols or {}).get(name, rtol), name)
 
@@ -212,17 +245,13 @@ class ClampedRollout(Rollout):
 
     rod_options = dict(Rollout.rod_options, bend_damping=0.01)
 
-    def _velocity(self, rng, model):
-        return np.where(self.fixed, 0.0, 0.5 * rng.normal(size=self.fixed.size))
-
     def _directions(self, rng, model):
         d = model.dismech
         k = d.triplet_params.numpy()
         bend = np.zeros_like(k)
         bend[:, 2:4] = k[:, 2:4]
         length, mass, inertia = d.edge_length.numpy(), model.particle_mass.numpy(), d.edge_inertia.numpy()
-        free = np.where(self.fixed, 0.0, rng.normal(size=self.fixed.size))
-        free_nodes = ~self.fixed[: 3 * self.nodes].reshape(-1, 3)
+        free = self._free(rng)
         return {
             "bend stiffness": (0.2, {"params": bend}),  # relative; a small effect over the steps
             "rest strain": (5.0e-2, {"rest": rng.normal(size=(k.shape[0], 5))}),  # nonlinear in curvature
@@ -232,37 +261,20 @@ class ClampedRollout(Rollout):
             "velocity": (2.0e-2, {"qd": free}),
             "position": (6.0e-4, {"q": free}),  # stiff stretching: nonlinear in positions
             # The prescribed DOFs (the clamp), which every step carries over from its input.
-            "clamp": (6.0e-4, {"q": np.where(self.fixed, rng.normal(size=self.fixed.size), 0.0)}),
-            # [N] on every free node along one direction (a random force per node can all but miss the loss).
-            "force": (0.3, {"force": np.where(free_nodes, 0.3 * rng.normal(size=3), 0.0)}),
+            "clamp": (6.0e-4, {"q": self._clamp(rng)}),
+            "force": (0.3, {"force": self._force(rng, 0.3)}),
         }
 
 
-class SpinningRollout(ClampedRollout):
-    """A long clamped rod swinging and spinning at a long step: its reference frames lag far behind."""
-
-    segments, steps, dt = 30, 2, 1.0 / 30.0
-    rod_options = dict(Rollout.rod_options, bend_damping=0.05)
-
-    def _velocity(self, rng, model):
-        nd, x = 3 * self.nodes, np.linspace(0.0, 1.0, self.nodes)
-        v = np.zeros(self.fixed.size)
-        v[1:nd:3], v[2:nd:3], v[nd:] = 0.5 * x**2, 0.3 * x, np.linspace(0.0, 5.0, v.size - nd)
-        return np.where(self.fixed, 0.0, v)
-
-    def _directions(self, rng, model):
-        return {}
-
-
 class GroundRollout(Rollout):
-    """A rod sliding on the ground (ADMM, friction); ``checks`` picks the directions."""
+    """A rod sliding on the ground (friction ``mu``); ``checks`` picks the directions."""
 
     ground = colliding = True
     height = RADIUS
 
-    def __init__(self, rng, v_mean, checks):
+    def __init__(self, rng, v_mean, checks, mu: float = 0.3):
         self.v_mean, self.checks = np.asarray(v_mean, dtype=float), checks
-        super().__init__(rng, ADMMDiSMechSolver)
+        super().__init__(rng, mu)
 
     def _velocity(self, rng, model):
         nd = 3 * model.particle_count
@@ -278,9 +290,8 @@ class GroundRollout(Rollout):
         planar[2:nd:3] = 0.0  # in the ground's plane
         rigid = np.zeros(self.fixed.size)  # a horizontal translation, which keeps a stuck rod stuck
         rigid[0:nd:3], rigid[1:nd:3] = 0.6, -0.8
-        mass = model.particle_mass.numpy()
         directions = {
-            "mass": (0.1, {"particle_mass": mass * rng.normal(size=mass.shape)}),
+            "mass": self._mass(rng, model),
             "velocity": (4.0e-2, {"qd": planar}),  # small in the stuck case
             "position": (6.0e-4, {"q": planar}),
             "translation": (2.0e-3, {"q": rigid}),
@@ -293,36 +304,184 @@ class CrossingRollout(Rollout):
     rod-rod contact, mid-edge on both (no cell switch), whose normal turns with the rods (unlike the ground's)."""
 
     colliding = True
+    spacing = 0.8
     half = 0.3125  # nodes at +-0.0625 around the crossing at the origin
-
-    def __init__(self, rng):
-        super().__init__(rng, ADMMDiSMechSolver)
 
     def _rods(self) -> list:
         return [((-self.half, 0.0, 0.0), (1.0, 0.0, 0.0), True),
                 ((0.0, -self.half, 2.0 * RADIUS), (0.0, 1.0, 0.0), False)]
 
     def _velocity(self, rng, model):
-        nd, half = 3 * model.particle_count, model.particle_count // 2
-        v = np.zeros(self.fixed.size)
-        top = slice(3 * half, nd)
-        v[top][0::3], v[top][2::3] = 0.3, -0.1  # sliding along the bottom rod, pressed onto it
-        v[nd:] = np.where(self.fixed[nd:], 0.0, 0.5 * rng.normal(size=v.size - nd))
-        return v
+        return self._slide(rng, model, model.particle_count // 2)  # the top rod along the bottom one, onto it
 
     def _directions(self, rng, model):
         nd, half = 3 * model.particle_count, model.particle_count // 2
         x = model.particle_q.numpy()[half:]
-        free = np.where(self.fixed, 0.0, rng.normal(size=self.fixed.size))
+        free = self._free(rng)
         tilt = np.zeros(self.fixed.size)  # the top rod turned about x: its tangent, so the normal, turns
         tilt[3 * half + 2 : nd : 3] = x[:, 1]
         yaw = np.zeros(self.fixed.size)  # turned about z: the crossing angle
         yaw[3 * half : nd : 3], yaw[3 * half + 1 : nd : 3] = -x[:, 1], x[:, 0]
-        mass = model.particle_mass.numpy()
         return {
-            "mass": (0.1, {"particle_mass": mass * rng.normal(size=mass.shape)}),
+            "mass": self._mass(rng, model),
             "velocity": (4.0e-2, {"qd": free}),
             "position": (1.2e-3, {"q": free}),  # small effects: smaller steps round off (4x larger is nonlinear)
             "tilt": (2.0e-2, {"q": tilt}),
             "yaw": (2.0e-2, {"q": yaw}),
+        }
+
+
+class ShellRollout(Rollout):
+    """A sheet clamped along one edge (and its neighbouring row), thrown at random (no self-contact: the copies
+    overlap)."""
+
+    nx, ny, size = 4, 3, 0.3
+    throw = 0.3
+    cloth_options = dict(density=0.5, tri_ke=2.0e3, tri_ka=1.0e3, tri_kd=2.0, edge_ke=1.0e-2, edge_kd=1.0e-3)
+
+    def model(self, copies: int):
+        builder = newton.ModelBuilder()
+        v, f = grid(self.nx, self.ny, self.size, 0.75 * self.size)
+        for _ in range(copies):
+            ids = cloth(builder, v, f, **self.cloth_options)
+            for k in ids[: 2 * self.ny]:  # x = 0 and its neighbours
+                builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
+        return builder.finalize()
+
+    def parameters(self, model, solver) -> dict:
+        return {"params": model.dismech.face_params, "rest": solver.shells.rest, "particle_mass": model.particle_mass}
+
+    def _directions(self, rng, model):
+        k = model.dismech.face_params.numpy()
+        free = self._free(rng)
+
+        def columns(cols):
+            return np.where(np.isin(np.arange(12), cols), k, 0.0)
+
+        return {
+            "membrane": (0.1, {"params": columns([0, 1, 2])}),
+            "bending": (0.1, {"params": columns([3, 4, 5])}),
+            "damping": (0.1, {"params": columns(range(6, 12))}),
+            "rest strain": (5.0e-4, {"rest": rng.normal(size=(k.shape[0], 6))}),
+            "mass": self._mass(rng, model),
+            "velocity": (2.0e-2, {"qd": free}),
+            "position": (3.0e-4, {"q": free}),
+            "clamp": (7.5e-5, {"q": self._clamp(rng)}),  # stiff: small
+            "force": (0.03, {"force": self._force(rng, 0.03)}),
+        }
+
+
+class SheetContactRollout(ShellRollout):
+    """A sheet's contacts, one kind per ``scene``, each pressed on and sliding (``free``: the sheet's or rod's free
+    DOFs; ``along``: the slide's direction):
+
+    - ``ground``: a free sheet stretching as it slides on the ground, a contact per vertex;
+    - ``sphere``: a small free sheet's centre vertex on top of a sphere, whose normal turns as it slides;
+    - ``foot``: an upright rod's foot inside a triangle of the clamped sheet (vertex-triangle);
+    - ``edge``: a rod tilted down across the clamped sheet's free edge, sliding along it (edge-edge, mid-edge on both).
+    """
+
+    colliding = True
+    spacing = 0.8
+    thickness = 0.004  # the sheet's particle radius
+    checks = {"ground": ("mass", "velocity", "position"), "sphere": ("mass", "speed", "shift"),
+              "foot": ("mass", "velocity", "position", "shift"), "edge": ("mass", "velocity", "shift")}
+
+    def __init__(self, rng, scene: str, mu: float):
+        self.scene = scene
+        super().__init__(rng, mu)
+
+    def _rod(self, o: np.ndarray):
+        if self.scene == "foot":
+            return newton.Rod.create_straight(o + (0.23, 0.09, RADIUS + self.thickness), (0.0, 0.0, 1.0), 0.2,
+                                              segment_count=2, radius=RADIUS)
+        d = np.array([1.0, 0.0, -0.3]) / np.linalg.norm([1.0, 0.0, -0.3])
+        touch = np.array([0.3, 0.05, 0.0]) + (RADIUS + self.thickness) * np.array([-d[2], 0.0, d[0]])
+        return newton.Rod.create_straight(o + touch - 0.15 / d[0] * d, d, 0.4, segment_count=4, radius=RADIUS)
+
+    def model(self, copies: int):
+        builder = newton.ModelBuilder()
+        if self.scene == "ground":
+            builder.add_ground_plane(cfg=_cfg(builder, self.mu))
+        if self.scene == "sphere":
+            v, f = grid(3, 3, 0.1, 0.1)
+            v += (-0.05, -0.05, self.thickness)
+        else:
+            v, f = grid(self.nx, self.ny, self.size, 0.75 * self.size)
+            v[:, 2] = self.thickness if self.scene == "ground" else 0.0
+        for c in range(copies):
+            o = self.offset(c, copies)
+            if self.scene == "sphere":
+                builder.add_shape_sphere(-1, xform=wp.transform(o + (0.0, 0.0, -0.06), wp.quat_identity()),
+                                         radius=0.06, cfg=_cfg(builder, self.mu))
+            ids = cloth(builder, v + o, f, particle_radius=self.thickness, **self.cloth_options)
+            if self.scene in ("foot", "edge"):
+                for k in ids[: 2 * self.ny]:
+                    builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
+                DiSMechSolver.add_rod(builder, self._rod(o), cfg=_cfg(builder, self.mu), **self.rod_options)
+        model = builder.finalize()
+        model.particle_mu = self.mu
+        return model
+
+    def _moving(self, model) -> tuple[int, int]:
+        """The first moving node (the rod's, or the sheet's) and the slide's axis."""
+        rod = {"foot": 3, "edge": 5}.get(self.scene, model.particle_count)
+        return model.particle_count - rod, int(self.scene == "edge")
+
+    def _velocity(self, rng, model):
+        nd, (first, axis) = 3 * model.particle_count, self._moving(model)
+        v = self._slide(rng, model, first)
+        if axis:
+            v[3 * first : nd : 3], v[3 * first + 1 : nd : 3] = 0.0, 0.3
+        if self.scene == "ground":  # stretching too: a rigid slide's mass derivative vanishes
+            v[:nd] += 0.1 * rng.normal(size=nd) * (np.arange(nd) % 3 != 2)
+        return v
+
+    def _directions(self, rng, model):
+        nd, (first, axis) = 3 * model.particle_count, self._moving(model)
+        free = self._free(rng)
+        if self.scene == "ground":
+            free[2:nd:3] = 0.0  # in the ground's plane
+        along = np.zeros(self.fixed.size)
+        along[3 * first + axis : nd : 3] = 1.0
+        directions = {
+            "mass": self._mass(rng, model),
+            "velocity": (4.0e-2, {"qd": free}),
+            "position": (1.5e-4, {"q": free}),  # the clamped sheet's membrane: nonlinear at 6e-4
+            "speed": (4.0e-2, {"qd": along}),
+            "shift": (2.0e-3, {"q": along}),
+        }
+        return {name: directions[name] for name in self.checks[self.scene]}
+
+
+class SphereRollout(Rollout):
+    """A rod across the top of a sphere, pressed onto it and sliding over it: its contact holds an
+    edge's interior (the top mid-edge: a node over it would hand the contact to an edge under any shift), whose
+    closest point and normal turn with the rod."""
+
+    colliding = True
+    spacing = 0.8
+    radius = 0.3
+
+    def model(self, copies: int):
+        builder = newton.ModelBuilder()
+        for c in range(copies):
+            o = self.offset(c, copies)
+            builder.add_shape_sphere(-1, xform=wp.transform(o + (0.0, 0.0, -self.radius), wp.quat_identity()),
+                                     radius=self.radius, cfg=_cfg(builder, self.mu))
+            rod = newton.Rod.create_straight(o + (-0.3125, 0.0, RADIUS), (1.0, 0.0, 0.0), 0.5,
+                                             segment_count=self.segments, radius=RADIUS)
+            DiSMechSolver.add_rod(builder, rod, cfg=_cfg(builder, self.mu), **self.rod_options)
+        return builder.finalize()
+
+    def _velocity(self, rng, model):
+        return self._slide(rng, model)
+
+    def _directions(self, rng, model):
+        along = np.zeros(self.fixed.size)  # along the rod: over the sphere, its contact's normal turns
+        along[0 : 3 * model.particle_count : 3] = 1.0
+        return {
+            "mass": self._mass(rng, model),
+            "speed": (4.0e-2, {"qd": along}),  # random velocities tumble it from edge to edge
+            "shift": (2.0e-3, {"q": along}),
         }

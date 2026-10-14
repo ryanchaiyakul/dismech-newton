@@ -1,12 +1,12 @@
 """What the examples share, none of it part of the ``dismech_newton`` package.
 
-- :class:`CableExample`: the frame loop in Newton's example format (drive, collide, step, CUDA graph replay).
+- :class:`CableExample`: the frame loop in Newton's example format (drive, step, CUDA graph replay).
 - :class:`FrameGraph`, :class:`TapedGraph`: device work run eagerly once, then replayed as CUDA graphs.
 - :class:`Drive`, :func:`segment_dofs`: move clamped segments along a prescribed path.
 - :func:`frame_box`: point the viewer's camera at a box.
-- :func:`contact_pipeline`: Newton's collision pipeline, rigid contacts only.
 - :func:`default_frames`: the ``--num-frames`` default from a simulated duration.
 - :func:`smoothstep`: a smooth ramp from 0 to 1.
+- :func:`grid`: a triangulated plate.
 - :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks; :func:`capsule_poses`: capsules
   along a polyline, for drawing recorded node positions.
 - :func:`inset`: the theory plots drawn in the viewer.
@@ -17,7 +17,6 @@ import hashlib
 import json
 from pathlib import Path
 
-import newton
 import numpy as np
 import warp as wp
 from scipy.spatial import cKDTree
@@ -99,13 +98,6 @@ class Drive:
                   outputs=[state.dismech.q])
 
 
-def contact_pipeline(model, radius: float, **options) -> newton.CollisionPipeline:
-    """The rod nodes are particles, but the solver reads rigid contacts only: skip the soft ones unless
-    ``soft_contact_max`` (shell vertices) says otherwise."""
-    options = {"contact_matching": "latest", "soft_contact_max": 0, **options}
-    return newton.CollisionPipeline(model, verify_buffers=False, speculative_contact_gap_max=2.0 * radius, **options)
-
-
 # -- CUDA graphs ---------------------------------------------------------------------------
 
 
@@ -185,18 +177,15 @@ class CableExample:
 
     fps, substeps, capture = 60, 8, True
     plot_every, plot_name = 0, "theory"
-    pipeline_options: dict = {}
     drives: tuple = ()
     control = None  # passed to every solver step
 
-    def start(self, viewer, model, solver, radius: float, **pipeline):
+    def start(self, viewer, model, solver):
         self.viewer, self.model, self.solver = viewer, model, solver
         self.frame_dt = 1.0 / self.fps
         self.sim_dt = self.frame_dt / self.substeps
         self.sim_time = 0.0
         self.frame = 0
-        self.pipeline = contact_pipeline(model, radius, **{**self.pipeline_options, **pipeline})
-        self.contacts = self.pipeline.contacts()
         self.state_0, self.state_1 = model.state(), model.state()
         flatten_state(self.state_0)
         flatten_state(self.state_1)
@@ -211,8 +200,7 @@ class CableExample:
         for k in range(self.substeps):
             for drive in self.drives:
                 drive(self.state_0, (k + 1) / self.substeps)
-            self.pipeline.collide(self.state_0, self.contacts, dt=2.0 * self.sim_dt)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.post_substep()
 
@@ -234,7 +222,6 @@ class CableExample:
         self.log_plot()
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
 
@@ -263,6 +250,22 @@ def frame_box(viewer, left: float, right: float, bottom: float, top: float, *, y
 
 
 # -- geometry checks ----------------------------------------------------------------------
+
+
+def grid(nx: int, ny: int, lx: float, ly: float, rng=None, jitter: float = 0.0):
+    """An ``nx x ny``-node plate in the xy plane, faces counter-clockwise; ``jitter`` moves interior nodes."""
+    xs, ys = np.linspace(0.0, lx, nx), np.linspace(0.0, ly, ny)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    v = np.column_stack([X.ravel(), Y.ravel(), np.zeros(X.size)])
+    if jitter:
+        inner = (X.ravel() > 0) & (X.ravel() < lx) & (Y.ravel() > 0) & (Y.ravel() < ly)
+        v[inner, :2] += jitter * rng.uniform(-1.0, 1.0, (inner.sum(), 2)) * [lx / (nx - 1), ly / (ny - 1)]
+    f = []
+    for i in range(nx - 1):
+        for j in range(ny - 1):
+            a, b, c, d = i * ny + j, (i + 1) * ny + j, (i + 1) * ny + j + 1, i * ny + j + 1
+            f += [(a, b, c), (a, c, d)] if (i + j) % 2 == 0 else [(a, b, d), (b, c, d)]
+    return v, np.array(f, dtype=np.int32)
 
 
 def segment_distance(p0, p1, q0, q1) -> np.ndarray:

@@ -710,7 +710,7 @@ wheels = [
 
 [[package]]
 name = "dismech-newton"
-version = "0.1.0.post2"
+version = "0.1.0.post3"
 source = { editable = "." }
 dependencies = [
     { name = "newton" },

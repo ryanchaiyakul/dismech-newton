@@ -113,7 +113,9 @@ def rod_jacobian(x: vec11f, v: Rod, t: int):
 
 @wp.func
 def parallel_transport(m: wp.vec3, t0: wp.vec3, t1: wp.vec3) -> wp.vec3:
-    """Transport ``m`` from ``t0`` to ``t1`` along the shortest arc."""
+    """Transport ``m`` from ``t0`` to ``t1`` along the shortest arc, ``m`` first projected off ``t0``: a prescribed
+    DOF moved between steps turns its edges off their stored frames, where the hand-written Jacobian is wrong."""
+    m = m - wp.dot(m, t0) * t0
     out = m - wp.dot(m, t1) / (1.0 + wp.dot(t0, t1)) * (t0 + t1)
     return wp.normalize(out)
 

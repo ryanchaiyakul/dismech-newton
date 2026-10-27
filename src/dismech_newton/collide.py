@@ -287,10 +287,12 @@ def _ahead(x: wp.vec3, a: wp.vec3, b: wp.vec3) -> float:
 
 
 @wp.func
-def _in_node_region(q: wp.array[float], m: Mesh, v: int, x: wp.vec3) -> bool:
-    """``x`` in node ``v``'s block: not past ``v`` toward any neighbour (closed; Eqs. 8, 15)."""
+def _in_node_region(q: wp.array[float], m: Mesh, v: int, x: wp.vec3, tol: float = 0.0) -> bool:
+    """``x`` in node ``v``'s block: not past ``v`` toward any neighbour (closed; Eqs. 8, 15), or not by more than
+    ``tol`` of the edge to it."""
     for k in range(m.adj_ptr[v], m.adj_ptr[v + 1]):
-        if _ahead(x, node(q, v), node(q, m.adj[k])) > 0.0:
+        nb = node(q, m.adj[k])
+        if _ahead(x, node(q, v), nb) > tol * wp.length_sq(nb - node(q, v)):
             return False
     return True
 
@@ -539,8 +541,10 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
             c0 = other
             c1 = other
         if on_rod:
-            if not _in_node_region(q, m, i, wp.lerp(node(q, b0), node(q, b1), t)):
-                continue  # not a local minimum along this rod
+            # Not a local minimum along this rod; within OPEN of it, the edge-edge pair is left to it (else a node
+            # just over a still rod, rounded past itself, is neither's).
+            if not _in_node_region(q, m, i, wp.lerp(node(q, b0), node(q, b1), t), OPEN):
+                continue
             if _excluded(q, m, i, i, 0.0, c0, c1, t, EXCLUSION * th):
                 continue
         _keep_pair(sc, base, other, pair, w, th, 0.5 * (m.mu[i] + m.mu[c0]))

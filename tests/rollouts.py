@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import newton
 import numpy as np
 import warp as wp
-from fd import assert_close, jacobian
+from fd import assert_derivative, jacobian
 from utils.common import grid
 
 from dismech_newton import DiSMechSolver, add_cloth_mesh, flatten_state, suspended_tape
@@ -39,6 +39,24 @@ def _cfg(builder, mu: float):
     return cfg
 
 
+def contact_signatures(solver, copies: int, nodes: int) -> list:
+    """Per copy (``nodes`` each) the step's force-carrying contacts: their nodes (copy-local), feature (the weights'
+    signs) and whether they slide. What the step's solution is smooth in only while it holds."""
+    out = [[] for _ in range(copies)]
+    if solver.contact.count:
+        s = solver.contact.s
+        pair, w, n, u, z = s.pair.numpy(), s.w.numpy(), s.normal.numpy(), s.u.numpy(), s.z.numpy()
+        for i in np.flatnonzero(s.active.numpy()):
+            un = u[i] @ n[i]  # the scaled normal force, negative when pressing
+            if un >= 0.0:
+                continue
+            slip = np.linalg.norm(z[i] - (z[i] @ n[i]) * n[i])  # zero inside the friction cone
+            c = pair[i][pair[i] >= 0].min() // nodes
+            local = tuple(int(k - c * nodes) if k >= 0 else -1 for k in pair[i])
+            out[c].append((local, tuple(int(x) for x in np.sign(w[i])), bool(slip > 1.0e-6 * -un)))
+    return [tuple(sorted(o)) for o in out]
+
+
 def _dofs(model, copies: int) -> np.ndarray:
     """``(copies, n)``: each copy's DOFs, nodes, edges, then hinges."""
     d = model.dismech
@@ -56,11 +74,14 @@ class Rollout:
     ``directions`` maps a name to ``(fd step, {array: perturbation per unit})``, arrays one copy's slice of
     :meth:`parameters`, ``q`` or ``qd`` (the first state's) or ``force`` (``particle_f`` on every step). Every
     evaluation builds a fresh model, so warm starts do not carry over. The solver's contacts ignore collision groups:
-    copies that may touch need ``spacing`` (else ``self_contact=False``).
+    copies that may touch need ``spacing`` (else ``self_contact=False``). The copies share the solver's line search,
+    so a perturbation must keep every copy tame: one thrown far shifts the others' differences.
     """
 
     ground = False
-    colliding = False  # the scene has contacts (asserted active)
+    colliding = False  # the scene has contacts (asserted active, and the same across each stencil)
+    shaped = frozenset({"translation", "tilt", "yaw", "speed", "shift"})  # directions without an ascent copy
+    witnesses = 6  # unperturbed copies per finite-difference batch, whose spread is the loss's noise
     drive = 0.0  # [m] the clamp raised before every step but the first, in place (a fit's drive moves the last output)
     spacing = 0.0  # copies this far apart on a grid
     height = 1.0
@@ -172,20 +193,41 @@ class Rollout:
             state.particle_f.assign(force)
         return SimpleNamespace(model=model, solver=solver, states=states, arrays=arrays, dofs=dofs)
 
-    def simulate(self, run: SimpleNamespace) -> None:
-        """Every step, after :attr:`drive` (off the tape)."""
+    def simulate(self, run: SimpleNamespace, signatures: list | None = None) -> None:
+        """Every step, after :attr:`drive` (off the tape); each step's :func:`contact_signatures` into
+        ``signatures``."""
         for t in range(self.steps):
             if self.drive and t > 0:
                 with suspended_tape():
                     wp.launch(_drive, dim=run.solver.num_dofs, inputs=[run.solver.fixed, run.solver.num_node_dofs,
                               self.drive], outputs=[run.states[t].dismech.q])
             run.solver.step(run.states[t], run.states[t + 1], None, None, self.dt)
+            if signatures is not None:
+                signatures.append(contact_signatures(run.solver, len(run.dofs), self.nodes))
+
+    def _assert_smooth(self, X: np.ndarray, signatures: list) -> None:
+        """Every copy of a direction's stencil (``X``'s rows along it) has the same contacts: else its loss has a
+        kink or jump inside the stencil, and the differences say nothing."""
+        names = list(self.directions)
+        for k in range(X.shape[1]):
+            rows = np.flatnonzero(X[:, k] != 0.0)
+            for t, sig in enumerate(signatures):
+                changed = {i for i in rows if sig[i] != sig[rows[0]]}
+                assert not changed, (
+                    f"{names[k]}: the contacts change across its finite-difference stencil at step {t}: "
+                    f"{sorted(set(sig[rows[0]]) ^ set(sig[min(changed)]))} (step {X[min(changed), k]:+.1e}); "
+                    "the loss is not smooth there, so take a smaller step or a firmer scene")
 
     def losses(self, X: np.ndarray, **options) -> np.ndarray:
         """``(N,)`` at the rows of ``X`` ``(N, k)``, summed in float64: the float32 atomic sum rounds in a
-        run-dependent order, by more than the finite differences resolve."""
-        run = self.setup(options, grad=False, X=np.atleast_2d(X))
-        self.simulate(run)
+        run-dependent order, by more than the finite differences resolve. A contact scene's stencils must keep their
+        contacts (:meth:`_assert_smooth`)."""
+        X = np.atleast_2d(X)
+        run = self.setup(options, grad=False, X=X)
+        signatures = [] if self.colliding else None
+        self.simulate(run, signatures)
+        if signatures:
+            self._assert_smooth(X, signatures)
         copies = len(run.dofs)
         shift = np.zeros(run.dofs.shape)  # each copy's offset, out of its loss
         shift[:, : 3 * self.nodes] = [np.tile(self.offset(c, copies), self.nodes) for c in range(copies)]
@@ -212,32 +254,69 @@ class Rollout:
         tape.backward(loss)
         return tape
 
-    def adjoint(self, **options) -> dict:
-        """The derivatives along ``directions``."""
+    def gradients(self, **options) -> dict:
+        """The loss's gradient per perturbable array (one copy's)."""
         run = self.setup(options, grad=True)
         self.record(run)
         if self.colliding:
             assert run.solver.contact.s.active.numpy().sum() > 0
         s0 = run.states[0].dismech
-        grads = {key: a.grad.numpy().ravel() for key, a in run.arrays.items()}
+        grads = {key: a.grad.numpy().ravel().astype(np.float64) for key, a in run.arrays.items()}
         grads["q"], grads["qd"] = s0.q.grad.numpy()[run.dofs[0]], s0.qd.grad.numpy()[run.dofs[0]]
         grads["force"] = sum(state.particle_f.grad.numpy() for state in run.states[:-1]).ravel()
-        return {name: sum(float(grads[key] @ delta.ravel()) for key, delta in deltas.items())
+        return grads
+
+    def along(self, grads: dict) -> dict:
+        """The derivatives along ``directions``."""
+        return {name: sum(float(grads[key] @ np.ravel(delta)) for key, delta in deltas.items())
                 for name, (_, deltas) in self.directions.items()}
 
-    def finite_differences(self, **options) -> dict:
-        """Along ``directions``."""
-        h = np.array([h for h, _ in self.directions.values()])
-        J = jacobian(lambda X: self.losses(X, **options)[:, None], np.zeros(len(h)), h)
-        return dict(zip(self.directions, J[0]))
+    def adjoint(self, **options) -> dict:
+        """The derivatives along ``directions``."""
+        return self.along(self.gradients(**options))
 
-    def check(self, options: dict, rtol: float, rtols: dict | None = None, fd_options: dict | None = None) -> None:
-        """The adjoint against finite differences (with ``fd_options`` if given); ``rtols`` overrides ``rtol`` per
-        name."""
-        adjoint = self.adjoint(**options)
-        fd = self.finite_differences(**(fd_options or options))
+    def add_ascent(self, grads: dict) -> None:
+        """Per random direction (not :attr:`shaped`), ``name ^``: its magnitudes with the gradient's signs, at its
+        step. Never larger than the random one anywhere, its derivative ``sum |delta g|`` is never small, so a relative
+        tolerance means something (a random direction's can all but cancel)."""
+        for name, (h, deltas) in list(self.directions.items()):
+            if name not in self.shaped:
+                self.directions[name + " ^"] = (h, {key: np.abs(d) * np.sign(grads[key]).reshape(np.shape(d))
+                                                    for key, d in deltas.items()})
+
+    def finite_differences(self, **options) -> tuple[dict, dict]:
+        """Along ``directions``, and their error estimates: :func:`fd.jacobian`'s, or the loss's own noise if larger
+        (the spread ``s`` of :attr:`witnesses` unperturbed copies in each batch, off the solver's float32 floor and the
+        copies' rounding, which the two steps share: ``1.9 s / h`` is the extrapolation's standard deviation)."""
+        h = np.array([h for h, _ in self.directions.values()])
+        spread = []
+
+        def f(X):
+            y = self.losses(np.vstack([X, np.zeros((self.witnesses, X.shape[1]))]), **options)
+            spread.append(y[len(X):].std(ddof=1))
+            return y[: len(X), None]
+
+        J, est = jacobian(f, np.zeros(len(h)), h, error=True)
+        est = np.maximum(est[0], 1.9 * max(spread) / h)
+        return dict(zip(self.directions, J[0])), dict(zip(self.directions, est))
+
+    def check(self, options: dict, rtol: float = 1.0e-2, rtols: dict | None = None, fd_options: dict | None = None,
+              resolved: float = 0.1) -> None:
+        """The adjoint against finite differences (with ``fd_options`` if given) along ``directions`` and their
+        ascents (:meth:`add_ascent`), within ``rtol`` and the differences' own error (:func:`fd.assert_derivative`);
+        ``rtols`` overrides ``rtol`` per name (an ascent's: its direction's). A random direction's error is relative to
+        its ascent's derivative, the largest its magnitudes allow (its own can all but cancel); an ascent must be
+        ``resolved`` too. Over 16 seeds every test needs at most 3.5e-3 (2026-10-27,
+        ``--seeds 16``)."""
+        grads = self.gradients(**options)
+        self.add_ascent(grads)
+        adjoint = self.along(grads)
+        fd, est = self.finite_differences(**(fd_options or options))
         for name, f in fd.items():
-            assert_close(adjoint[name], f, (rtols or {}).get(name, rtol), name)
+            base = name.removesuffix(" ^")
+            scale = abs(adjoint[name + " ^"]) if name + " ^" in adjoint else None
+            assert_derivative(adjoint[name], f, est[name], (rtols or {}).get(base, rtol), name, scale=scale,
+                              resolved=resolved if base != name else None)
 
 
 class ClampedRollout(Rollout):
@@ -325,8 +404,8 @@ class CrossingRollout(Rollout):
         return {
             "mass": self._mass(rng, model),
             "velocity": (4.0e-2, {"qd": free}),
-            "position": (1.2e-3, {"q": free}),  # small effects: smaller steps round off (4x larger is nonlinear)
-            "tilt": (2.0e-2, {"q": tilt}),
+            "position": (3.0e-4, {"q": free}),  # 4x larger lifts the top rod off within the stencil (16 seeds)
+            "tilt": (4.0e-2, {"q": tilt}),
             "yaw": (2.0e-2, {"q": yaw}),
         }
 
@@ -446,8 +525,10 @@ class SheetContactRollout(ShellRollout):
         along[3 * first + axis : nd : 3] = 1.0
         directions = {
             "mass": self._mass(rng, model),
-            "velocity": (4.0e-2, {"qd": free}),
-            "position": (1.5e-4, {"q": free}),  # the clamped sheet's membrane: nonlinear at 6e-4
+            # The rod on the sheet's edge, which springs back: 8x larger lifts it off within the stencil (16 seeds).
+            "velocity": (5.0e-3 if self.scene == "edge" else 4.0e-2, {"qd": free}),
+            # The clamped sheet's membrane: nonlinear at 6e-4; the foot lifts off within a 1.5e-4 stencil (16 seeds).
+            "position": (7.5e-5 if self.scene == "foot" else 1.5e-4, {"q": free}),
             "speed": (4.0e-2, {"qd": along}),
             "shift": (2.0e-3, {"q": along}),
         }

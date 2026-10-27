@@ -96,7 +96,9 @@ def test_forms_and_derivatives(rng):
             dx[c] = 1.0e-6
             fd[:, c] = (reference_forms(x + dx, flap[f] > 0, sign[f]) - reference_forms(x - dx, flap[f] > 0, sign[f]))
         fd /= 2.0e-6
-        assert np.abs(J[f] - fd).max() < 1.0e-5 * max(np.abs(fd).max(), 1.0)
+        # float32 round-off: 3.6e-6 at the 99.9th percentile of 2048 faces (64 seeds), 1.3e-5 at the worst (an
+        # entry ~500, near tan's pole).
+        assert np.abs(J[f] - fd).max() < 3.0e-5 * max(np.abs(fd).max(), 1.0)
 
 
 def test_curved_shell_at_rest_stays(rng):
@@ -152,36 +154,20 @@ def test_shell_lands_on_the_ground():
 # -- Offset Geometric Contact --------------------------------------------------------------------------
 
 
-def closest_on_triangle(p, a, b, c):
-    """Ericson's closest point, numpy, one point."""
-    ab, ac, ap = b - a, c - a, p - a
-    d1, d2 = ab @ ap, ac @ ap
-    if d1 <= 0 and d2 <= 0:
-        return a
-    bp = p - b
-    d3, d4 = ab @ bp, ac @ bp
-    if d3 >= 0 and d4 <= d3:
-        return b
-    vc = d1 * d4 - d3 * d2
-    if vc <= 0 and d1 >= 0 and d3 <= 0:
-        return a + d1 / (d1 - d3) * ab
-    cp = p - c
-    d5, d6 = ab @ cp, ac @ cp
-    if d6 >= 0 and d5 <= d6:
-        return c
-    vb = d5 * d2 - d1 * d6
-    if vb <= 0 and d2 >= 0 and d6 <= 0:
-        return a + d2 / (d2 - d6) * ac
-    va = d3 * d6 - d5 * d4
-    if va <= 0 and d4 - d3 >= 0 and d5 - d6 >= 0:
-        return b + (d4 - d3) / ((d4 - d3) + (d5 - d6)) * (c - b)
-    den = 1.0 / (va + vb + vc)
-    return a + ab * vb * den + ac * vc * den
+@wp.kernel
+def _mesh_distance_kernel(mesh: wp.uint64, points: wp.array[wp.vec3], out: wp.array[float]):
+    i = wp.tid()
+    q = wp.mesh_query_point_no_sign(mesh, points[i], 1.0e6)
+    out[i] = wp.length(points[i] - wp.mesh_eval_position(mesh, q.face, q.u, q.v))
 
 
 def mesh_distance(points, x, tris):
-    """Each point's distance to the triangle mesh."""
-    return np.array([min(np.linalg.norm(p - closest_on_triangle(p, *x[t])) for t in tris) for p in points])
+    """Each point's distance to the triangle mesh (Warp's BVH, not the solver's contact)."""
+    mesh = wp.Mesh(wp.array(x, dtype=wp.vec3), wp.array(np.ravel(tris), dtype=wp.int32))
+    out = wp.zeros(len(points), dtype=float)
+    wp.launch(_mesh_distance_kernel, dim=len(points), inputs=[mesh.id, wp.array(points, dtype=wp.vec3)],
+              outputs=[out])
+    return out.numpy()
 
 
 def mesh_gaps(frames, points, tris) -> list:
@@ -241,6 +227,38 @@ def test_sheet_over_rod():
     assert overflow(solver) == 0
     assert min(gaps) > 0.85 * (rs + rr)
     assert x[ids, 2].max() < 0.04 and x[ids, 2].min() < -0.05  # it hangs over the rod (coarse faces tent above it)
+
+
+def polyline_gap(a: np.ndarray, b: np.ndarray, samples: int = 41) -> float:
+    """The closest two polylines come: points along ``a``'s edges against ``b``'s edges."""
+    s = np.linspace(0.0, 1.0, samples)[:, None, None]
+    p = ((1.0 - s) * a[:-1] + s * a[1:]).reshape(-1, 1, 3)  # (samples * edges, 1, 3)
+    d = b[1:] - b[:-1]
+    u = np.clip(((p - b[:-1]) * d).sum(-1) / (d * d).sum(-1), 0.0, 1.0)
+    return float(np.linalg.norm(p - (b[:-1] + u[..., None] * d), axis=-1).min())
+
+
+def test_rod_on_rod():
+    """A rod dropped across a clamped one at an angle, a node landing right over it (the edge-edge pair's end, left
+    to the node: a node rounded past itself was once neither's, and fell through): nothing comes closer than the
+    summed radii, and it rests on it."""
+    r = 0.01
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    lower = np.column_stack([np.linspace(-0.3, 0.3, 4), np.zeros(4), np.zeros(4)])
+    for b in DiSMechSolver.add_rod(builder, newton.Rod(lower, radius=r), stretch_stiffness=1.0e5, bend_stiffness=1.0,
+                                   twist_stiffness=1.0, collide=True):
+        DiSMechSolver.fix_segment(builder, b)
+    s = np.linspace(-0.3, 0.3, 7)
+    upper = np.column_stack([0.013 + s * np.sin(0.6), s * np.cos(0.6), np.full(7, 0.05)])
+    DiSMechSolver.add_rod(builder, newton.Rod(upper, radius=r), stretch_stiffness=1.0e4, bend_stiffness=0.05,
+                          twist_stiffness=0.05, collide=True)
+    model = builder.finalize()
+    solver = DiSMechSolver(model)
+    _, frames = simulate(model, solver, 120, 1.0 / 240.0, every=1)
+    gaps = [polyline_gap(x[:4], x[4:]) for x in frames]
+    assert overflow(solver) == 0
+    assert min(gaps) > 0.85 * 2 * r
+    assert abs(gaps[-1] - 2 * r) < 0.05 * r  # resting on it
 
 
 def test_rod_on_hammock():
@@ -319,10 +337,13 @@ def test_sheet_on_shape(shape):
     model.particle_mu = 0.5
     solver = DiSMechSolver(model)
     out, frames = simulate(model, solver, 360, 1.0 / 240.0, every=4)
-    worst = min(min(sdf(x[ids], shape, h, h).min(), x[ids, 2].min()) for x in frames)
+    gaps = np.array([np.minimum(sdf(x[ids], shape, h, h), x[ids, 2]) for x in frames])  # (frames, vertices)
+    k, v = np.unravel_index(gaps.argmin(), gaps.shape)
     x = out.particle_q.numpy()[ids]
     top = (np.abs(x[:, 0]) < 0.5 * h) & (np.abs(x[:, 1]) < 0.5 * h)
-    assert worst > 0.7 * r
+    # 0.80-0.93 r over 40 runs (2026-10-27, mesh and box alike): the rim sliding down the side; [mesh] once < 0 (once
+    # in ~14 full runs, not reproduced since), so say where.
+    assert gaps[k, v] > 0.7 * r, f"vertex {v} at step {4 * k}: gap {gaps[k, v] / r:.2f} r at {frames[k][ids[v]]}"
     gap = np.abs(sdf(x[top], shape, h, h) - r)
     assert (gap.min() if shape == "sphere" else gap.max()) < 0.15 * r  # a sphere's top touches at one vertex
 

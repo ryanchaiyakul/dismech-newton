@@ -1,0 +1,11 @@
+#!/bin/sh
+# Build and upload the T4 Warp kernel cache of each pushed commit in the background (scripts/warp_cache.py build);
+# the push does not wait. Log: .cache/warp-cache/<sha>.log. Enable per clone: git config core.hooksPath .githooks
+root=$(git rev-parse --show-toplevel)
+mkdir -p "$root/.cache/warp-cache"
+while read -r _ sha _ _; do
+    case "$sha" in 0000000000000000000000000000000000000000) continue ;; esac  # a deleted branch
+    nohup uv run --no-project python "$root/scripts/warp_cache.py" build "$sha" \
+        > "$root/.cache/warp-cache/$sha.log" 2>&1 < /dev/null &
+done
+exit 0

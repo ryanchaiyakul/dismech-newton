@@ -1,7 +1,8 @@
 """Shared fixtures; ``--device`` picks the tests' Warp device (default ``cuda`` if available, else ``cpu``),
 ``--ptx-arch`` compiles CUDA kernels as PTX for an older GPU (``75``: Colab's T4, whose NVRTC bugs the local card
 never shows; run it before merging kernel changes), ``--seeds N`` runs every seeded test over ``N`` seeds (the
-first is the fast loop's): what the tolerances are checked against."""
+first is the fast loop's): what the tolerances are checked against. ``--cubin-arch``/``--cubin`` build and load the
+pushed commits' T4 kernel cache (``scripts/warp_cache.py``)."""
 
 import re
 import zlib
@@ -18,6 +19,10 @@ def pytest_addoption(parser):
     parser.addoption("--ptx-arch", type=int, default=None,
                      help="compile CUDA kernels to PTX for this arch (e.g. 75: Colab's T4) instead of the device's")
     parser.addoption("--seeds", type=int, default=1, help="run every test taking `rng` over this many seeds")
+    parser.addoption("--cubin-arch", type=int, default=None,
+                     help="also compile every CUDA module to CUBIN for this arch (the kernel cache's build)")
+    parser.addoption("--cubin", action="store_true",
+                     help="load CUDA modules as CUBIN (a restored kernel cache; the T4 would JIT PTX at every load)")
 
 
 def pytest_configure(config):
@@ -26,6 +31,27 @@ def pytest_configure(config):
     if arch:
         wp.config.cuda_output = "ptx"
         wp.config.ptx_target_arch = arch
+    if config.getoption("--cubin"):
+        wp.config.cuda_output = "cubin"
+    if config.getoption("--cubin-arch"):
+        _also_compile_cubin(config.getoption("--cubin-arch"))
+
+
+def _also_compile_cubin(arch):
+    """Every CUDA module version Warp compiles is also compiled to CUBIN for ``arch``, as it compiles: modules are
+    re-hashed as kernels get added, so the session's last versions are not all of them. (Warp's private
+    ``Module._compile``; ``wp.compile_aot_module`` only sees the last version.)"""
+    from warp._src.context import Module
+
+    original = Module._compile
+
+    def _compile(self, device=None, output_dir=None, output_name=None, output_arch=None, use_ptx=None, options=None):
+        out = original(self, device, output_dir, output_name, output_arch, use_ptx, options)
+        if device is not None and device.is_cuda:
+            original(self, None, output_dir, None, arch, False, options)
+        return out
+
+    Module._compile = _compile
 
 
 @pytest.fixture(scope="session")

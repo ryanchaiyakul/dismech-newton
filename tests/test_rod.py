@@ -1,16 +1,19 @@
 """The rod element: its Jacobian against central differences of its strains, with the reference frames current and
-lagged (a step's start behind its iterate), and its strains at rest."""
+lagged (a step's start behind its iterate), and its strains at rest; a cantilever against beam theory."""
 
+import newton
 import numpy as np
 import pytest
 import warp as wp
 from fd import assert_close
 
+from dismech_newton import DiSMechSolver, flatten_state
 from dismech_newton.builder import vec5f
 from dismech_newton.rod import Rod, mat5x11f, rod_jacobian, rod_strain, vec5i, vec11f
 
 
-@wp.kernel
+# -O2: nvrtc -O3 reads the struct argument through a local-memory pointer (CUDA 700) for sm_75-sm_90 (Warp 1.17).
+@wp.kernel(module="unique", module_options={"optimization_level": 2})
 def _evaluate(x: wp.array[vec11f], v: Rod, strain: wp.array[vec5f], jac: wp.array[mat5x11f]):
     i = wp.tid()
     strain[i] = rod_strain(x[i], v, 0)
@@ -72,3 +75,30 @@ def test_strains_at_rest(rng):
     strain, _ = _evaluate_at(np.stack([straight, stretched]), v)
     np.testing.assert_allclose(strain[0], 0.0, atol=1.0e-6)
     np.testing.assert_allclose(strain[1], [0.0, 0.05, 0.0, 0.0, 0.0], atol=1.0e-5)
+
+
+def test_cantilever_converges_to_beam_theory():
+    """Tip deflection of a rod clamped by its first segment under its weight against ``w L^4 / (8 EI)`` (the clamp at
+    the second node; ``bend_stiffness = EI / h``), deflection ~1% of the length: within 10%, closer on the finer mesh
+    (1.07 and 1.012 on 2026-10-27)."""
+    length, r, rho, E = 0.5, 0.005, 1000.0, 1.0e8
+    area, EI = np.pi * r**2, E * np.pi * r**4 / 4.0
+    ratios = []
+    for n in (20, 40):
+        h = length / n
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        rod = newton.Rod.create_straight((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), length, segment_count=n, radius=r)
+        bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=rho),
+                                       stretch_stiffness=E * area, bend_stiffness=EI / h, twist_stiffness=EI / h)
+        DiSMechSolver.fix_segment(builder, bodies[0])
+        model = builder.finalize()
+        solver = DiSMechSolver(model, self_contact=False)
+        s0, s1 = model.state(), model.state()
+        flatten_state(s0)
+        flatten_state(s1)
+        for _ in range(200):  # implicit Euler's damping settles it
+            solver.step(s0, s1, None, None, 0.02)
+            s0, s1 = s1, s0
+        tip = 1.0 - s0.particle_q.numpy()[-1, 2]
+        ratios.append(tip / (rho * area * 9.81 * (length - h) ** 4 / (8.0 * EI)))
+    assert 1.0 < ratios[1] < ratios[0] < 1.1, ratios

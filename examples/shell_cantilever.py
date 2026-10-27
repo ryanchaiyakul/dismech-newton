@@ -30,10 +30,11 @@ from cantilever import Example as RodExample
 
 from dismech_newton import DiSMechSolver
 
-# name: (solver, its options, color); both on ADMM, the theta method the only difference.
+# name: (solver, its options, color); both on ADMM, the theta method the only difference. Without contact 3
+# iterations give the same sag and frequency as 20, in 0.6 of the default 10's time.
 SHELL_SOLVERS = {
-    "Shell ADMM, implicit midpoint": (DiSMechSolver, {"theta": 0.5}, (0.6, 0.45, 0.9)),
-    "Shell ADMM, implicit Euler": (DiSMechSolver, {}, (0.3, 0.8, 0.6)),
+    "Shell ADMM, implicit midpoint": (DiSMechSolver, {"theta": 0.5, "iterations": 3}, (0.6, 0.45, 0.9)),
+    "Shell ADMM, implicit Euler": (DiSMechSolver, {"iterations": 3}, (0.3, 0.8, 0.6)),
 }
 
 

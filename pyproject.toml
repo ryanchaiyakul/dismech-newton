@@ -68,7 +68,8 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["examples"]  # tests/test_splat.py: examples/utils/splat.py
-addopts = ["-rs"]  # list why tests skipped (most need --device cuda)
+addopts = ["-rs", "-m", "not slow"]  # list why tests skipped (most need CUDA); `-m slow` runs the slow ones
+markers = ["slow: over the fast loop's budget (the examples)"]
 
 [tool.ruff]
 line-length = 120

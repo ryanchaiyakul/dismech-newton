@@ -106,7 +106,8 @@ class Example(CableExample):
                                      damping=self.damping, particle_radius=self.radius)
         model = builder.finalize()
         model.particle_mu = self.mu
-        self.start(viewer, model, DiSMechSolver(model))
+        # 5 iterations: the eyelet height within 0.5% of 10's, in 0.75 of the time
+        self.start(viewer, model, DiSMechSolver(model, iterations=5))
         if self.drag:
             self.drives = (AirDrag(model, self.nx, self.ny, self.density, self.drag),)
 

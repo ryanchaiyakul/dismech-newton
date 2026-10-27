@@ -20,35 +20,39 @@ def test_step_adjoint_matches_finite_differences(rng, options, drive):
     """Every differentiable input, the clamp and the external force included; the element Hessians are Warp's
     reverse mode through their Jacobians. ``driven``: the clamp moves between steps, written into each step's input,
     which is the last step's output (a step's fixed DOFs are its input's: reading the output's was a 20% error). The
-    moved clamp leaves its neighbour's frame off its tangent, where the rod's hand-written Jacobian is not exactly the
-    strain's: ~1e-3 per step, up to 4% here. ``midpoint``: the theta method's extrapolation, theta = 1/2."""
+    drive turns the clamp's edges off their frames' tangents: untransported, the hand-written Jacobian assumed the
+    frames orthonormal, and the error grew linearly with the drive (up to 14% over 16 seeds). ``midpoint``: the theta
+    method's extrapolation, theta = 1/2."""
     r = ClampedRollout(rng)
     r.drive = drive
-    r.check(options, rtol=6.0e-2 if drive else 1.0e-2, fd_options={**EXACT, "theta": options.get("theta", 1.0)})
+    r.check(options, fd_options={**EXACT, "theta": options.get("theta", 1.0)})
 
 
 def test_shell_adjoint_matches_finite_differences(rng):
-    """Membrane, bending and damping stiffness, rest strains, mass, velocity, the clamp and a force. A random
-    position's derivative cancels ~200x over the DOFs: its float32 round-off is a few percent."""
-    ShellRollout(rng).check(EXACT, rtol=1.0e-2, rtols={"position": 6.0e-2})
+    """Membrane, bending and damping stiffness, rest strains, mass, velocity, the clamp and a force."""
+    ShellRollout(rng).check(EXACT)
 
 
 @pytest.mark.usefixtures("needs_cudss")
 def test_gradient_graph_capture(rng):
-    """A whole gradient evaluation (rollout, loss, backward) in one CUDA graph: replays give the eager gradients,
-    and do not accumulate. No contacts possible, so recording reads no count."""
+    """A whole gradient evaluation (the solver's reset, rollout, loss, backward) in one CUDA graph: replays give the
+    eager gradients to round-off, and do not accumulate. Without the reset, each rollout starts from the last one's
+    warm start: unconverged (10 iterations), up to 0.6% off the first's (16 seeds). No contacts possible, so recording
+    reads no count."""
     r = ClampedRollout(rng)
     run = r.setup({"iterations": 10, "self_contact": False}, grad=True)
     loss = wp.zeros(1, dtype=float, requires_grad=True)
     inputs = [*run.arrays.values(), run.states[0].dismech.q, run.states[0].dismech.qd]
 
+    run.solver.reset(run.states[0])
     tape = r.record(run, loss)  # eager: the one-time host work (adjoint, cuDSS analysis)
     assert run.solver.graph_capturable
     expected = [a.grad.numpy().copy() for a in inputs]
     with wp.ScopedCapture() as capture:
         tape.zero()
+        run.solver.reset(run.states[0])
         r.record(run, loss)
     for _ in range(2):
         wp.capture_launch(capture.graph)
     for a, g in zip(inputs, expected, strict=True):
-        assert_close(a.grad.numpy(), g, 1.0e-3)
+        assert_close(a.grad.numpy(), g, 1.0e-6)

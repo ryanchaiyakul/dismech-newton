@@ -30,6 +30,8 @@ ATTRIBUTES = [
     ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
     # Midedge shells (shell.py): a hinge per mesh edge, its midedge angle a DOF.
     ("hinge", "hinge_fixed", wp.int32, None),
+    ("hinge", "hinge_inertia", float, None),  # the angle's (Chen et al. 2026, Eq. 52)
+    ("hinge", "hinge_thickness", float, None),  # h = sqrt(12 D / (lam + 2 mu)), its faces' mean
     *(("face", f"face_node{k}", wp.int32, "particle") for k in range(6)),  # its 3 vertices, then the 3 flaps
     *(("face", f"face_hinge{k}", wp.int32, _P + "hinge") for k in range(3)),  # hinge k: the edge opposite node k
     ("face", "face_sign", wp.vec3, None),  # +-1: the hinge's angle as the face sees it
@@ -267,7 +269,10 @@ def add_cloth_mesh(
       face's hinges: Newton's dihedral spring is anisotropic, so this is within about 10% along a regular grid's
       axes and 30% across its diagonals. ``bend_stiffness`` sets ``D`` [N m] instead;
     - damping as a time: ``4 tri_kd / (lam + 2 mu)`` (membrane), ``edge_kd / edge_ke`` (bending), or ``damping`` [s]
-      for both.
+      for both;
+    - a midedge angle's inertia ``rho h^3 (A + A') / 36 / cos^4(psi0)`` (Chen et al. 2026, Eq. 52: ``rho h`` the
+      ``density`` per area, ``h^2 = 12 D / (lam + 2 mu)``, ``A + A'`` its faces' rest areas, ``psi0`` half its rest
+      turning angle).
 
     The rest shape is the initial one. Fix vertices through their particle flags; a clamped edge needs its
     neighbouring row too (the midedge angles stay free).
@@ -315,10 +320,22 @@ def add_cloth_mesh(
     area = 0.5 * np.sqrt(np.linalg.det(metric))
     L = np.linalg.inv(np.linalg.cholesky(metric))  # L a L^T = I
     lam_2mu = ka + 2.0 * ke  # 2D Lame: lam = tri_ka, mu = tri_ke
+    hinge_area = np.bincount(face_hinges.ravel(), np.repeat(area, 3), minlength=len(edges))
     if bend_stiffness is None:
-        hinge_area = np.bincount(face_hinges.ravel(), np.repeat(area, 3), minlength=len(edges))
         hinge_len = np.linalg.norm(x[edges[:, 3]] - x[edges[:, 2]], axis=1)
         bend_stiffness = (edge_ke * hinge_area / hinge_len)[face_hinges].mean(1)
+    face_h2 = 12.0 * np.broadcast_to(bend_stiffness, area.shape) / lam_2mu
+    count = np.bincount(face_hinges.ravel(), minlength=len(edges))
+    hinge_h = np.sqrt(np.bincount(face_hinges.ravel(), np.repeat(face_h2, 3), minlength=len(edges)) / count)
+    n = np.cross(eu, ev)
+    n /= np.linalg.norm(n, axis=1, keepdims=True)
+    cos_turn = np.ones(len(edges))  # its faces' normals' dot product (a boundary hinge's: 1)
+    two = np.flatnonzero(count == 2)
+    pairs = np.argsort(face_hinges.ravel(), kind="stable").reshape(-1)  # face slots grouped by hinge
+    start = np.concatenate([[0], np.cumsum(count)])
+    first, second = pairs[start[two]] // 3, pairs[start[two] + 1] // 3
+    cos_turn[two] = (n[first] * n[second]).sum(1)
+    hinge_inertia = kwargs["density"] * hinge_h**2 * hinge_area / 36.0 / (0.5 * (1.0 + cos_turn)) ** 2
     gamma = (4.0 * kd / lam_2mu, (edge_kd / np.where(edge_ke > 0, edge_ke, np.inf))[face_hinges].mean(1))
     K = np.repeat(np.column_stack([0.25 * area * lam_2mu, area * bend_stiffness]), 3, axis=1)
     C = K * (damping if damping is not None else np.repeat(np.column_stack(gamma), 3, axis=1))
@@ -337,10 +354,12 @@ def add_cloth_mesh(
     R[:, 0, 0], R[:, 0, 1], R[:, 1, 1], R[:, 2, 2] = 1.0, nu, np.sqrt(1.0 - nu**2), np.sqrt(2.0 * (1.0 - nu))
     W = R @ T
 
-    for _ in edges:
+    for h in range(len(edges)):
         builder.add_custom_values(
             **{
                 _P + "hinge_fixed": 0,
+                _P + "hinge_inertia": float(hinge_inertia[h]),
+                _P + "hinge_thickness": float(hinge_h[h]),
                 _P + "hinge_q": 0.0,
                 _P + "hinge_qd": 0.0,
             }

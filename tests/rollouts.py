@@ -11,9 +11,11 @@ from fd import assert_derivative, jacobian
 from utils.common import grid
 
 from dismech_newton import DiSMechSolver, add_cloth_mesh, flatten_state, suspended_tape
+from dismech_newton.contact import SMOOTH
 from dismech_newton.state import dof_constants
 
 RADIUS = 0.01
+ONSET = 1.0 + SMOOTH  # contacts start this many thicknesses apart: at the barrier's onset, no normal force yet
 
 
 @wp.kernel
@@ -39,22 +41,24 @@ def _cfg(builder, mu: float):
     return cfg
 
 
-def contact_signatures(solver, copies: int, nodes: int) -> list:
-    """Per copy (``nodes`` each) the step's force-carrying contacts: their nodes (copy-local), feature (the weights'
-    signs) and whether they slide. What the step's solution is smooth in only while it holds."""
-    out = [[] for _ in range(copies)]
+def contact_signatures(solver, q: wp.array, copies: int, nodes: int) -> list:
+    """Per copy (``nodes`` each) its contacts, ``(nodes (copy-local), feature (the weights' signs))``: those the
+    source holds, and of them those carrying force (within the barrier's onset at the step's end, or with friction's
+    normal force)."""
+    held, force = [set() for _ in range(copies)], [set() for _ in range(copies)]
     if solver.contact.count:
         s = solver.contact.s
-        pair, w, n, u, z = s.pair.numpy(), s.w.numpy(), s.normal.numpy(), s.u.numpy(), s.z.numpy()
+        pair, w, n, anchor = s.pair.numpy(), s.w.numpy(), s.normal.numpy(), s.anchor.numpy()
+        th, rho = s.thickness.numpy(), s.rho.numpy()
+        x = q.numpy()[: 3 * solver.model.particle_count].reshape(-1, 3)
         for i in np.flatnonzero(s.active.numpy()):
-            un = u[i] @ n[i]  # the scaled normal force, negative when pressing
-            if un >= 0.0:
-                continue
-            slip = np.linalg.norm(z[i] - (z[i] @ n[i]) * n[i])  # zero inside the friction cone
-            c = pair[i][pair[i] >= 0].min() // nodes
-            local = tuple(int(k - c * nodes) if k >= 0 else -1 for k in pair[i])
-            out[c].append((local, tuple(int(x) for x in np.sign(w[i])), bool(slip > 1.0e-6 * -un)))
-    return [tuple(sorted(o)) for o in out]
+            p = pair[i]
+            c = p[p >= 0].min() // nodes
+            key = (tuple(int(k - c * nodes) if k >= 0 else -1 for k in p), tuple(int(v) for v in np.sign(w[i])))
+            held[c].add(key)
+            if n[i] @ (sum(w[i][k] * x[p[k]] for k in range(4) if p[k] >= 0) - anchor[i]) < ONSET * th[i] or rho[i] > 0:
+                force[c].add(key)
+    return list(zip(held, force))
 
 
 def _dofs(model, copies: int) -> np.ndarray:
@@ -203,20 +207,25 @@ class Rollout:
                               self.drive], outputs=[run.states[t].dismech.q])
             run.solver.step(run.states[t], run.states[t + 1], None, None, self.dt)
             if signatures is not None:
-                signatures.append(contact_signatures(run.solver, len(run.dofs), self.nodes))
+                signatures.append(contact_signatures(run.solver, run.states[t + 1].dismech.q, len(run.dofs),
+                                                     self.nodes))
 
     def _assert_smooth(self, X: np.ndarray, signatures: list) -> None:
-        """Every copy of a direction's stencil (``X``'s rows along it) has the same contacts: else its loss has a
-        kink or jump inside the stencil, and the differences say nothing."""
+        """Every copy of a direction's stencil (``X``'s rows along it) holds a contact on the nodes of each contact
+        that carries force in any other: else its loss jumps inside the stencil, and the differences say nothing. (A
+        contact crossing the barrier's onset is smooth, and so is one handed between a node and its edge.)"""
         names = list(self.directions)
         for k in range(X.shape[1]):
             rows = np.flatnonzero(X[:, k] != 0.0)
             for t, sig in enumerate(signatures):
-                changed = {i for i in rows if sig[i] != sig[rows[0]]}
-                assert not changed, (
-                    f"{names[k]}: the contacts change across its finite-difference stencil at step {t}: "
-                    f"{sorted(set(sig[rows[0]]) ^ set(sig[min(changed)]))} (step {X[min(changed), k]:+.1e}); "
-                    "the loss is not smooth there, so take a smaller step or a firmer scene")
+                force = set().union(*(sig[i][1] for i in rows))
+                for i in rows:
+                    nodes = {n for pair, _ in sig[i][0] for n in pair if n >= 0}
+                    lost = [c for c in force if not nodes & {n for n in c[0] if n >= 0}]
+                    assert not lost, (
+                        f"{names[k]}: the contacts change across its finite-difference stencil at step {t}: "
+                        f"{sorted(lost)} not held (step {X[i, k]:+.1e}); the loss is not smooth there, so take a "
+                        "smaller step or a firmer scene")
 
     def losses(self, X: np.ndarray, **options) -> np.ndarray:
         """``(N,)`` at the rows of ``X`` ``(N, k)``, summed in float64: the float32 atomic sum rounds in a
@@ -349,7 +358,7 @@ class GroundRollout(Rollout):
     """A rod sliding on the ground (friction ``mu``); ``checks`` picks the directions."""
 
     ground = colliding = True
-    height = RADIUS
+    height = RADIUS * ONSET
 
     def __init__(self, rng, v_mean, checks, mu: float = 0.3):
         self.v_mean, self.checks = np.asarray(v_mean, dtype=float), checks
@@ -388,7 +397,7 @@ class CrossingRollout(Rollout):
 
     def _rods(self) -> list:
         return [((-self.half, 0.0, 0.0), (1.0, 0.0, 0.0), True),
-                ((0.0, -self.half, 2.0 * RADIUS), (0.0, 1.0, 0.0), False)]
+                ((0.0, -self.half, 2.0 * RADIUS * ONSET), (0.0, 1.0, 0.0), False)]
 
     def _velocity(self, rng, model):
         return self._slide(rng, model, model.particle_count // 2)  # the top rod along the bottom one, onto it
@@ -472,10 +481,10 @@ class SheetContactRollout(ShellRollout):
 
     def _rod(self, o: np.ndarray):
         if self.scene == "foot":
-            return newton.Rod.create_straight(o + (0.23, 0.09, RADIUS + self.thickness), (0.0, 0.0, 1.0), 0.2,
+            return newton.Rod.create_straight(o + (0.23, 0.09, (RADIUS + self.thickness) * ONSET), (0.0, 0.0, 1.0), 0.2,
                                               segment_count=2, radius=RADIUS)
         d = np.array([1.0, 0.0, -0.3]) / np.linalg.norm([1.0, 0.0, -0.3])
-        touch = np.array([0.3, 0.05, 0.0]) + (RADIUS + self.thickness) * np.array([-d[2], 0.0, d[0]])
+        touch = np.array([0.3, 0.05, 0.0]) + (RADIUS + self.thickness) * ONSET * np.array([-d[2], 0.0, d[0]])
         return newton.Rod.create_straight(o + touch - 0.15 / d[0] * d, d, 0.4, segment_count=4, radius=RADIUS)
 
     def model(self, copies: int):
@@ -484,10 +493,10 @@ class SheetContactRollout(ShellRollout):
             builder.add_ground_plane(cfg=_cfg(builder, self.mu))
         if self.scene == "sphere":
             v, f = grid(3, 3, 0.1, 0.1)
-            v += (-0.05, -0.05, self.thickness)
+            v += (-0.05, -0.05, self.thickness * ONSET)
         else:
             v, f = grid(self.nx, self.ny, self.size, 0.75 * self.size)
-            v[:, 2] = self.thickness if self.scene == "ground" else 0.0
+            v[:, 2] = self.thickness * ONSET if self.scene == "ground" else 0.0
         for c in range(copies):
             o = self.offset(c, copies)
             if self.scene == "sphere":
@@ -550,7 +559,7 @@ class SphereRollout(Rollout):
             o = self.offset(c, copies)
             builder.add_shape_sphere(-1, xform=wp.transform(o + (0.0, 0.0, -self.radius), wp.quat_identity()),
                                      radius=self.radius, cfg=_cfg(builder, self.mu))
-            rod = newton.Rod.create_straight(o + (-0.3125, 0.0, RADIUS), (1.0, 0.0, 0.0), 0.5,
+            rod = newton.Rod.create_straight(o + (-0.3125, 0.0, RADIUS * ONSET), (1.0, 0.0, 0.0), 0.5,
                                              segment_count=self.segments, radius=RADIUS)
             DiSMechSolver.add_rod(builder, rod, cfg=_cfg(builder, self.mu), **self.rod_options)
         return builder.finalize()

@@ -1,5 +1,5 @@
-"""Discrete elastic rods and midedge shells for Newton: one implicit solver, strain-space ADMM with contact,
-friction and an adjoint (:class:`DiSMechSolver`)."""
+"""Discrete elastic rods and midedge shells for Newton: one implicit solver, strain-space ADMM elements with barrier
+contact, friction and an adjoint (:class:`DiSMechSolver`)."""
 
 from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
 from .solver import DiSMechSolver

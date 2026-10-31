@@ -26,10 +26,9 @@ def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
 
 
 def dof_mass(model: Model, mass: wp.array) -> None:
-    """The per-DOF masses into ``mass`` (differentiable): the particles', the twist inertias, massless midedge
-    angles."""
-    wp.launch(_dof_mass_kernel, dim=mass.shape[0], inputs=[model.particle_mass, model.dismech.edge_inertia],
-              outputs=[mass], device=model.device)
+    """The per-DOF masses into ``mass`` (differentiable): the particles', the twist and midedge angle inertias."""
+    wp.launch(_dof_mass_kernel, dim=mass.shape[0], inputs=[model.particle_mass, model.dismech.edge_inertia,
+              model.dismech.hinge_inertia], outputs=[mass], device=model.device)
 
 
 def flatten_state(state: State) -> None:
@@ -131,7 +130,8 @@ def inertia_energy(f: Dofs, i: int, r: float) -> float:
 
 
 @wp.kernel
-def _dof_mass_kernel(particle_mass: wp.array[float], edge_inertia: wp.array[float], mass: wp.array[float]):
+def _dof_mass_kernel(particle_mass: wp.array[float], edge_inertia: wp.array[float], hinge_inertia: wp.array[float],
+                     mass: wp.array[float]):
     i = wp.tid()
     nd = 3 * particle_mass.shape[0]
     if i < nd:
@@ -139,7 +139,7 @@ def _dof_mass_kernel(particle_mass: wp.array[float], edge_inertia: wp.array[floa
     elif i < nd + edge_inertia.shape[0]:
         mass[i] = edge_inertia[i - nd]
     else:
-        mass[i] = 0.0
+        mass[i] = hinge_inertia[i - nd - edge_inertia.shape[0]]
 
 
 def bind_dofs(f: Dofs, model: Model, mass: wp.array, fixed: wp.array, no_force: wp.array, state_in: State,

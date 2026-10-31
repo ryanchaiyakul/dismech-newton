@@ -1,7 +1,7 @@
 """Midedge shells (Chen et al. 2018) on Newton's cloth mesh, as an element of the generic block (:mod:`.element`).
 
 A face's DOFs are its 3 vertices, the 3 flap vertices across its edges (a boundary edge's flap is the vertex
-itself) and the 3 midedge angles of its hinges (massless, ``hinge_q``): 21 DOFs. Its strains are the first and
+itself) and the 3 midedge angles of its hinges (``hinge_q``): 21 DOFs. Its strains are the first and
 second fundamental forms in the rest frame (``L``, ``L a L^T = I``), whitened by the material: the energy
 ``A/4 (lam + 2 mu) |R (L a L^T - I)|^2 / 2 + A D |R (L b L^T - b0)|^2 / 2``, with ``R^T R = [[1, nu, 0], [nu, 1, 0],
 [0, 0, 2 (1 - nu)]]`` (plane-stress StVK in ``(S11, S22, S12)``), ``lam``, ``mu`` the 2D Lame parameters.
@@ -162,7 +162,8 @@ def _half_dihedral(P: mat63f, n: wp.vec3, i: int) -> float:
 @wp.func
 def _forms(P: mat63f, th: wp.vec3, sign: wp.vec3, flap: wp.vec3):
     """``(m, g)``: the first form's entries ``(eu.eu, eu.ev, ev.ev)`` and ``g_i = tan(psi_i + s_i theta_i) |n| / l_i``
-    (``psi_i`` half the dihedral angle at hinge ``i``)."""
+    (``psi_i`` half the dihedral angle at hinge ``i``); infinite past ``|psi_i + s_i theta_i| = pi/2``, where the
+    tangent diverges (a barrier: the line search keeps every angle inside it, Chen et al. 2026, Sec. 7.3)."""
     p0 = _row(P, 0)
     eu = _row(P, 1) - p0
     ev = _row(P, 2) - p0
@@ -174,7 +175,8 @@ def _forms(P: mat63f, th: wp.vec3, sign: wp.vec3, flap: wp.vec3):
         psi = float(0.0)
         if flap[i] != 0.0:
             psi = _half_dihedral(P, n, i)
-        g[i] = wp.tan(psi + float(sign[i]) * th[i]) * nn / wp.length(t)
+        a = psi + float(sign[i]) * th[i]
+        g[i] = wp.where(wp.abs(a) < 0.5 * wp.pi, wp.tan(a) * nn / wp.length(t), wp.inf)
     return wp.vec3(wp.dot(eu, eu), wp.dot(eu, ev), wp.dot(ev, ev)), g
 
 

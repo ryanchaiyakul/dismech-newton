@@ -143,15 +143,20 @@ class CudssSolver:
         """``A``'s values changed: refactorise on the next solve."""
         self._factored = False
 
-    def solve(self, b: wp.array, x: wp.array) -> None:
-        """``x = A^{-1} b``."""
-        wp.launch(_convert, dim=self.A.n, inputs=[b], outputs=[self._b], device=self.device)
+    def factor(self) -> None:
+        """Factorise ``A`` now (inside a graph's conditional branch, say)."""
         with wp.ScopedDevice(self.device):
             if self._handle is None:
                 self._setup()
-            if not self._factored:
-                self._execute(cudss.Phase.FACTORIZATION)
-                self._factored = True
+            self._execute(cudss.Phase.FACTORIZATION)
+            self._factored = True
+
+    def solve(self, b: wp.array, x: wp.array) -> None:
+        """``x = A^{-1} b``."""
+        wp.launch(_convert, dim=self.A.n, inputs=[b], outputs=[self._b], device=self.device)
+        if not self._factored:
+            self.factor()
+        with wp.ScopedDevice(self.device):
             self._execute(cudss.Phase.SOLVE)
         wp.launch(_convert, dim=self.A.n, inputs=[self._x], outputs=[x], device=self.device)
 
@@ -180,6 +185,8 @@ class ScipySolver:
 
     def invalidate(self) -> None:
         self._lu = None
+
+    factor = invalidate  # factorised on the next solve
 
     def solve(self, b: wp.array, x: wp.array) -> None:
         """``x = A^{-1} b``."""

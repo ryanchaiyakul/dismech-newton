@@ -8,8 +8,8 @@ import newton.examples
 import numpy as np
 import pytest
 
-EXAMPLES = ["cable_pile", "cable_twist", "cantilever", "flagella", "overhand_knot", "plectoneme", "shell_cantilever",
-            "shell_fold"]
+EXAMPLES = ["cable_pile", "cable_twist", "cantilever", "cloth_twist", "flagella", "overhand_knot", "plectoneme",
+            "shell_cantilever", "shell_fold"]
 
 
 @pytest.mark.slow

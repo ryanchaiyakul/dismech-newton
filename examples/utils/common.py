@@ -83,7 +83,9 @@ class Drive:
     """
 
     def __init__(self, model, dofs: list[int]):
-        q0 = np.concatenate([model.particle_q.numpy().ravel(), model.dismech.edge_q.numpy()])
+        q0 = model.particle_q.numpy().ravel()
+        if max(dofs) >= len(q0):  # a twist DOF: the model has rods
+            q0 = np.concatenate([q0, model.dismech.edge_q.numpy()])
         self.rest = q0[dofs].astype(np.float64)
         self.dofs = wp.array(dofs, dtype=wp.int32, device=model.device)
         self.start = wp.array(self.rest, dtype=float, device=model.device)

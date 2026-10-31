@@ -15,6 +15,7 @@ Read them in this order: each adds one thing to the last.
 | [`fit_capture.py`](fit_capture.py) | The rod model itself from one RGB-D camera with simulated real-camera flaws: length, radius and held pose fitted as a chain of plain cylinders (analytic outline and depth), splats on it painted from the still; then gradients from pixels (gswarp in torch, the image loss handed back to `wp.Tape`): a coarse scan and L-BFGS on bend stiffness and damping from the same camera's video. Needs `--extra splat` and CUDA. |
 | [`shell_cantilever.py`](shell_cantilever.py) | `cantilever.py` for midedge shells (`add_cloth_mesh`) beside VBD cloth from the same parameters, against plate theory; what Newton's `edge_ke` means as a plate stiffness. |
 | [`shell_fold.py`](shell_fold.py) | A cloth strip flopped over onto itself: it falls, lands on its own lower half and settles into an open fold (an eyelet), held by self-contact with friction, its fall calmed by air drag on the nodes (`state.particle_f`), against the frictionless heavy elastica (height `0.907 (D / rho g)^(1/3)`). |
+| [`cloth_twist.py`](cloth_twist.py) | The sheet self-contact stress test: a square held along two edges, one spun turn after turn until the cloth wrings into a coiling rope; no layer passes through another, and the helicoid before contact against its symmetry (the middle turns half the driven angle). Compressed cloth: its steps end on the iteration budget, not converged (`solver.counts`). |
 
 ```bash
 uv run examples/cable_twist.py

@@ -2,13 +2,19 @@
 
 Shows: many rods in one model (``add_rod``), ground contact and friction (``DiSMechSolver``).
 
-    uv run examples/cable_pile.py
-    uv run examples/cable_pile.py --viewer null --test
+    uv run examples/newton/cable_pile.py
+    uv run examples/newton/cable_pile.py --viewer null --test
 """
+
+import sys
+from pathlib import Path
 
 import newton
 import newton.examples
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
 from utils.common import CableExample
 
 from dismech_newton import DiSMechSolver
@@ -40,7 +46,8 @@ class Example(CableExample):
                     bend_damping=2.0e1,
                 ))
         model = builder.finalize()
-        self.start(viewer, model, DiSMechSolver(model, friction=1.0))  # Coulomb mu = 1
+        model.shape_material_mu.fill_(1.0)  # Coulomb mu = 1: the rods' and the ground's
+        self.start(viewer, model, DiSMechSolver(model))
 
     def test_final(self):
         z = self.state_0.particle_q.numpy()[:, 2]

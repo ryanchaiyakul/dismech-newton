@@ -1,26 +1,37 @@
-"""The cloth twisting stress test: a square of cloth held along two opposite edges, one edge spun about the axis
-between them, turn after turn, so the cloth wrings into a rope that coils on itself; then held.
+"""Newton's cloth twist (``python -m newton.examples cloth_twist``) with midedge shells: the same mesh, material,
+drive and contact settings, so the two run side by side. A 1.5 x 1 m cloth held along its two short edges, each
+spun about the long axis in opposite directions at pi/3 rad/s, wrings into a rope that coils on itself.
 
 Shows: shell self-contact under sustained load (Offset Geometric Contact, vertex-triangle and edge-edge with
-friction, as a barrier energy: ``contact_stiffness``), clamped edges driven through their nodes
-(:class:`utils.common.Drive`). The test asks only that nothing goes wrong: no two parts of the sheet pass through
-each other (no edge crosses a face it does not touch) and no vertex comes within half a contact thickness of one it
-did not start near (the barrier's steep part), at any frame. The membrane must stretch (to ~3x at the free edges, as with Newton's VBD): the
-layers cannot pass, and the ends stay apart.
+friction, as a barrier energy), clamped edges driven through their nodes (:class:`utils.common.Drive`), Newton's
+VBD cloth parameters (``tri_ke``, ``tri_ka``, ``tri_kd``, ``edge_ke``, ``edge_kd``) as a midedge shell's
+(:func:`~dismech_newton.builder.add_cloth_mesh`). Newton's test (every particle within a box, speeds below
+1.5 m/s) and two of its own: no two parts of the sheet pass through each other (no edge crosses a face it does not
+touch), and no vertex comes within half a contact thickness of one it did not start near, at any checked frame.
+By the drive's symmetry (a half turn about the vertical through the middle swaps the ends) the middle cross-section
+does not turn. Many steps of a compressed cloth end on their iteration budget (``solver.counts``): ``A`` is
+factorised once a step (``refactor=False``), as accurate there and ~3.5x faster.
 
-Before the layers touch, the twist is a helicoid: by the clamps' symmetry (a half turn about the vertical through
-the middle swaps them) the middle cross-section turns by exactly half the driven angle.
-
-    uv run examples/cloth_twist.py
-    uv run examples/cloth_twist.py --viewer null --test
+    uv run examples/newton/cloth_twist.py
+    uv run examples/newton/cloth_twist.py --viewer null --test
 """
+
+import os
+import sys
+from pathlib import Path
 
 import newton
 import newton.examples
+import newton.usd
 import numpy as np
 import warp as wp
+import warp.examples
+from pxr import Usd
 from scipy.spatial import cKDTree
-from utils.common import THEORY, CableExample, Drive, default_frames, grid, inset, inset_scale
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
+from utils.common import THEORY, CableExample, Drive, default_frames, inset, inset_scale
 
 from dismech_newton import DiSMechSolver
 
@@ -85,61 +96,62 @@ class Crossings:
 
 
 class Example(CableExample):
-    duration, substeps = 9.0, 4  # [s]
+    duration, substeps = 5.0, 10  # [s]: Newton's 300 frames at 60 fps, 10 substeps
     plot_every, plot_name = 6, "twist"
-    size, spacing = 0.3, 0.006  # [m]: a 51 x 51 node square
-    turns, rate, ramp = 4, 0.75, 0.5  # driven turns, at [turn/s], eased in and out over [s]
-    pull = 0.4  # the spun edge moves in by this share of the size over the turns, as hands wringing a towel do
-    radius = 2.0e-3  # the vertices' contact thickness: layers 4 mm apart
-    density, tri_ke, bend_stiffness, damping = 0.2, 1.0e4, 1.0e-4, 0.05  # [kg/m^2], [N/m], D [N m], [s]
-    mu, contact_stiffness = 0.3, 1.0e3  # the barrier's, in units of a pair's inertia
+    cols = 50  # the mesh's vertices along the twist axis (and across it)
+    rate, end = np.pi / 3.0, 10.0  # each end's spin [rad/s], until [s]
+    # Newton's example: density [kg/m^2], tri_ke, tri_ka [N/m], tri_kd, edge_ke, edge_kd; its self-contact gap
+    # (1.5 mm) as the contact thickness, its friction
+    material = dict(density=0.2, tri_ke=1.0e3, tri_ka=1.0e3, tri_kd=2.0e-4, edge_ke=1.0e-3, edge_kd=1.0e-2)
+    radius, mu = 0.75e-3, 0.2
     check_every = 10  # frames between the geometry checks (on the host)
 
+    def mesh(self):
+        """Newton's ``square_cloth.usd``: ``cols x cols`` vertices, index ``r cols + c`` (``c`` along its x)."""
+        stage = Usd.Stage.Open(os.path.join(warp.examples.get_asset_directory(), "square_cloth.usd"))
+        mesh = newton.usd.get_mesh(stage.GetPrimAtPath("/root/cloth/cloth"))
+        return mesh.vertices, mesh.indices
+
     def __init__(self, viewer, args=None):
+        vertices, indices = self.mesh()
         builder = newton.ModelBuilder(gravity=0.0)
-        self.n = int(round(self.size / self.spacing)) + 1
-        v, f = grid(self.n, self.n, self.size, self.size)
-        v[:, 1] -= 0.5 * self.size  # the twist axis: the x axis, through the middle
-        v[:, 2] += 0.5 * self.size
-        self.ids = DiSMechSolver.add_cloth_mesh(builder, vertices=v.tolist(), indices=f.ravel().tolist(),
-                                                density=self.density, tri_ke=self.tri_ke, tri_ka=0.0, edge_ke=0.0,
-                                                bend_stiffness=self.bend_stiffness, damping=self.damping,
-                                                particle_radius=self.radius)
-        held, spun = v[:, 0] < 1.5 * self.spacing, v[:, 0] > self.size - 1.5 * self.spacing  # two lattice lines each
-        for k in self.ids[held | spun]:
+        self.ids = DiSMechSolver.add_cloth_mesh(builder, pos=(0.0, 0.0, 0.0), rot=wp.quat_from_axis_angle(
+            wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi), scale=0.01, vertices=[wp.vec3(v) for v in vertices],
+            indices=indices, particle_radius=self.radius, **self.material)
+        n = self.cols
+        ends = (self.ids[np.arange(n) * n], self.ids[np.arange(n) * n + n - 1])  # y = -0.75 m and y = +0.75 m
+        for k in np.concatenate(ends):
             builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
-            builder.particle_mass[k] = 0.0
         model = builder.finalize()
         model.particle_mu = self.mu
-        self.start(viewer, model, DiSMechSolver(model, contact_stiffness=self.contact_stiffness))
-        self.spun = self.ids[spun]
-        self.spin = Drive(model, [3 * k + c for k in self.spun for c in range(3)])
+        # its compressed steps end on their budget either way: one factorization a step
+        self.start(viewer, model, DiSMechSolver(model, refactor=False, iterations=10))
+        self.rest = model.particle_q.numpy().astype(np.float64)
+        self.ends = np.concatenate(ends)
+        self.axis = np.repeat([1.0, -1.0], n)  # about +y at y = -0.75, -y at +0.75 (Newton's rot_axes)
+        self.spin = Drive(model, [3 * k + c for k in self.ends for c in range(3)])
         self.drives = (self.spin,)
 
-        self.tris, self.rest = f, v
-        e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
-        self.edges = np.unique(e, axis=0)
+        f = np.asarray(indices).reshape(-1, 3)
+        self.tris = f
+        self.edges = np.unique(np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1), axis=0)
         self.crossings = Crossings(self.edges, f, model.device)
-        self.middle = (self.n // 2) * self.n + np.array([0, self.n - 1])  # the middle cross-section's ends
+        mid = n // 2 - 1, n // 2  # the two columns either side of the middle, top and bottom rows
+        self.middle = np.array([[c, (n - 1) * n + c] for c in mid])
         self.t, self.angle, self.mid_angle, self.gap, self.cross = [0.0], [0.0], [0.0], [np.inf], [0]
         if viewer is not None and hasattr(viewer, "set_camera"):
-            viewer.set_camera(pos=wp.vec3(0.5 * self.size, -0.6, 0.5 * self.size), pitch=0.0, yaw=90.0)
+            viewer.set_camera(wp.vec3(2.25, 0.0, 0.0), 0.0, -180.0)  # Newton's
 
     def angle_at(self, t: float) -> float:
-        """The spun edge's angle [rad]: ``turns`` turns at ``rate``, eased in and out."""
-        def eased(t0):  # the integral of smoothstep(t, t0, t0 + ramp)
-            u = np.clip((t - t0) / self.ramp, 0.0, 1.0)
-            return self.ramp * (u**3 - 0.5 * u**4) + max(t - t0 - self.ramp, 0.0)
-
-        return 2.0 * np.pi * self.rate * (eased(0.0) - eased(self.turns / self.rate))
+        """Each end's angle [rad] about its axis."""
+        return self.rate * min(t, self.end)
 
     def offsets(self, t: float) -> np.ndarray:
-        """The spun edge's displacement from rest at ``t``: turned about the axis, moved in along it."""
-        a = self.angle_at(t)
-        y, z = self.rest[self.spun, 1], self.rest[self.spun, 2] - 0.5 * self.size
-        c, s = np.cos(a), np.sin(a)
-        dx = np.full(len(y), -self.pull * self.size * a / (2.0 * np.pi * self.turns))
-        return np.column_stack([dx, c * y - s * z - y, s * y + c * z - z]).ravel()
+        """The ends' displacements from rest at ``t``: each turned about the y axis (its own sense)."""
+        a = self.angle_at(t) * self.axis
+        x, y, z = self.rest[self.ends].T
+        c, s = np.cos(a), np.sin(a)  # about y: x' = c x + s z, z' = -s x + c z
+        return np.column_stack([c * x + s * z - x, np.zeros_like(y), -s * x + c * z - z]).ravel()
 
     def drive(self, t0, t1):
         self.spin.set(self.offsets(t0), self.offsets(t1))
@@ -149,10 +161,10 @@ class Example(CableExample):
         if self.frame % self.check_every:
             return
         x = self.state_0.particle_q.numpy().astype(np.float64)
-        d = x[self.middle[1]] - x[self.middle[0]]
+        d = x[self.middle[:, 1]] - x[self.middle[:, 0]]
         self.t.append(self.sim_time)
         self.angle.append(self.angle_at(self.sim_time))
-        mid = np.arctan2(d[2], d[1])
+        mid = np.arctan2(d[:, 0], d[:, 2]).mean()  # about y, from the rest direction +z
         self.mid_angle.append(np.unwrap([self.mid_angle[-1], mid])[1])
         self.gap.append(self.min_gap(x))
         self.cross.append(self.crossings(self.state_0.particle_q))
@@ -164,8 +176,8 @@ class Example(CableExample):
         return float(np.linalg.norm(x[i[apart]] - x[j[apart]], axis=1).min(initial=np.inf) / (2.0 * self.radius))
 
     def image(self, size: tuple[int, int] = (800, 400)) -> np.ndarray:
-        """Left: the middle cross-section's angle against half the driven one. Right: the closest gap between
-        layers, in contact thicknesses."""
+        """Left: the middle cross-section's angle against the ends' (zero by symmetry). Right: the closest gap
+        between layers, in contact thicknesses."""
         import matplotlib  # noqa: PLC0415
 
         pt = inset_scale(size, 2)
@@ -174,7 +186,9 @@ class Example(CableExample):
 
         def draw(axes):
             left, right = axes
-            left.plot(self.t, 0.5 * turns, color=THEORY, ls="--", lw=1.2 * pt, label=r"$\phi / 2$")
+            left.plot(self.t, turns, color="0.6", lw=1.2 * pt, label=r"ends $\pm\phi$")
+            left.plot(self.t, -turns, color="0.6", lw=1.2 * pt)
+            left.axhline(0.0, color=THEORY, ls="--", lw=1.2 * pt, label="0")
             left.plot(self.t, np.array(self.mid_angle) / (2.0 * np.pi), color=color, lw=1.6 * pt, label="middle")
             left.set(xlim=(0.0, self.duration))
             left.set_xlabel(r"time $t$ (s)")
@@ -191,7 +205,10 @@ class Example(CableExample):
 
     def test_final(self):
         x = self.state_0.particle_q.numpy().astype(np.float64)
+        v = self.state_0.particle_qd.numpy().astype(np.float64)
         assert np.isfinite(x).all(), "non-finite positions"
+        assert (np.abs(x) <= [0.6, 0.9, 0.6]).all(), "particles outside Newton's box"
+        assert np.abs(v).max() < 1.5, f"a particle at {np.abs(v).max():.2f} m/s (Newton's bound: 1.5)"
         assert max(self.cross) == 0, f"the cloth passed through itself ({max(self.cross)} crossings)"
         assert min(self.gap) > 0.5, f"layers {min(self.gap):.2f} contact thicknesses apart"
 

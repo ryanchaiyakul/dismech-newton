@@ -3,15 +3,21 @@
 Shows: stiffness and damping per rod (``add_rod``), a clamped segment (``fix_segment``) driven through
 its twist DOF (:class:`utils.common.Drive`). Stiffer cables carry the twist further around their turns.
 
-    uv run examples/cable_twist.py
-    uv run examples/cable_twist.py --viewer null --test
+    uv run examples/newton/cable_twist.py
+    uv run examples/newton/cable_twist.py --viewer null --test
 """
+
+import sys
+from pathlib import Path
 
 import newton
 import newton.examples
 import numpy as np
 import warp as wp
 from newton.examples.cable.example_cable_twist import Example as NewtonExample
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
 from utils.common import CableExample, Drive, segment_dofs
 
 from dismech_newton import DiSMechSolver
@@ -40,7 +46,8 @@ class Example(CableExample):
             self.rods.append(bodies)
         builder.add_ground_plane()
         model = builder.finalize()
-        self.start(viewer, model, DiSMechSolver(model, friction=0.5))
+        model.shape_material_mu.fill_(0.5)  # the rods' and the ground's
+        self.start(viewer, model, DiSMechSolver(model))
         # The clamped segments' twist angles, prescribed every substep.
         self.spin = Drive(model, [d for bodies in self.rods for d in segment_dofs(model, bodies[0], True)])
         self.drives = (self.spin,)

@@ -20,7 +20,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / ".cache" / "reference"
-EXAMPLES = ["cable_twist", "cable_pile", "cantilever", "overhand_knot", "plectoneme", "flagella", "fit_buckling",
+EXAMPLES = ["newton/cable_twist", "newton/cable_pile", "cantilever", "overhand_knot", "plectoneme", "flagella", "fit_buckling",
             "fit_capture"]
 EXTRA_ARGS = {name: ["--fresh"] for name in ("fit_buckling", "fit_capture")}  # re-run the fit, not the cached replay
 EVERY = 10
@@ -67,7 +67,7 @@ def _run_one(name: str, path: Path) -> None:
         frames.append(_snapshot(example))
 
     newton.examples.run = recording_run
-    script = ROOT / "examples" / f"{name}.py"
+    script = ROOT / "examples" / ("experimental" if name.startswith("fit_") else "") / f"{name}.py"  # name may be newton/...
     sys.path.insert(0, str(script.parent))
     sys.argv = [str(script), "--viewer", "null", "--test", *EXTRA_ARGS.get(name, [])]
     runpy.run_path(str(script), run_name="__main__")
@@ -102,11 +102,11 @@ def main() -> None:
         _run_one(args.names[0], Path(args.names[1]))
         return
     for name in args.names or EXAMPLES:
-        ref = OUT / f"{name}.npz"
+        ref = OUT / f"{Path(name).name}.npz"
         if args.command == "record":
             print(f"{name}: {_status(_record(name, ref))}", flush=True)
             continue
-        new = OUT / "current" / f"{name}.npz"
+        new = OUT / "current" / f"{Path(name).name}.npz"
         r_new, f_new = _record(name, new), _load(new)[1]
         r_ref, f_ref = _load(ref)
         print(f"{name}: reference {_status(r_ref)}; now {_status(r_new)}")

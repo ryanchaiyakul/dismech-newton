@@ -1,5 +1,6 @@
 """Sparse matrices on the device and their direct solves: cuDSS on CUDA (the 'gpu' extra), SciPy otherwise."""
 
+import ctypes
 import warnings
 import weakref
 from typing import Any
@@ -10,6 +11,7 @@ import warp as wp
 from scipy.sparse.linalg import splu
 
 try:
+    from cuda.bindings import runtime as cudart
     from nvmath.bindings import cudss
 except ImportError:
     cudss = None
@@ -102,20 +104,22 @@ def row_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], a: int, b:
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`), analysed on the first solve and factorised on the
-    first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a GeForce's float64, for an ``A``
-    that only has to be approximate). Graph-capturable."""
+    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`; Cholesky if ``spd``: 15% faster), analysed on the first
+    solve and factorised on the first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a
+    GeForce's float64, for an ``A`` that only has to be approximate). Graph-capturable."""
 
     graph_capturable = True
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR, single: bool = False) -> None:
-        self.A, self.device = A, A.vals.device
+    def __init__(self, A: SymmetricCSR | GeneralCSR, single: bool = False, spd: bool = False) -> None:
+        self.A, self.device, self.spd = A, A.vals.device, spd
         dtype = wp.float32 if single else wp.float64
         self._type = _CUDA_R_32F if single else _CUDA_R_64F
         self._vals = wp.zeros(A.nnz, dtype=dtype, device=self.device) if single else A.vals
         self._b, self._x = (wp.zeros(A.n, dtype=dtype, device=self.device) for _ in range(2))
         self._handle = None
         self._factored = False
+        self._sources = wp.zeros((8, 16), dtype=wp.uint8, device="cpu", pinned=self.device.is_cuda)  # _pin_sources
+        self._source_bytes = []
 
     def _setup(self) -> None:
         A = self.A
@@ -125,7 +129,7 @@ class CudssSolver:
         if isinstance(A, GeneralCSR):
             kind = cudss.MatrixType.GENERAL, cudss.MatrixViewType.FULL
         else:
-            kind = cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
+            kind = cudss.MatrixType.SPD if self.spd else cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
         self._A = cudss.matrix_create_csr(A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, self._vals.ptr,
                                           _CUDA_R_32I, _CUDA_R_32I, self._type, *kind, cudss.IndexBase.ZERO)
         self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, self._type, cudss.Layout.COL_MAJOR)
@@ -157,8 +161,36 @@ class CudssSolver:
         if not self._factored:
             self.factor()
         with wp.ScopedDevice(self.device):
+            start = self._captured()[1] if self.device.is_capturing else None
             self._execute(cudss.Phase.SOLVE)
+            if start is not None:
+                self._pin_sources(start)
         wp.launch(_convert, dim=self.A.n, inputs=[self._x], outputs=[x], device=self.device)
+
+    def _captured(self) -> tuple[list, int]:
+        """The nodes of the graph being captured on the device's stream, and their count."""
+        graph = cudart.cudaStreamGetCaptureInfo(cudart.cudaStream_t(self.device.stream.cuda_stream))[3]
+        count = cudart.cudaGraphGetNodes(graph, 0)[2]
+        return cudart.cudaGraphGetNodes(graph, count)[1], count
+
+    def _pin_sources(self, start: int) -> None:
+        """cuDSS's solve records small host-to-device copies from pageable memory (constants of the matrix), which a
+        conditional graph body cannot hold: the solve's copies since node ``start`` read pinned copies instead."""
+        for nd in self._captured()[0][start:]:
+            if cudart.cudaGraphNodeGetType(nd)[1] != cudart.cudaGraphNodeType.cudaGraphNodeTypeMemcpy:
+                continue
+            p = cudart.cudaGraphMemcpyNodeGetParams(nd)[1]
+            if p.kind != cudart.cudaMemcpyKind.cudaMemcpyHostToDevice:
+                continue
+            size = p.extent.width * p.extent.height * p.extent.depth
+            data = bytes((ctypes.c_char * size).from_address(p.srcPtr.ptr))
+            if data not in self._source_bytes:
+                if len(self._source_bytes) == self._sources.shape[0] or size > self._sources.shape[1]:
+                    raise RuntimeError("cuDSS solve: unexpected host copies in a capture")
+                self._sources.numpy()[len(self._source_bytes), :size] = np.frombuffer(data, dtype=np.uint8)
+                self._source_bytes.append(data)
+            p.srcPtr.ptr = self._sources.ptr + self._sources.shape[1] * self._source_bytes.index(data)
+            cudart.cudaGraphMemcpyNodeSetParams(nd, p)
 
 
 def _destroy(handle, config, data, matrices) -> None:
@@ -201,10 +233,12 @@ class ScipySolver:
         x.assign(self._lu.solve(b.numpy().astype(np.float64)).astype(wp.dtype_to_numpy(x.dtype)))
 
 
-def sparse_solver(A: SymmetricCSR | GeneralCSR, single: bool = False) -> CudssSolver | ScipySolver:
-    """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy; ``single``: cuDSS in float32."""
+def sparse_solver(A: SymmetricCSR | GeneralCSR, single: bool = False,
+                  spd: bool = False) -> CudssSolver | ScipySolver:
+    """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy; ``single``: cuDSS in float32; ``spd``: ``A`` is
+    positive definite."""
     if A.vals.device.is_cuda and cudss is not None:
-        return CudssSolver(A, single)
+        return CudssSolver(A, single, spd)
     return ScipySolver(A)
 
 

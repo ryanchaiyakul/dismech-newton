@@ -20,6 +20,8 @@ from newton import State
 from .linear import SymmetricCSR, triu_slot
 from .state import block_sum, flatten_state, padded
 
+BETA = 1.0  # the strain penalty over the energy's stiffness K + C/dt
+
 
 def rest_strains(elem, model, vec) -> wp.array:
     """``elem``'s strains (``vec`` each) in ``model``'s initial state."""
@@ -38,10 +40,10 @@ class ElementBlock:
     (:func:`element_kernels`), ``count``, ``bind(dismech) -> view`` of a state, ``params`` ``[K, C]``, ``rest``
     strains and ``stored``, the state attribute holding its strains."""
 
-    def __init__(self, elem, *, slots, fixed, num_candidates, beta):
+    def __init__(self, elem, *, slots, fixed, num_candidates):
         self.k, self.count, self.bind, self.params = elem.kernels, elem.count, elem.bind, elem.params
         self.rest, self.stored, self.slots, self.fixed = elem.rest, elem.stored, slots, fixed
-        self.beta, self.device, vec = beta, fixed.device, elem.kernels.vec
+        self.device, vec = fixed.device, elem.kernels.vec
         self.P, self.z, self.u, self.eps_prev = (wp.zeros(self.count, dtype=vec, device=self.device) for _ in range(4))
         self.eps_cand = wp.zeros((num_candidates, self.count), dtype=vec, device=self.device)
 
@@ -58,7 +60,7 @@ class ElementBlock:
         s = state_in.dismech
         self.view, self.dt, self.exact = self.bind(s), dt, int(exact)
         self._launch(self.k.previous, [getattr(s, self.stored), s.q, self.view], [self.eps_prev])
-        self._launch(self.k.penalty, [self.params, self.rest, self.eps_prev, 1.0 if exact else self.beta, dt,
+        self._launch(self.k.penalty, [self.params, self.rest, self.eps_prev, 1.0 if exact else BETA, dt,
                                       self.exact], [self.P, self.z, self.u])
 
     def store(self, s) -> None:

@@ -22,11 +22,13 @@ force: the sensor's reading (dots) and the replay's (line).
 
 The dataset, the fit and the replays are cached in ``.cache/examples`` (``--fresh`` recomputes them):
 
-    uv run examples/fit_buckling.py
-    uv run examples/fit_buckling.py --viewer null --test
+    uv run examples/experimental/fit_buckling.py
+    uv run examples/experimental/fit_buckling.py --viewer null --test
 """
 
+import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import newton
@@ -36,6 +38,9 @@ import warp as wp
 from scipy.optimize import minimize
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale, smoothstep
 
 from dismech_newton import DiSMechSolver, add_rod, flatten_state, suspended_tape

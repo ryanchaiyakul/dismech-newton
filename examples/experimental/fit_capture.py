@@ -42,11 +42,13 @@ true pose, green: the recovered), the painted rod beside the still, then every L
 the truth (grey). The rod and the fit are cached in ``.cache/examples`` (``--fresh`` recomputes them). It needs
 CUDA and the ``splat`` extra (torch, gswarp):
 
-    uv run --extra splat examples/fit_capture.py
-    uv run --extra splat examples/fit_capture.py --viewer null --test
+    uv run --extra splat examples/experimental/fit_capture.py
+    uv run --extra splat examples/experimental/fit_capture.py --viewer null --test
 """
 
 import math
+import sys
+from pathlib import Path
 
 import newton
 import newton.examples
@@ -56,6 +58,9 @@ import torch.nn.functional as F
 import warp as wp
 from PIL import Image, ImageDraw
 from scipy.optimize import minimize
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale
 from utils.gaussians import DEVICE, Camera, backprop, to_uint8, view
 from utils.splat import Splats, skin

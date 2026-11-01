@@ -119,7 +119,7 @@ class Offset:
     detection, grown by a contact's reach, and are refit each detection (graph-capturable); shapes are culled by their
     bounding spheres. Without ``self_contact``, no rod-rod or shell-shell pairs."""
 
-    def __init__(self, model: Model, fixed: wp.array, *, self_contact: bool, friction: float | None = None):
+    def __init__(self, model: Model, fixed: wp.array, *, self_contact: bool):
         dev = wp.get_device(model.device)
         self.mesh = mesh = _mesh(model, dev)
         self.fixed, self.self_contact = fixed, int(self_contact)
@@ -138,9 +138,6 @@ class Offset:
         self._bvh = wp.Bvh(self._lo[:E], self._hi[:E])
         self._face_bvh = wp.Bvh(self._lo[E:], self._hi[E:]) if self.num_faces else None
         self.bodies = _bodies(model, dev)
-        if friction is not None:  # every contact's mu: each side's
-            mesh.mu.fill_(friction)
-            self.bodies.mu = wp.full(self.bodies.mu.shape[0], friction, dtype=float, device=dev)
         sc = self.scene = Scene()  # the step's positions and slots set in fill
         sc.m, sc.b, sc.fixed, sc.self_contact = mesh, self.bodies, fixed, self.self_contact
         sc.num_nodes, sc.slots = self.num_nodes, SHEET_SLOTS if self.num_faces else SLOTS

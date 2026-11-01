@@ -106,8 +106,9 @@ class Example(CableExample):
                                      damping=self.damping, particle_radius=self.radius)
         model = builder.finalize()
         model.particle_mu = self.mu
-        # 5 iterations: the eyelet height within 0.5% of 10's, in 0.75 of the time
-        self.start(viewer, model, DiSMechSolver(model, iterations=5))
+        # A factorised once a step (refactoring at 5 iterations: 4/6 runs pass, ~40% slower); 20 iterations: at 10
+        # the landing creases where the layers meet (steps end on the budget), at 20 it is smooth, as fast (gated)
+        self.start(viewer, model, DiSMechSolver(model, refactor=False, iterations=20))
         if self.drag:
             self.drives = (AirDrag(model, self.nx, self.ny, self.density, self.drag),)
 

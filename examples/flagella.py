@@ -108,7 +108,8 @@ class DERFlagella:
             DiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
             self.rods.append(bodies)
         self.model = model = builder.finalize()
-        self.solver = DiSMechSolver(model, friction=p["friction"])
+        model.shape_material_mu.fill_(p["friction"])
+        self.solver = DiSMechSolver(model)
         if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
             self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
         self.state_0, self.state_1 = model.state(), model.state()

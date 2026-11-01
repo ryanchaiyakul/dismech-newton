@@ -71,7 +71,8 @@ class Example(CableExample):
         for body in (bodies[0], bodies[-1]):
             DiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        solver = DiSMechSolver(model, friction=friction)
+        model.shape_material_mu.fill_(friction)
+        solver = DiSMechSolver(model)
         self.start(None if display else viewer, model, solver)
         self.end = Drive(model, segment_dofs(model, bodies[-1]))  # the last segment's nodes and twist
         self.drives = (self.end,)

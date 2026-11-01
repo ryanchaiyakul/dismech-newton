@@ -22,6 +22,8 @@ GROW = wp.constant(2.0)  # a node's load scale grows at most this factor per ste
 DECAY = wp.constant(0.99)  # and relaxes by this factor per step, toward 1
 IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
 MAX_SCALE = wp.constant(1.0e5)  # and stays below this (unbounded, it spreads pair to pair and overflows k)
+STIFFNESS = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
+SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
 
 
@@ -114,14 +116,14 @@ class BarrierBlock:
     """The contacts as energies in the step's objective, each on its pair's gap ``d = n . C q`` along the normal at
     its detection: :func:`barrier` (infinite at ``d = 0``: the line search never takes a candidate through a
     contact), and lagged smoothed Coulomb friction (IPC), ``mu lam f0(|slip|)`` with the normal force ``lam`` at the
-    step's start and ``f0`` smoothed over ``slip_speed dt``. Each pair's ``k`` is ``stiffness`` times its inertia
-    ``1 / (dt^2 C M^-1 C^T)`` (a light sheet vertex and a rod node alike: Newton sees the contact coming), times its
-    nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction); the solver
+    step's start and ``f0`` smoothed over :data:`SLIP_SPEED` ``dt``. Each pair's ``k`` is :data:`STIFFNESS` times its
+    inertia ``1 / (dt^2 C M^-1 C^T)`` (a light sheet vertex and a rod node alike: Newton sees the contact coming), times
+    its nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction); the solver
     caps each node's move per detection so no pair beyond it can close."""
 
-    def __init__(self, model: Model, fixed: wp.array, source, *, stiffness: float, slip_speed: float):
+    def __init__(self, model: Model, fixed: wp.array, source):
         self.fixed, self.device, self.source = fixed, wp.get_device(model.device), source
-        self.stiffness, self.slip_speed, self.slip = stiffness, slip_speed, 0.0
+        self.stiffness, self.slip_speed, self.slip = STIFFNESS, SLIP_SPEED, 0.0
         self.count = source.slots()
         size = max(self.count, 1)
         self.s = _slots(size, self.device)

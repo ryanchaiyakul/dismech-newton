@@ -31,6 +31,7 @@ from .state import (
 
 _C1 = 1.0e-4  # Armijo's sufficient decrease
 _NOISE = 1.0e-5  # a rise of the objective within its float32 rounding
+LINESEARCH = 4  # step lengths tried per iteration, halving from 1 (1: the full chord step)
 FINISH = 3  # a step's last iterations, after its multipliers are updated whether it has converged or not
 # the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
 # force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
@@ -45,27 +46,25 @@ class DiSMechSolver(SolverBase):
     (:meth:`vjp`; recording reads on the host whether a contact touches). Rods and shells collide with Newton's
     shapes, each other and themselves by Offset Geometric Contact, found by the solver (see :mod:`.collide`):
     ``contacts`` is ignored. Coulomb ``mu`` is Newton's: the mean of the two sides' ``shape_material_mu`` (a rod's
-    capsules', ``particle_mu`` for a shell vertex), so a rod's friction is its ``cfg.mu``; ``friction`` sets every
-    contact's. Obstacles move with ``state_in.body_qd``.
+    capsules', ``particle_mu`` for a shell vertex), so a rod's friction is its ``cfg.mu``. Obstacles move with
+    ``state_in.body_qd``.
 
     Args:
         iterations: Iterations per step (a fixed count, graph-capturable).
-        beta: Strain penalty over the energy's stiffness ``K + C/dt``.
-        linesearch: Step lengths tried per iteration, halving from ``1`` (``1`` takes the full chord step).
         exact: Gauss-Newton on the step's energy, ``A`` refactorised every iteration (no elastic splitting).
         self_contact: Rod-rod and shell-shell contacts (rod-shell and shape contacts are always on).
-        friction: Every contact's Coulomb ``mu`` (else the materials' means).
         theta: The theta method, in ``[1/2, 1]``: ``1`` implicit Euler, ``1/2`` implicit midpoint (the implicit
             Euler step ``theta dt``, extrapolated). Below ``1`` for contact-free scenes: the extrapolation can step
             into contact; undamped, ADMM's leftover residual can pump the stiff modes (``exact`` does not).
-        contact_stiffness: Each contact pair's barrier stiffness, this many times its inertia
-            ``1 / (dt^2 C M^-1 C^T)`` and its nodes' load scale (:class:`~.contact.BarrierBlock`): no candidate
-            passes through a contact, and each node moves at most the smallest particle radius per detection (the
-            pairs are found again when a node has moved half of it). With contacts the step iterates until its
-            Newton step moves no node (nor a pair's force, nor a midedge angle's offset midpoint) more than
-            :data:`TOLERANCE` radii, or the line search stalls, at most ``iterations`` times, with ``A`` assembled
-            anew at each iterate while a contact touches.
-        slip_speed: The barrier's friction is smoothed below this slip speed [m/s].
+        refactor: With contacts, ``A`` assembled and factorised anew at each iterate while a contact touches; else
+            once per step, at the prediction. Rods converge better with it (their factorizations are cheap); sheets,
+            whose factorizations dominate a step, are as accurate without it given 10-20 iterations and 1.5-3.5x
+            faster (shell_fold, cloth_twist).
+
+    Contacts are barriers (:class:`~.contact.BarrierBlock`): no candidate passes through one, and each node moves at
+    most the smallest particle radius per detection (the pairs are found again when a node has moved half of it).
+    With contacts the step iterates until its Newton step moves no node (nor a pair's force, nor a midedge angle's
+    offset midpoint) more than :data:`TOLERANCE` radii, or the line search stalls, at most ``iterations`` times.
 
     ``counts`` (device ``int32[2]``) sums the contact steps that spent their ``iterations`` unconverged, and those
     that stalled. A step is a fixed budget, not a solve to tolerance: compressed cloth (a buckling membrane, whose
@@ -83,23 +82,17 @@ class DiSMechSolver(SolverBase):
         model: Model,
         *,
         iterations: int = 10,
-        beta: float = 1.0,
-        linesearch: int = 4,
         exact: bool = False,
         self_contact: bool = True,
-        friction: float | None = None,
         theta: float = 1.0,
-        contact_stiffness: float = 1.0e3,
-        slip_speed: float = 0.01,
+        refactor: bool = True,
     ):
         super().__init__(model)
-        if linesearch < 1:
-            raise ValueError("linesearch must be >= 1")
         if not 0.5 <= theta <= 1.0:
             raise ValueError(f"theta must be in [1/2, 1], got {theta}")
         self.theta = float(theta)
-        self.iterations, self.exact = int(iterations), bool(exact)
-        self.num_candidates = nc = int(linesearch) + 1  # candidate 0: the current iterate
+        self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
+        self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
         self.mass, self.fixed = dof_constants(model)
@@ -118,18 +111,19 @@ class DiSMechSolver(SolverBase):
         edge_dofs = np.column_stack([3 * node0 + k for k in range(3)] + [3 * node1 + k for k in range(3)])
         self.A = SymmetricCSR(n, (edge_dofs, *(t.dofs() for t in types)), dev)  # an edge's nodes: its contacts
         self.elements = tuple(
-            ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc, beta=beta) for t in types
+            ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
         )
         # every pair within twice its thickness; a node moves at most its smallest radius per detection
-        source = Offset(model, self.fixed, self_contact=self_contact, friction=friction)
-        self.contact = BarrierBlock(model, self.fixed, source, stiffness=contact_stiffness, slip_speed=slip_speed)
+        source = Offset(model, self.fixed, self_contact=self_contact)
+        self.contact = BarrierBlock(model, self.fixed, source)
         self.cap = float(model.particle_radius.numpy().min()) if self.contact.count else 0.0
         self._tol = TOLERANCE * self.cap
         source.cap = self.cap
         self.blocks = (*self.elements, self.contact)
         self._adjoint = None  # StepAdjoint, built on the first vjp
-        # float32 cuDSS: A is the step's chord matrix, an approximation the line search corrects
-        self._linear = sparse_solver(self.A, single=True)
+        # float32 cuDSS: A is the step's chord matrix, an approximation the line search corrects (positive definite:
+        # majorized elements and contacts, plus inertia)
+        self._linear = sparse_solver(self.A, single=True, spd=True)
         self._b = wp.zeros(n, dtype=wp.float64, device=dev)  # the objective's gradient
         self._dq = wp.zeros(n, dtype=float, device=dev)
         self._q0 = wp.zeros(n, dtype=float, device=dev)  # the move cap's anchor: the start, or the last detection
@@ -283,21 +277,22 @@ class DiSMechSolver(SolverBase):
             if it == 0 or (self.exact and self.cap == 0.0):  # the chord matrix at the prediction (every iterate:
                 self._assemble(q, f)  # Gauss-Newton)
                 self._linear.invalidate()
-            elif self.cap > 0.0:  # the barrier's: at the iterate while a contact touches, until converged
+            elif self.cap > 0.0 and self.refactor:  # the barrier's: at the iterate while a contact touches
                 wp.launch(_refresh_kernel, dim=1, inputs=[self._go, self.contact.touching, int(self.exact)],
                           outputs=[self._refresh], device=dev)
                 wp.capture_if(self._refresh, on_true=partial(self._refactor, q, f))
-            if self.cap > 0.0 and it > 0:  # cuDSS's solve cannot sit in a conditional graph body; the rest can
-                wp.capture_if(self._go, on_true=partial(self._dof, q, f))
-                self._linear.solve(self._b, self._dq)
-                wp.capture_if(self._go, on_true=partial(self._search, state_in, q, f))
+            if self.cap > 0.0 and it > 0:  # converged: the rest of the step skipped
+                wp.capture_if(self._go, on_true=partial(self._iterate, state_in, q, f))
             else:
-                self._dof(q, f)
-                self._linear.solve(self._b, self._dq)
-                self._search(state_in, q, f)
+                self._iterate(state_in, q, f)
         self.contact.end_step()
         if self.cap > 0.0:
             wp.launch(_count_kernel, dim=1, inputs=[self._go, self._stalled, self.counts], device=dev)
+
+    def _iterate(self, state_in: State, q: wp.array, f) -> None:
+        self._dof(q, f)
+        self._linear.solve(self._b, self._dq)
+        self._search(state_in, q, f)
 
     def _regrad(self, q: wp.array) -> None:
         self._b.zero_()

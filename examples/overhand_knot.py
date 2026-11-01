@@ -54,7 +54,8 @@ class Example(CableExample):
         for body in (bodies[0], bodies[-1]):
             DiSMechSolver.fix_segment(builder, body)
         model = builder.finalize()
-        solver = DiSMechSolver(model, friction=self.friction)
+        model.shape_material_mu.fill_(self.friction)
+        solver = DiSMechSolver(model)
         solver.triplets.rest.zero_()  # a rope: straight and untwisted at rest, not knotted
         self.start(viewer, model, solver)
         # Both clamped segments' nodes (not their twist), moved along the end-to-end line.

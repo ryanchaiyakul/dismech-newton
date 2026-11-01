@@ -14,7 +14,7 @@ from dismech_newton import solver
 from dismech_newton.adjoint import _closest_weights
 
 # Converged: 12 step lengths, as a step from beyond the barrier's onset can need far shorter steps than 4 give.
-OPTIONS = {"iterations": 500, "linesearch": 12}
+OPTIONS = {"iterations": 500}
 # A two-sided pair's majorized A converges the pair's common motion slowly.
 TWO_SIDED = pytest.mark.xfail(strict=True, reason="a two-sided pair's step converges too slowly for the differences")
 

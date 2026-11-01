@@ -4,7 +4,7 @@ capture."""
 import pytest
 import warp as wp
 from fd import assert_close
-from rollouts import ClampedRollout, ShellRollout
+from rollouts import ClampedRollout, JunctionRollout, ShellRollout
 
 # The differences: Gauss-Newton to convergence. No self-contact: a rollout's copies overlap.
 EXACT = {"exact": True, "iterations": 30, "self_contact": False}
@@ -26,6 +26,11 @@ def test_step_adjoint_matches_finite_differences(rng, options, drive):
     r = ClampedRollout(rng)
     r.drive = drive
     r.check(options, fd_options={**EXACT, "theta": options.get("theta", 1.0)})
+
+
+def test_junction_adjoint_matches_finite_differences(rng):
+    """A rod graph: junction triplets, edges stored against them (their signs in the element Jacobian)."""
+    JunctionRollout(rng).check(EXACT, fd_options=EXACT)
 
 
 def test_shell_adjoint_matches_finite_differences(rng):

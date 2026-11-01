@@ -34,7 +34,9 @@ class Mesh:
     """What collides: per edge (the rods', then the shells') its nodes, whether it collides and (a shell's) its faces'
     opposite nodes (-1); per triangle its nodes and edges (edge ``k`` opposite node ``k``); per node its neighbours
     along colliding edges (CSR), radius, ``mu``, rod (-1 off rods), arc length and rest position (flat, the model's
-    initial state); per rod its length if closed, else 0."""
+    initial state). A rod here is a branch: a chain between nodes of other than two rod edges (ends, junctions), or a
+    loop; per rod edge its branch, its first node's arc and the arc's direction along it; per branch its end nodes
+    (equal: a loop) and length."""
 
     edges: wp.array[wp.vec2i]
     edge_on: wp.array[wp.int32]
@@ -49,6 +51,10 @@ class Mesh:
     arc: wp.array[float]
     rest: wp.array[float]
     rod_len: wp.array[float]
+    rod_end: wp.array[wp.vec2i]
+    edge_rod: wp.array[wp.int32]
+    edge_arc: wp.array[float]
+    edge_dir: wp.array[float]
 
 
 def _mesh(model: Model, device) -> Mesh:
@@ -65,18 +71,32 @@ def _mesh(model: Model, device) -> Mesh:
     on = (edge_body >= 0) & body_on[edge_body]
     mu = np.full(n, float(model.particle_mu))
     mu[n0[on]] = mu[n1[on]] = body_mu[edge_body[on]]
-    rod, arc, rod_len = np.full(n, -1, dtype=np.int32), np.zeros(n), []
-    nxt = dict(zip(n0.tolist(), zip(n1.tolist(), length.tolist())))
-    for start in sorted(set(nxt) - set(n1.tolist())) + sorted(nxt):  # open rods' first nodes, then loops
-        s, a = start, 0.0
-        while rod[s] < 0:
-            rod[s], arc[s] = len(rod_len), a
-            if s not in nxt:
-                break
-            s, step = nxt[s]
-            a += step
-        if rod[start] == len(rod_len):
-            rod_len.append(a if s == start else 0.0)
+    rod, arc, rod_len, rod_end = np.full(n, -1, dtype=np.int32), np.zeros(n), [], []
+    ne = len(n0)
+    edge_rod, edge_arc, edge_dir = np.full(ne, -1), np.zeros(ne), np.ones(ne)
+    deg = np.bincount(np.concatenate([n0, n1]), minlength=n)
+    inc = [[] for _ in range(n)]
+    for e, (a, b) in enumerate(zip(n0.tolist(), n1.tolist())):
+        inc[a].append(e)
+        inc[b].append(e)
+    for start in [v for v in range(n) if deg[v] not in (0, 2)] + [v for v in range(n) if deg[v] == 2]:  # then loops
+        for e in inc[start]:
+            v, a, r = start, 0.0, len(rod_len)
+            if edge_rod[e] >= 0:
+                continue
+            if rod[v] < 0:
+                rod[v] = r
+            while edge_rod[e] < 0:
+                forward = n0[e] == v
+                edge_rod[e], edge_dir[e], edge_arc[e] = r, 1.0 if forward else -1.0, a if forward else a + length[e]
+                a, v = a + length[e], n1[e] if forward else n0[e]
+                if rod[v] < 0:
+                    rod[v], arc[v] = r, a
+                if deg[v] != 2:
+                    break
+                e = inc[v][0] if inc[v][1] == e else inc[v][1]
+            rod_len.append(a)
+            rod_end.append((start, v))
     # The shells' edges: edge k of a triangle is opposite its node k; an edge's faces' opposite nodes.
     nf = model.custom_frequency_counts.get(_P + "face", 0)
     tris = np.stack([getattr(der, f"face_node{k}").numpy() for k in range(3)], 1) if nf else np.zeros((0, 3), int)
@@ -106,6 +126,10 @@ def _mesh(model: Model, device) -> Mesh:
         ("arc", arc, float),
         ("rest", model.particle_q.numpy().ravel() if n else np.zeros(3), float),
         ("rod_len", rod_len + [0.0], float),
+        ("rod_end", rod_end + [(0, 0)], wp.vec2i),
+        ("edge_rod", np.concatenate([edge_rod, np.full(len(uniq), -1)]), wp.int32),
+        ("edge_arc", np.concatenate([edge_arc, np.zeros(len(uniq))]), float),
+        ("edge_dir", np.concatenate([edge_dir, np.ones(len(uniq))]), float),
     ):
         value = np.asarray(value)
         setattr(m, name, wp.array(value if dtype is float else value.astype(np.int32), dtype=dtype, device=device))
@@ -336,18 +360,34 @@ def _in_edge_region(q: wp.array[float], m: Mesh, e: int, x: wp.vec3) -> bool:
 
 
 @wp.func
+def _along(q: wp.array[float], m: Mesh, e: int, i: int, s: float):
+    """Rod edge ``e``'s point ``s`` from its first node (``e < 0``: node ``i``): its branch and arc."""
+    if e < 0:
+        return m.rod[i], m.arc[i]
+    x = node(q, m.edges[e][1]) - node(q, m.edges[e][0])
+    return m.edge_rod[e], m.edge_arc[e] + m.edge_dir[e] * s * wp.length(x)
+
+
+@wp.func
 def _excluded(
-    q: wp.array[float], m: Mesh, a0: int, a1: int, sa: float, b0: int, b1: int, sb: float, cutoff: float
+    q: wp.array[float], m: Mesh, ea: int, ia: int, sa: float, eb: int, ib: int, sb: float, cutoff: float
 ) -> bool:
-    """Both points on one rod, closer than ``cutoff`` along it (around a loop either way)."""
-    r = m.rod[a0]
-    if r < 0 or m.rod[b0] != r:
+    """Two rod points (:func:`_along`'s) closer than ``cutoff`` along their rods: on one branch (around a loop either
+    way) or through a node two branches end at."""
+    ra, a = _along(q, m, ea, ia, sa)
+    rb, b = _along(q, m, eb, ib, sb)
+    if ra < 0 or rb < 0:
         return False
-    d = wp.abs(
-        m.arc[a0] + sa * wp.length(node(q, a1) - node(q, a0)) - m.arc[b0] - sb * wp.length(node(q, b1) - node(q, b0))
-    )
-    if m.rod_len[r] > 0.0:
-        d = wp.min(d, m.rod_len[r] - d)
+    d = float(1.0e30)
+    if ra == rb:
+        d = wp.abs(a - b)
+        if m.rod_end[ra][0] == m.rod_end[ra][1]:
+            d = wp.min(d, m.rod_len[ra] - d)
+    else:
+        for i in range(2):
+            for j in range(2):
+                if m.rod_end[ra][i] == m.rod_end[rb][j]:
+                    d = wp.min(d, wp.where(i == 0, a, m.rod_len[ra] - a) + wp.where(j == 0, b, m.rod_len[rb] - b))
     return d < cutoff
 
 
@@ -528,7 +568,7 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
         if wp.min(st) <= OPEN or wp.max(st) >= 1.0 - OPEN:
             continue  # an end: a node's pair (found exactly on a node, rounding would duplicate it)
         th = 0.5 * (m.radius[a0] + m.radius[a1] + m.radius[b0] + m.radius[b1])
-        if not _excluded(q, m, a0, a1, st[0], b0, b1, st[1], EXCLUSION * th):
+        if not _excluded(q, m, e, -1, st[0], f, -1, st[1], EXCLUSION * th):
             _keep_pair(sc, base, sc.num_nodes + f, wp.vec4i(a0, a1, b0, b1),
                        wp.vec4(1.0 - st[0], st[0], st[1] - 1.0, -st[1]), th, 0.5 * (m.mu[a0] + m.mu[b0]))
 
@@ -560,7 +600,7 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
         w = wp.vec4(1.0, t - 1.0, -t, 0.0)
         th = m.radius[i] + 0.5 * (m.radius[b0] + m.radius[b1])
         c0 = b0
-        c1 = b1
+        ef = f
         if other < sc.num_nodes:
             if (on_rod and other < i) or not _in_node_region(q, m, other, xv):
                 continue  # the lower node's pair; or xv lies past it into its other edge
@@ -568,13 +608,13 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
             w = wp.vec4(1.0, -1.0, 0.0, 0.0)
             th = m.radius[i] + m.radius[other]
             c0 = other
-            c1 = other
+            ef = -1
         if on_rod:
             # Not a local minimum along this rod; within OPEN of it, the edge-edge pair is left to it (else a node
             # just over a still rod, rounded past itself, is neither's).
             if not _in_node_region(q, m, i, wp.lerp(node(q, b0), node(q, b1), t), OPEN):
                 continue
-            if _excluded(q, m, i, i, 0.0, c0, c1, t, EXCLUSION * th):
+            if _excluded(q, m, -1, i, 0.0, ef, c0, t, EXCLUSION * th):
                 continue
         _keep_pair(sc, base, other, pair, w, th, 0.5 * (m.mu[i] + m.mu[c0]))
     for j in range(b.shapes.shape[0]):  # against shapes: their surfaces offset outward (Sec. 3.9)

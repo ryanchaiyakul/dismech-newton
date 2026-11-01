@@ -19,13 +19,16 @@ mat5x11f = wp.types.matrix((5, 11), float)
 
 @wp.struct
 class Rod:
-    """The rods as the element block sees them: connectivity ``(e, f, n0, n1, n2)`` per triplet, rest lengths and the
-    step's start (positions, reference directors, reference twist)."""
+    """The rods as the element block sees them: connectivity ``(e, f, n0, n1, n2)`` per triplet (the triplet runs
+    ``n0 -> n1 -> n2``), each edge's ``sign`` (-1: stored the other way, at a junction or in a graph: its twist angle
+    as the triplet sees it is ``-theta``, its director ``d1`` the same), rest lengths and the step's start
+    (positions, reference directors, reference twist)."""
 
     q_old: wp.array[float]
     edge_d1_old: wp.array[wp.vec3]
     ref_twist_old: wp.array[float]
     conn: wp.array[vec5i]
+    sign: wp.array[wp.vec2]
     edge_length: wp.array[float]
     theta_dof_offset: int
 
@@ -41,8 +44,11 @@ class Rods:
         self.params, self.edge_length, self.num_node_dofs = d.triplet_params, d.edge_length, 3 * model.particle_count
         e, f = d.triplet_edge0.numpy(), d.triplet_edge1.numpy()
         node0, node1 = d.edge_node0.numpy(), d.edge_node1.numpy()
-        conn = np.column_stack((e, f, node0[e], node1[e], node1[f])).astype(np.int32)
-        self.conn = wp.array(conn.reshape(-1, 5), dtype=vec5i, device=dev)
+        shared = np.where((node0[e] == node0[f]) | (node0[e] == node1[f]), node0[e], node1[e])
+        se, sf = np.where(node1[e] == shared, 1.0, -1.0), np.where(node0[f] == shared, 1.0, -1.0)
+        conn = np.column_stack((e, f, np.where(se > 0, node0[e], node1[e]), shared, np.where(sf > 0, node1[f], node0[f])))
+        self.conn = wp.array(conn.astype(np.int32).reshape(-1, 5), dtype=vec5i, device=dev)
+        self.sign = wp.array(np.column_stack((se, sf)).reshape(-1, 2), dtype=wp.vec2, device=dev)
         self.kernels = element_kernels(Rod, rod_strain, rod_jacobian, rod_dofs, 5, 11)
         self.rest = rest_strains(self, model, vec5f)
         if self.count:
@@ -75,7 +81,7 @@ class Rods:
         ``triplet_ref_twist_q``)."""
         v = Rod()
         v.q_old, v.edge_d1_old, v.ref_twist_old = s.q, s.edge_d1_q, s.triplet_ref_twist_q
-        v.conn, v.edge_length, v.theta_dof_offset = self.conn, self.edge_length, self.num_node_dofs
+        v.conn, v.sign, v.edge_length, v.theta_dof_offset = self.conn, self.sign, self.edge_length, self.num_node_dofs
         return v
 
     def dofs(self) -> np.ndarray:
@@ -101,12 +107,19 @@ def rod_dofs(v: Rod, t: int) -> vec11i:
 
 @wp.func
 def rod_strain(x: vec11f, v: Rod, t: int) -> vec5f:
-    return _geometry(x, v, t).strain
+    return _geometry(_oriented(x, v.sign[t]), v, t).strain
+
+
+@wp.func
+def _oriented(x: vec11f, s: wp.vec2) -> vec11f:
+    """The DOFs as the triplet sees them: its edges' twist angles signed."""
+    return wp.cw_mul(x, vec11f(1.0, 1.0, 1.0, s[0], 1.0, 1.0, 1.0, s[1], 1.0, 1.0, 1.0))  # differentiable
 
 
 @wp.func
 def rod_jacobian(x: vec11f, v: Rod, t: int):
-    g = _geometry(x, v, t)
+    s = v.sign[t]
+    g = _geometry(_oriented(x, s), v, t)
     ge = _dphi(g.te_old, g.te, g.ne)
     gf = _dphi(g.tf_old, g.tf, g.nf)
     ue = g.te / g.l0e
@@ -123,8 +136,13 @@ def rod_jacobian(x: vec11f, v: Rod, t: int):
     J = mat5x11f()
     for i in range(11):
         i0, s0, i1, s1 = _z_of_dof(i)
+        o = float(1.0)
+        if i == 3:
+            o = s[0]
+        elif i == 7:
+            o = s[1]
         for r in range(5):
-            J[r, i] = s0 * Jz[r, i0] + s1 * Jz[r, i1]
+            J[r, i] = o * (s0 * Jz[r, i0] + s1 * Jz[r, i1])
     return g.strain, J
 
 

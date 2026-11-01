@@ -121,7 +121,12 @@ def add_rod(
     proxies: bool = True,
     color: Vec3 | None = None,
 ) -> list[int]:
-    """Add an ordered chain of DER segments; returns the proxy bodies (edge indices without proxies).
+    """Add DER segments, an ordered chain or a graph (``rod.edges``: junctions); returns the proxy bodies (edge indices
+    without proxies).
+
+    At a node of ``n`` segments, ``n - 1`` triplets couple its first segment to each of the others (Newton's choice;
+    rest angles the initial ones): a 2-segment node is a chain's triplet, a junction a star around its first segment,
+    whatever way the segments run. Twist and bending at a junction are pairwise with that first segment.
 
     Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend. ``proxies``: a
     kinematic capsule per segment, posed every step (rendering, and what Newton's pipeline sees). ``collide``: the
@@ -130,8 +135,6 @@ def add_rod(
     (both > 0): Newton's Dahl hysteresis on bending and twist (:func:`.rod.dahl_advance`).
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
-    if not Rod._is_ordered_chain_topology(len(points), edges):
-        raise NotImplementedError("add_rod: only ordered chains are supported")
     if collide and not proxies:
         raise ValueError("add_rod: a colliding rod needs its capsule proxies (proxies=True)")
     default = cfg is None
@@ -147,15 +150,19 @@ def add_rod(
     frames = np.asarray(frames, dtype=float)
 
     # -- topology and rest geometry -------------------------------------------------
-    n_e = len(points) - 1
-    idx = np.arange(n_e)
-    nodes = points[:-1] if rod.closed else points
-    edge_nodes = np.column_stack((idx, (idx + 1) % n_e if rod.closed else idx + 1))
-    first = idx if rod.closed else idx[:-1]
-    triplets = np.column_stack((first, (first + 1) % n_e))
+    n_e = len(edges)
+    nodes = points[:-1] if rod.closed else points  # a closed rod's last point is its first
+    edge_nodes = np.where(edges == len(nodes), 0, edges)
+    triplets = []
+    for v in range(len(nodes)):  # the node's first segment with each other; incoming first where one is
+        at = np.flatnonzero((edge_nodes == v).any(1))
+        for o in at[1:]:
+            standard = edge_nodes[at[0], 1] == v or edge_nodes[o, 0] == v
+            triplets.append((at[0], o) if standard else (o, at[0]))
+    triplets = np.array(sorted(triplets), dtype=np.int64).reshape(-1, 2)
     n_t = len(triplets)
 
-    vec = points[1:] - points[:-1]
+    vec = points[edges[:, 1]] - points[edges[:, 0]]
     length = np.linalg.norm(vec, axis=1)
     tangent = vec / length[:, None]
     # d1: the segment frame's local +X (quaternion rotation of x), made orthogonal to t.
@@ -187,7 +194,7 @@ def add_rod(
     # -- kinematic capsule proxies (body frame at the segment midpoint) ---------------
     bodies, shapes = [], []
     for e in range(n_e if proxies else 0):
-        mid = 0.5 * (points[e] + points[e + 1])
+        mid = 0.5 * (points[edges[e, 0]] + points[edges[e, 1]])
         body = builder.add_body(
             xform=wp.transform(wp.vec3(*mid.tolist()), wp.quat(*frames[e].tolist())),
             mass=0.0,
@@ -206,8 +213,11 @@ def add_rod(
             )
         )
         bodies.append(body)
-    for a, b in triplets if proxies else ():  # adjacent proxies overlap at the shared node
-        builder.add_shape_collision_filter_pair(shapes[a], shapes[b])
+    for v in range(len(nodes) if proxies else 0):  # proxies overlap at their shared node
+        at = np.flatnonzero((edge_nodes == v).any(1))
+        for i, a in enumerate(at):
+            for b in at[i + 1:]:
+                builder.add_shape_collision_filter_pair(shapes[a], shapes[b])
 
     # -- attribute rows ---------------------------------------------------------------
     register_custom_attributes(builder)

@@ -1,5 +1,6 @@
 """The rod element: its Jacobian against central differences of its strains, with the reference frames current and
-lagged (a step's start behind its iterate), and its strains at rest; a cantilever against beam theory."""
+lagged (a step's start behind its iterate) and its edges stored either way, and its strains at rest; a cantilever and
+a Y junction's arms against beam theory; a chain given as a graph of reversed, shuffled edges against the chain."""
 
 import newton
 import numpy as np
@@ -27,9 +28,10 @@ def _perpendicular(t, rng):
     return a / np.linalg.norm(a)
 
 
-def _triplet(rng, lag: float):
+def _triplet(rng, lag: float, sign=(1.0, 1.0)):
     """DOFs ``[x0, theta_e, x1, theta_f, x2]`` of a bent, twisted triplet and its view: the start-of-step positions
-    ``lag`` away (``0``: current frames), directors perpendicular to the start's tangents."""
+    ``lag`` away (``0``: current frames), directors perpendicular to the start's tangents; ``sign``: its edges stored
+    the triplet's way (1) or the other (-1, a junction's)."""
     pts = np.array([[0.0, 0.0, 0.0], [0.11, 0.02, -0.01], [0.2, 0.08, 0.03]]) + 0.01 * rng.normal(size=(3, 3))
     old = pts + lag * 0.05 * rng.normal(size=(3, 3))
     x = np.concatenate([pts[0], [0.3], pts[1], [-0.2], pts[2]])
@@ -39,6 +41,7 @@ def _triplet(rng, lag: float):
     v.edge_d1_old = wp.array(d1, dtype=wp.vec3)
     v.ref_twist_old = wp.array([0.1], dtype=float)
     v.conn = wp.array([[0, 1, 0, 1, 2]], dtype=vec5i)
+    v.sign = wp.array([sign], dtype=wp.vec2)
     v.edge_length = wp.array([0.1, 0.12], dtype=float)
     v.theta_dof_offset = 0  # unused: the element reads its gathered DOFs
     return x, v
@@ -51,9 +54,12 @@ def _evaluate_at(xs: np.ndarray, v: Rod):
     return strain.numpy().astype(np.float64), jac.numpy().astype(np.float64)
 
 
+@pytest.mark.parametrize("sign", [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0)], ids=["chain", "e-reversed", "f-reversed"])
 @pytest.mark.parametrize("lag", [0.0, 1.0], ids=["current", "lagged"])
-def test_jacobian_matches_finite_differences(rng, lag):
-    x, v = _triplet(rng, lag)
+def test_jacobian_matches_finite_differences(rng, lag, sign):
+    x, v = _triplet(rng, lag, sign)
+    tau = _evaluate_at(x[None], v)[0][0, 4] - sign[1] * x[7] + sign[0] * x[3]  # its reference twist: unwrapped
+    v.ref_twist_old = wp.array([tau], dtype=float)  # about it, the differences don't cross a 2 pi jump
     h = 1.0e-3
     xs = np.concatenate([x[None], x + h * np.eye(11), x - h * np.eye(11)])
     strain, jac = _evaluate_at(xs, v)
@@ -91,15 +97,7 @@ def test_cantilever_converges_to_beam_theory():
         bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=rho),
                                        stretch_stiffness=E * area, bend_stiffness=EI / h, twist_stiffness=EI / h)
         DiSMechSolver.fix_segment(builder, bodies[0])
-        model = builder.finalize()
-        solver = DiSMechSolver(model, self_contact=False)
-        s0, s1 = model.state(), model.state()
-        flatten_state(s0)
-        flatten_state(s1)
-        for _ in range(200):  # implicit Euler's damping settles it
-            solver.step(s0, s1, None, None, 0.02)
-            s0, s1 = s1, s0
-        tip = 1.0 - s0.particle_q.numpy()[-1, 2]
+        tip = 1.0 - _run(builder, 200, 0.02)[-1][-1, 2]  # implicit Euler's damping settles it
         ratios.append(tip / (rho * area * 9.81 * (length - h) ** 4 / (8.0 * EI)))
     assert 1.0 < ratios[1] < ratios[0] < 1.1, ratios
 
@@ -195,3 +193,73 @@ def test_dahl_off_is_elastic():
     assert np.abs(runs[0]).max() > 0.1
     for run in runs[1:]:
         assert np.array_equal(run, runs[0])
+
+
+def _run(builder, steps: int, dt: float) -> list:
+    """The node positions after each step."""
+    model = builder.finalize()
+    solver = DiSMechSolver(model, self_contact=False)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    out = []
+    for _ in range(steps):
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+        out.append(s0.particle_q.numpy())
+    return out
+
+
+def test_y_junction_arms_are_cantilevers():
+    """A Y of three equal branches at 120 degrees (Newton's ``cable_y_junction``), its stem clamped by its segment at
+    the junction: under their weight the arms are cantilevers, ``w L^4 / (8 EI)`` each. The junction triplets (stem
+    edge reversed) clamp them with the DER curvature ``2 tan(phi / 2)`` linearised about a 60 degree turn, which is
+    softer than a chain's: first order in ``h`` (1.764, 1.382, 1.190 at 10, 20, 40 segments on 2026-11-01), so the
+    Richardson extrapolation ``2 r(h/2) - r(h)`` is the check (1.0006)."""
+    length, r, rho, E = 0.3, 0.005, 1000.0, 1.0e8
+    area, EI = np.pi * r**2, E * np.pi * r**4 / 4.0
+    dirs = np.array([[1.0, 0.0, 0.0], [-0.5, 0.75**0.5, 0.0], [-0.5, -(0.75**0.5), 0.0]])
+    ratios = []
+    for n in (10, 20):
+        h = length / n
+        points = np.concatenate([[[0.0, 0.0, 1.0]], (np.arange(1, n + 1)[None, :, None] * h * dirs[:, None]).reshape(
+            -1, 3) + [0.0, 0.0, 1.0]])
+        edges = [(0 if i == 0 else 1 + b * n + i - 1, 1 + b * n + i) for b in range(3) for i in range(n)]
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        DiSMechSolver.add_rod(builder, newton.Rod(points, edges=edges, radius=r),
+                              cfg=newton.ModelBuilder.ShapeConfig(density=rho), stretch_stiffness=E * area,
+                              bend_stiffness=EI / h, twist_stiffness=EI / h)
+        DiSMechSolver.fix_segment(builder, edge=0)  # the stem's segment at the junction
+        x = _run(builder, 50, 0.1)[-1]  # settled
+        tips = 1.0 - x[[2 * n, 3 * n], 2]
+        assert abs(tips[0] - tips[1]) < 1.0e-4 * tips[0], tips  # the arms share the load
+        ratios.append(tips[0] / (rho * area * 9.81 * length**4 / (8.0 * EI)))
+    assert ratios[1] < ratios[0] and abs(2.0 * ratios[1] - ratios[0] - 1.0) < 0.02, ratios
+
+
+def test_reversed_edges_reproduce_the_chain():
+    """A clamped helical rod falling under gravity, given as a graph with half its edges reversed (frames turned
+    half a turn about ``d1``) and listed shuffled: the trajectory of the ordered chain, to rounding (1.4e-6 m in
+    100 steps that move it 1.7 m on 2026-11-01)."""
+    n = 24
+    s = np.linspace(0.0, 1.5 * np.pi, n + 1)
+    points = np.column_stack([0.3 * np.cos(s), 0.3 * np.sin(s), 1.0 + 0.1 * s])
+    chain = newton.Rod(points, radius=0.01)
+    rng = np.random.default_rng(0)
+    flip = np.arange(n) % 2 == 1
+    edges = np.column_stack([np.arange(n), np.arange(1, n + 1)])
+    edges[flip] = edges[flip, ::-1]
+    x, y, z, w = chain.quaternions.T.astype(np.float64)
+    turned = np.column_stack([w, z, -y, -x])  # q * (x, y, z, w) = (1, 0, 0, 0): local x stays
+    quats = np.where(flip[:, None], turned, chain.quaternions)
+    order = np.concatenate([[0], 1 + rng.permutation(n - 1)])  # the clamped edge first
+    graph = newton.Rod(points, edges=edges[order], quaternions=quats[order], radius=0.01)
+    paths = []
+    for rod in (chain, graph):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0),
+                              stretch_stiffness=1.0e5, bend_stiffness=2.0, twist_stiffness=1.5)
+        DiSMechSolver.fix_segment(builder, edge=0)
+        paths.append(np.array(_run(builder, 100, 0.01)))
+    assert np.abs(paths[0] - paths[0][0]).max() > 1.0
+    np.testing.assert_allclose(paths[1], paths[0], atol=1.0e-5)

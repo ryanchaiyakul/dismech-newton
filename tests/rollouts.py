@@ -354,6 +354,24 @@ class ClampedRollout(Rollout):
         }
 
 
+class JunctionRollout(ClampedRollout):
+    """A Y thrown at random: three 2-segment branches at 120 degrees in one rod graph, edges stored either way (the
+    stem's and one arm's into the junction), the stem's outer segment clamped."""
+
+    def model(self, copies: int):
+        builder = newton.ModelBuilder()
+        dirs = np.array([[-1.0, 0.0, 0.0], [0.5, 0.75**0.5, 0.0], [0.5, -(0.75**0.5), 0.0]])
+        h = 0.5 / self.segments
+        edges = [(1, 2), (0, 1), (0, 3), (3, 4), (6, 5), (5, 0)]  # stem 2-1-0, arms 0-3-4 and 0-5-6
+        for c in range(copies):
+            j = np.add((0.0, 0.0, self.height), self.offset(c, copies))
+            points = [j] + [j + d * k * h for d in dirs for k in (1, 2)]
+            bodies = DiSMechSolver.add_rod(builder, newton.Rod(np.array(points), edges=edges, radius=RADIUS),
+                                           cfg=_cfg(builder, self.mu), **self.rod_options)
+            DiSMechSolver.fix_segment(builder, bodies[0])
+        return builder.finalize()
+
+
 class GroundRollout(Rollout):
     """A rod sliding on the ground (friction ``mu``); ``checks`` picks the directions."""
 

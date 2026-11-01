@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 EXAMPLES = ["cantilever", "flagella", "overhand_knot", "plectoneme", "shell_cantilever", "shell_fold",
-            "newton/cable_bundle_hysteresis", "newton/cable_pile", "newton/cable_plectoneme", "newton/cable_twist",
+            "newton/cable_bundle_hysteresis", "newton/cable_dahl_hysteresis", "newton/cable_pile",
+            "newton/cable_plectoneme", "newton/cable_twist",
             "newton/cloth_bending", "newton/cloth_hanging", "newton/cloth_twist"]
 ROOT = Path(__file__).resolve().parents[1] / "examples"
 

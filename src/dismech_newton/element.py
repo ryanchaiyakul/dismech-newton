@@ -43,6 +43,8 @@ class ElementBlock:
     def __init__(self, elem, *, slots, fixed, num_candidates):
         self.k, self.count, self.bind, self.params = elem.kernels, elem.count, elem.bind, elem.params
         self.rest, self.stored, self.slots, self.fixed = elem.rest, elem.stored, slots, fixed
+        self.effective = getattr(elem, "effective", None)  # (state, dt) -> the step's (params, rest), else theirs
+        self.params_step, self.rest_step = self.params, self.rest
         self.device, vec = fixed.device, elem.kernels.vec
         self.P, self.z, self.u, self.eps_prev = (wp.zeros(self.count, dtype=vec, device=self.device) for _ in range(4))
         self.eps_cand = wp.zeros((num_candidates, self.count), dtype=vec, device=self.device)
@@ -60,7 +62,9 @@ class ElementBlock:
         s = state_in.dismech
         self.view, self.dt, self.exact = self.bind(s), dt, int(exact)
         self._launch(self.k.previous, [getattr(s, self.stored), s.q, self.view], [self.eps_prev])
-        self._launch(self.k.penalty, [self.params, self.rest, self.eps_prev, 1.0 if exact else BETA, dt,
+        if self.effective is not None:
+            self.params_step, self.rest_step = self.effective(s, dt)
+        self._launch(self.k.penalty, [self.params_step, self.rest_step, self.eps_prev, 1.0 if exact else BETA, dt,
                                       self.exact], [self.P, self.z, self.u])
 
     def store(self, s) -> None:
@@ -78,8 +82,8 @@ class ElementBlock:
                      dim=(q_cand.shape[0], padded(self.count)))
 
     def commit(self, q: wp.array, pick: wp.array, b: wp.array) -> None:
-        self._launch(self.k.commit, [q, self.view, pick, self.eps_cand, self.params, self.rest, self.eps_prev, self.P,
-                                     self.dt, self.exact, self.fixed], [self.z, self.u, b])
+        self._launch(self.k.commit, [q, self.view, pick, self.eps_cand, self.params_step, self.rest_step, self.eps_prev,
+                                     self.P, self.dt, self.exact, self.fixed], [self.z, self.u, b])
 
 
 @cache

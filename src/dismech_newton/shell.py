@@ -4,7 +4,8 @@ A face's DOFs are its 3 vertices, the 3 flap vertices across its edges (a bounda
 itself) and the 3 midedge angles of its hinges (``hinge_q``): 21 DOFs. Its strains are the first and
 second fundamental forms in the rest frame (``L``, ``L a L^T = I``), whitened by the material: the energy
 ``A/4 (lam + 2 mu) |R (L a L^T - I)|^2 / 2 + A D |R (L b L^T - b0)|^2 / 2``, with ``R^T R = [[1, nu, 0], [nu, 1, 0],
-[0, 0, 2 (1 - nu)]]`` (plane-stress StVK in ``(S11, S22, S12)``), ``lam``, ``mu`` the 2D Lame parameters.
+[0, 0, 2 (1 - nu)]]`` (plane-stress StVK in ``(S11, S22, S12)``), ``lam``, ``mu`` the 2D Lame parameters. Woven
+cloth has its own ``R`` per form, rotated into the face's material axes (``builder._orthotropic``).
 """
 
 import numpy as np
@@ -24,13 +25,15 @@ mat23f = wp.types.matrix((2, 3), float)
 
 @wp.struct
 class Shell:
-    """The faces as the element block sees them: 6 nodes and 3 hinges, hinge signs and flaps, the strain map ``W``
-    (a form's entries to its whitened strains); ``hinge_offset``: the first midedge angle's DOF."""
+    """The faces as the element block sees them: 6 nodes and 3 hinges, hinge signs and flaps, the strain maps ``W``
+    (a form's entries to its whitened strains: the first form's, ``bend_map`` the second's); ``hinge_offset``: the
+    first midedge angle's DOF."""
 
     conn: wp.array[vec9i]
     sign: wp.array[wp.vec3]
     flap: wp.array[wp.vec3]
     strain_map: wp.array[wp.mat33]
+    bend_map: wp.array[wp.mat33]
     hinge_offset: int
 
 
@@ -50,7 +53,7 @@ class Shells:
         ).astype(np.int32)
         v = self.view = Shell()
         v.conn = wp.array(conn.reshape(-1, 9), dtype=vec9i, device=dev)
-        v.sign, v.flap, v.strain_map = d.face_sign, d.face_flap, d.face_strain_map
+        v.sign, v.flap, v.strain_map, v.bend_map = d.face_sign, d.face_flap, d.face_strain_map, d.face_bend_map
         v.hinge_offset = hinge_offset
         self.kernels = element_kernels(Shell, shell_strain, shell_jacobian, shell_dofs, 6, 21, shell_geometric)
         self.rest = rest_strains(self, model, vec6f)
@@ -88,8 +91,7 @@ def shell_strain(x: vec21f, v: Shell, i: int) -> vec6f:
 
 @wp.func
 def shell_jacobian(x: vec21f, v: Shell, i: int):
-    Wm = v.strain_map[i]
-    m, g, J = _derivatives(_points(x), _angles(x), v.sign[i], v.flap[i], Wm, Wm * _b_of_g())
+    m, g, J = _derivatives(_points(x), _angles(x), v.sign[i], v.flap[i], v.strain_map[i], v.bend_map[i] * _b_of_g())
     return _whiten(v, i, m, g), J
 
 
@@ -136,9 +138,8 @@ def _b_of_g() -> wp.mat33:
 
 @wp.func
 def _whiten(v: Shell, i: int, m: wp.vec3, g: wp.vec3) -> vec6f:
-    Wm = v.strain_map[i]
-    em = Wm * m
-    eb = Wm * (_b_of_g() * g)
+    em = v.strain_map[i] * m
+    eb = v.bend_map[i] * (_b_of_g() * g)
     return vec6f(float(em[0]), float(em[1]), float(em[2]), float(eb[0]), float(eb[1]), float(eb[2]))
 
 

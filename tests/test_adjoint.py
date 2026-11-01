@@ -56,3 +56,15 @@ def test_gradient_graph_capture(rng):
         wp.capture_launch(capture.graph)
     for a, g in zip(inputs, expected, strict=True):
         assert_close(a.grad.numpy(), g, 1.0e-6)
+
+
+class DahlRollout(ClampedRollout):
+    rod_options = dict(ClampedRollout.rod_options, dahl_eps_max=0.1, dahl_tau=0.05)
+
+
+@pytest.mark.parametrize("options", [EXACT, {"iterations": 300, "self_contact": False}], ids=["exact", "admm"])
+def test_dahl_adjoint_matches_finite_differences(rng, options):
+    """With Dahl hysteresis (its tangent ``sigma_max / tau`` twice the bend stiffness): the stress is state, carried
+    across steps by the exact law, and its adjoint with it, so gradients reach the stiffness through ``sigma_max``
+    too. Over 16 seeds within 1e-3 (2026-11-01); an adjoint that holds the stresses frozen fails."""
+    DahlRollout(rng).check(options, fd_options=EXACT)

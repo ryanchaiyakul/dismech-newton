@@ -28,6 +28,7 @@ ATTRIBUTES = [
     ("triplet", "triplet_edge0", wp.int32, _P + "edge"),  # scalar int32, so merging builders offsets them
     ("triplet", "triplet_edge1", wp.int32, _P + "edge"),
     ("triplet", "triplet_params", vec10f, None),  # [stiffness, damping] per strain
+    ("triplet", "triplet_dahl", wp.vec2, None),  # Dahl hysteresis (eps_max, tau) [rad]; off unless both > 0
     # Midedge shells (shell.py): a hinge per mesh edge, its midedge angle a DOF.
     ("hinge", "hinge_fixed", wp.int32, None),
     ("hinge", "hinge_inertia", float, None),  # the angle's (Chen et al. 2026, Eq. 52)
@@ -37,6 +38,7 @@ ATTRIBUTES = [
     ("face", "face_sign", wp.vec3, None),  # +-1: the hinge's angle as the face sees it
     ("face", "face_flap", wp.vec3, None),  # 1 where the hinge has a second face
     ("face", "face_strain_map", wp.mat33, None),  # (m00, m01, m11) -> whitened strains in the rest frame
+    ("face", "face_bend_map", wp.mat33, None),  # the same for the second form
     ("face", "face_params", vec12f, None),  # [stiffness, damping] per strain (membrane 3, bending 3)
 ]
 
@@ -48,6 +50,7 @@ STATE_ATTRIBUTES = [
     ("triplet", "triplet_ref_twist_q", float, None),
     # The strains at the end of the last step (strain-rate damping); NaN until a step measures them.
     ("triplet", "triplet_strain_q", vec5f, vec5f(*([float("nan")] * 5))),
+    ("triplet", "triplet_dahl_q", wp.vec3, None),  # Dahl stress (kappa1, kappa2, tau) [N m]
     ("hinge", "hinge_q", float, None),  # midedge angle
     ("hinge", "hinge_qd", float, None),
     ("face", "face_strain_q", vec6f, vec6f(*([float("nan")] * 6))),
@@ -111,6 +114,8 @@ def add_rod(
     bend_damping: float | None = None,
     twist_stiffness: float | None = None,
     twist_damping: float | None = None,
+    dahl_eps_max: float = 0.0,
+    dahl_tau: float = 0.0,
     label: str | None = None,
     collide: bool = False,
     proxies: bool = True,
@@ -121,7 +126,8 @@ def add_rod(
     Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend. ``proxies``: a
     kinematic capsule per segment, posed every step (rendering, and what Newton's pipeline sees). ``collide``: the
     rod takes part in the solver's contacts (:mod:`.collide`), its friction ``cfg.mu`` (without ``cfg``, 0.3); its
-    capsules are in :data:`ROD_GROUP`, so a pipeline never pairs two of them.
+    capsules are in :data:`ROD_GROUP`, so a pipeline never pairs two of them. ``dahl_eps_max``, ``dahl_tau``
+    (both > 0): Newton's Dahl hysteresis on bending and twist (:func:`.rod.dahl_advance`).
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
     if not Rod._is_ordered_chain_topology(len(points), edges):
@@ -236,6 +242,8 @@ def add_rod(
                 _P + "triplet_edge0": edge0 + int(triplets[t, 0]),
                 _P + "triplet_edge1": edge0 + int(triplets[t, 1]),
                 _P + "triplet_params": vec10f(*params[t].tolist()),
+                _P + "triplet_dahl": wp.vec2(dahl_eps_max, dahl_tau),
+                _P + "triplet_dahl_q": wp.vec3(0.0),
                 _P + "triplet_ref_twist_q": 0.0,  # the first strain evaluation yields the reference twist itself
             }
         )
@@ -243,6 +251,24 @@ def add_rod(
 
 
 # -- shells: Newton's cloth mesh --------------------------------------------------------------------------
+
+
+def _orthotropic(C, phi: np.ndarray, T: np.ndarray):
+    """``(W, c)``: a face's strain map ``R Ts T`` for the plane-stress ``C`` (Voigt, engineering shear) in material
+    axes at ``phi`` in its rest frame, ``Ts`` turning ``(S11, S22, S12)`` into those axes, ``R^T R = Q C Q / c``
+    (``Q = diag(1, 1, 2)``), ``c = (C11 + C22) / 2`` the stiffness ``K`` carries."""
+    C = np.asarray(C, dtype=np.float64)
+    C = np.diag(C) if C.shape == (3,) else C
+    if C.shape != (3, 3) or not np.allclose(C, C.T) or np.linalg.eigvalsh(C).min() <= 0.0:
+        raise ValueError("add_cloth_mesh: an anisotropic stiffness must be 3 positive values or an SPD 3x3 matrix")
+    c = 0.5 * (C[0, 0] + C[1, 1])
+    Q = np.diag([1.0, 1.0, 2.0])
+    co, si = np.cos(phi), np.sin(phi)
+    cc, ss, cs = co * co, si * si, co * si
+    Ts = np.stack(
+        [np.stack([cc, ss, 2 * cs], -1), np.stack([ss, cc, -2 * cs], -1), np.stack([-cs, cs, cc - ss], -1)], -2
+    )
+    return np.linalg.cholesky(Q @ C @ Q / c).T @ Ts @ T, c
 
 
 def add_cloth_mesh(
@@ -256,6 +282,9 @@ def add_cloth_mesh(
     vel=(0.0, 0.0, 0.0),
     bend_stiffness: float | None = None,
     damping: float | None = None,
+    aniso=None,
+    bend_aniso=None,
+    uv=None,
     **kwargs,
 ) -> np.ndarray:
     """:meth:`newton.ModelBuilder.add_cloth_mesh` as a midedge shell; returns its vertices' particle indices.
@@ -273,6 +302,14 @@ def add_cloth_mesh(
     - a midedge angle's inertia ``rho h^3 (A + A') / 36 / cos^4(psi0)`` (Chen et al. 2026, Eq. 52: ``rho h`` the
       ``density`` per area, ``h^2 = 12 D / (lam + 2 mu)``, ``A + A'`` its faces' rest areas, ``psi0`` half its rest
       turning angle).
+
+    Woven cloth (orthotropic, Style3D's ``tri_aniso_ke``, ``edge_aniso_ke``): ``aniso = (ku, kv, ks)`` [N/m] is the
+    membrane's plane-stress stiffness ``C`` on the strains ``(e_uu, e_vv, g_uv)`` (``g_uv = 2 e_uv``) in the
+    material axes ``u`` (weft), ``v`` (warp), replacing ``tri_ke``, ``tri_ka``; ``bend_aniso = (bu, bv, bs)`` [N m]
+    the plate's ``D`` on the curvatures ``(k_uu, k_vv, 2 k_uv)``, replacing the isotropic ``D``. Either may be a full
+    SPD 3x3 matrix (a Poisson coupling). ``uv``: the panel coordinates per vertex ``(V, 2)`` or per face corner
+    ``(F, 3, 2)`` (``vertices``' x, y without it); a face's ``u`` axis is its ``u`` direction in the rest shape. The
+    midedge inertia's ``h^2`` takes ``12 (D_uu + D_vv) / (C_uu + C_vv)``.
 
     The rest shape is the initial one. Fix vertices through their particle flags; a clamped edge needs its
     neighbouring row too (the midedge angles stay free).
@@ -320,10 +357,36 @@ def add_cloth_mesh(
     area = 0.5 * np.sqrt(np.linalg.det(metric))
     L = np.linalg.inv(np.linalg.cholesky(metric))  # L a L^T = I
     lam_2mu = ka + 2.0 * ke  # 2D Lame: lam = tri_ka, mu = tri_ke
+    nu = ka / lam_2mu
     hinge_area = np.bincount(face_hinges.ravel(), np.repeat(area, 3), minlength=len(edges))
     if bend_stiffness is None:
         hinge_len = np.linalg.norm(x[edges[:, 3]] - x[edges[:, 2]], axis=1)
         bend_stiffness = (edge_ke * hinge_area / hinge_len)[face_hinges].mean(1)
+    # W = R T: T takes (m00, m01, m11) to (S11, S22, S12) of S = L M L^T, R whitens (module docstring)
+    l00, l01, l10, l11 = L[:, 0, 0], L[:, 0, 1], L[:, 1, 0], L[:, 1, 1]
+    T = np.stack(
+        [
+            np.stack([l00 * l00, 2 * l00 * l01, l01 * l01], -1),
+            np.stack([l10 * l10, 2 * l10 * l11, l11 * l11], -1),
+            np.stack([l00 * l10, l00 * l11 + l01 * l10, l01 * l11], -1),
+        ],
+        -2,
+    )
+    R = np.zeros((len(tris), 3, 3))
+    R[:, 0, 0], R[:, 0, 1], R[:, 1, 1], R[:, 2, 2] = 1.0, nu, np.sqrt(1.0 - nu**2), np.sqrt(2.0 * (1.0 - nu))
+    W = Wb = R @ T
+    if aniso is not None or bend_aniso is not None:
+        uv = np.asarray(vertices, dtype=np.float64)[:, :2] if uv is None else np.asarray(uv, dtype=np.float64)
+        if uv.ndim == 3 and len(uv) != len(tris):
+            raise ValueError("add_cloth_mesh: a panel corner per face corner (Newton dropped degenerate faces?)")
+        uv = uv if uv.ndim == 3 else uv[tris - v0]
+        duv = np.stack([uv[:, 1] - uv[:, 0], uv[:, 2] - uv[:, 0]], -1)  # columns: the edges in the panel
+        u = np.einsum("fji,fj->fi", np.linalg.cholesky(metric), np.linalg.inv(duv)[:, :, 0])  # L^-T: u in the frame
+        phi = np.arctan2(u[:, 1], u[:, 0])
+        if aniso is not None:
+            W, lam_2mu = _orthotropic(aniso, phi, T)
+        if bend_aniso is not None:
+            Wb, bend_stiffness = _orthotropic(bend_aniso, phi, T)
     face_h2 = 12.0 * np.broadcast_to(bend_stiffness, area.shape) / lam_2mu
     count = np.bincount(face_hinges.ravel(), minlength=len(edges))
     hinge_h = np.sqrt(np.bincount(face_hinges.ravel(), np.repeat(face_h2, 3), minlength=len(edges)) / count)
@@ -339,20 +402,7 @@ def add_cloth_mesh(
     gamma = (4.0 * kd / lam_2mu, (edge_kd / np.where(edge_ke > 0, edge_ke, np.inf))[face_hinges].mean(1))
     K = np.repeat(np.column_stack([0.25 * area * lam_2mu, area * bend_stiffness]), 3, axis=1)
     C = K * (damping if damping is not None else np.repeat(np.column_stack(gamma), 3, axis=1))
-    params, nu = np.concatenate([K, C], axis=1), ka / lam_2mu
-    # W = R T: T takes (m00, m01, m11) to (S11, S22, S12) of S = L M L^T, R whitens (module docstring)
-    l00, l01, l10, l11 = L[:, 0, 0], L[:, 0, 1], L[:, 1, 0], L[:, 1, 1]
-    T = np.stack(
-        [
-            np.stack([l00 * l00, 2 * l00 * l01, l01 * l01], -1),
-            np.stack([l10 * l10, 2 * l10 * l11, l11 * l11], -1),
-            np.stack([l00 * l10, l00 * l11 + l01 * l10, l01 * l11], -1),
-        ],
-        -2,
-    )
-    R = np.zeros((len(tris), 3, 3))
-    R[:, 0, 0], R[:, 0, 1], R[:, 1, 1], R[:, 2, 2] = 1.0, nu, np.sqrt(1.0 - nu**2), np.sqrt(2.0 * (1.0 - nu))
-    W = R @ T
+    params = np.concatenate([K, C], axis=1)
 
     for h in range(len(edges)):
         builder.add_custom_values(
@@ -373,6 +423,7 @@ def add_cloth_mesh(
                 _P + "face_sign": wp.vec3(*sign[f]),
                 _P + "face_flap": wp.vec3(*flap[f]),
                 _P + "face_strain_map": wp.mat33(*W[f].ravel().tolist()),
+                _P + "face_bend_map": wp.mat33(*Wb[f].ravel().tolist()),
                 _P + "face_params": vec12f(*params[f].tolist()),
             },
         )

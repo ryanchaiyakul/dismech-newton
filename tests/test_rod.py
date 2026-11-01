@@ -102,3 +102,96 @@ def test_cantilever_converges_to_beam_theory():
         tip = 1.0 - s0.particle_q.numpy()[-1, 2]
         ratios.append(tip / (rho * area * 9.81 * (length - h) ** 4 / (8.0 * EI)))
     assert 1.0 < ratios[1] < ratios[0] < 1.1, ratios
+
+
+def _dahl_triplet(eps_max: float, tau: float):
+    """One triplet of stiffness ``K = 1`` (edges 0.1 m), its first edge clamped, the tip node nearly massless."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.2, segment_count=2, radius=0.01)
+    DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), bend_stiffness=1.0,
+                          collide=False, proxies=False, dahl_eps_max=eps_max, dahl_tau=tau)
+    DiSMechSolver.fix_segment(builder, edge=0)
+    model = builder.finalize()
+    return model, DiSMechSolver(model, self_contact=False)
+
+
+@wp.kernel
+def _tip_force(force: wp.array[float], i: int, f: wp.array[wp.vec3]):
+    f[2] = wp.vec3(0.0, 0.0, force[i])
+
+
+@wp.kernel
+def _record_kappa(strain: wp.array[vec5f], i: int, out: wp.array[float]):
+    out[i] = -strain[0][2]
+
+
+def _dahl_cycle(eps_max, tau, force, dt):
+    """The curvature ``kappa = -kappa_1`` (the turning angle's ``2 tan(phi / 2)``) under a tip force ``force[i]``
+    along +z at the end of step ``i`` (no host sync per step)."""
+    model, solver = _dahl_triplet(eps_max, tau)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    f, out = wp.array(force, dtype=float), wp.zeros(len(force), dtype=float)
+    for i in range(len(force)):
+        wp.launch(_tip_force, dim=1, inputs=[f, i], outputs=[s0.particle_f])
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+        wp.launch(_record_kappa, dim=1, inputs=[s0.dismech.triplet_strain_q, i], outputs=[out])
+    return out.numpy().astype(np.float64)
+
+
+def _dahl(d, sigma, sigma_max, tau):
+    s = np.sign(d) if abs(d) > 1.0e-6 else (-1.0 if sigma < 0.0 else 1.0)
+    e = np.exp(-s * d / tau)
+    return s * sigma_max * (1.0 - e) + sigma * e
+
+
+def _dahl_quasistatic(force, eps_max, tau, l=0.1):
+    """The exact quasi-static loop: per sample, ``F l cos(phi) / (1 + kappa^2 / 4) = kappa + sigma(kappa)`` (the
+    moment about the clamp over ``d kappa / d phi``, ``K = 1``), ``sigma`` the Dahl law from the last sample."""
+    kappa, sigma, out = 0.0, 0.0, []
+    for f in force:
+        def residual(x, kappa=kappa, sigma=sigma, f=f):
+            return f * l * np.cos(2.0 * np.arctan(0.5 * x)) / (1.0 + 0.25 * x * x) - x - _dahl(x - kappa, sigma,
+                                                                                                 eps_max, tau)
+        lo, hi = -2.0, 2.0
+        for _ in range(60):
+            lo, hi = ((lo + hi) / 2, hi) if residual((lo + hi) / 2) > 0.0 else (lo, (lo + hi) / 2)
+        sigma, kappa = _dahl(lo - kappa, sigma, eps_max, tau), lo
+        out.append(kappa)
+    return np.array(out)
+
+
+@pytest.mark.parametrize("period", [1.0, 2.0])
+def test_dahl_loop_matches_closed_form(period):
+    """Newton's Dahl hysteresis on one triplet under a tip force ``3 sin(2 pi t / T)`` N (moment ~0.3 K), without
+    damping: the curvature against the exact quasi-static loop, whose branches are exponentials toward
+    ``+-sigma_max = +-K eps_max`` at rate ``1 / tau``. Rate independent: the same loop at either period ``T``, its
+    area (moment over curvature, the last full cycle) and its curvature at zero force (the set) within 3%, the
+    curvature within 2% of its peak. Over a step the Dahl stress is linearized with the branches' mean tangent
+    ``sigma_max / tau`` (an implicit damping ``dt sigma_max / tau``): at 2000 steps per period, area +2.6% (T 1 s,
+    dt 1e-3; frozen sigma breaks down there: 0.003 for 0.057), +1.3% (dt/T 5e-4) and +0.6% (2.5e-4)
+    (2026-11-01)."""
+    eps_max, tau, dt = 0.1, 0.05, 5.0e-4
+    t = dt * np.arange(1, int(round(1.25 * period / dt)) + 1)
+    force = 3.0 * np.sin(2.0 * np.pi * t / period)
+    kappa, exact = _dahl_cycle(eps_max, tau, force, dt), _dahl_quasistatic(force, eps_max, tau)
+    assert_close(kappa, exact, 2.0e-2, "curvature")
+    cycle = t > 0.25 * period
+    moment = [0.1 * force[cycle] * np.cos(2.0 * np.arctan(0.5 * k[cycle])) / (1.0 + 0.25 * k[cycle] ** 2)
+              for k in (kappa, exact)]
+    area = [0.5 * abs(k[cycle] @ np.roll(m, -1) - np.roll(k[cycle], -1) @ m) for k, m in zip((kappa, exact), moment)]
+    assert abs(area[0] / area[1] - 1.0) < 0.03, area
+    zero = np.argmin(np.abs(t - 0.5 * period))  # the force back to zero after the first peak: the set
+    assert abs(kappa[zero] / exact[zero] - 1.0) < 0.03, (kappa[zero], exact[zero])
+    assert exact[zero] > 0.5 * eps_max  # a set of order eps_max: the loop is open
+
+
+def test_dahl_off_is_elastic():
+    """Dahl is off where ``eps_max`` or ``tau`` is 0: the trajectory bit-identical to a rod without it."""
+    force = 3.0 * np.sin(np.linspace(0.0, 2.0 * np.pi, 200))
+    runs = [_dahl_cycle(eps_max, tau, force, 1.0e-3) for eps_max, tau in ((0.0, 0.0), (0.0, 0.05), (0.1, 0.0))]
+    assert np.abs(runs[0]).max() > 0.1
+    for run in runs[1:]:
+        assert np.array_equal(run, runs[0])

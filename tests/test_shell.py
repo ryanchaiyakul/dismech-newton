@@ -136,6 +136,126 @@ def test_plate_strip_converges_to_beam_theory(exact):
     assert 1.0 < ratios[1] < ratios[0] < 1.2, ratios
 
 
+# -- woven cloth (orthotropic) ------------------------------------------------------------------------
+
+
+def _panel(v, theta):
+    """``v``'s panel coordinates with the material ``u`` axis at ``theta`` from x."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.column_stack([v[:, 0] * c + v[:, 1] * s, -v[:, 0] * s + v[:, 1] * c])
+
+
+def _voigt_rotation(theta):
+    """Engineering strains ``(e_xx, e_yy, g_xy)`` into axes at ``theta``."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c * c, s * s, c * s], [s * s, c * c, -c * s], [-2 * c * s, 2 * c * s, c * c - s * s]])
+
+
+def test_isotropic_limit(rng):
+    """An isotropic ``C`` and ``D`` given as anisotropic stiffness, material axes at random: the energy (``W^T W`` of
+    each strain map, the stiffness) and the midedge inertia of the isotropic shell (Newton's ``tri_ke``, ``tri_ka``,
+    ``bend_stiffness``)."""
+    v, f = grid(6, 5, 0.3, 0.2, rng, jitter=0.3)
+    v[:, 2] = 0.1 * np.sin(4.0 * v[:, 0])
+    mu, lam, D = 1.0e3, 4.0e2, 2.0e-3
+    nu = lam / (lam + 2.0 * mu)
+    iso = np.array([[1.0, nu, 0.0], [nu, 1.0, 0.0], [0.0, 0.0, 0.5 * (1.0 - nu)]])
+    out = []
+    for kw in ({}, {"aniso": (lam + 2 * mu) * iso, "bend_aniso": D * iso, "uv": rng.normal(size=(len(f), 3, 2))}):
+        builder = newton.ModelBuilder()
+        cloth(builder, v, f, density=1.0, tri_ke=mu, tri_ka=lam, bend_stiffness=D, **kw)
+        a = {k: np.array(builder.custom_attributes["dismech:" + k].values, dtype=np.float64)
+             for k in ("face_strain_map", "face_bend_map", "face_params", "hinge_inertia")}
+        Wm, Wb = (a[k].reshape(-1, 3, 3) for k in ("face_strain_map", "face_bend_map"))
+        out.append([Wm.transpose(0, 2, 1) @ Wm, Wb.transpose(0, 2, 1) @ Wb, a["face_params"], a["hinge_inertia"]])
+    for a, b in zip(*out):
+        np.testing.assert_allclose(b, a, rtol=1e-6, atol=1e-9 * np.abs(a).max())
+
+
+@pytest.mark.parametrize("C", [(2.0e2, 5.0e1, 1.0e1), "isotropic"])
+@pytest.mark.parametrize("theta", [0.0, 0.5 * np.pi, 0.25 * np.pi, 0.3])
+def test_uniaxial_stretch(C, theta):
+    """A strip clamped at ``x = 0`` and pulled at ``x = 1`` by a small stress, its weft at ``theta``: the strain in
+    its middle third is ``C(theta)^-1 (sigma, 0, 0)`` (the effective modulus, Poisson ratio and shear coupling along
+    x), within 1% of the axial strain."""
+    C = np.diag(C) if C != "isotropic" else 1.0e2 / 0.91 * np.array([[1.0, 0.3, 0.0], [0.3, 1.0, 0.0], [0, 0, 0.35]])
+    lx, ly, nx, ny, sigma = 1.0, 0.25, 41, 11, 2.0e-4 * C[0, 0]
+    v, f = grid(nx, ny, lx, ly)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    ids = cloth(builder, v, f, density=0.1, aniso=C, uv=_panel(v, theta), bend_stiffness=1.0e-4, damping=0.05)
+    for k in np.flatnonzero(v[:, 0] < 1.0e-9):
+        builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
+    model = builder.finalize()
+    right = np.flatnonzero(v[:, 0] > lx - 1.0e-9)
+    force = np.zeros((len(v), 3), np.float32)
+    force[right, 0] = sigma * ly / (ny - 1) * np.where(np.isin(right, right[[0, -1]]), 0.5, 1.0)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    solver = DiSMechSolver(model, iterations=10)
+    for _ in range(100):
+        s0.particle_f.assign(force)
+        solver.step(s0, s1, None, None, 0.05)
+        s0, s1 = s1, s0
+    mid = (v[:, 0] > 0.35) & (v[:, 0] < 0.65)
+    G = np.linalg.lstsq(np.column_stack([v[mid, :2], np.ones(mid.sum())]), s0.particle_q.numpy()[mid, :2],
+                        rcond=None)[0][:2].T
+    E = 0.5 * (G.T @ G - np.eye(2))
+    T = _voigt_rotation(theta)
+    expected = np.linalg.solve(T.T @ C @ T, [sigma, 0.0, 0.0])
+    assert np.abs([E[0, 0], E[1, 1], 2.0 * E[0, 1]] - expected).max() < 0.01 * expected[0]
+
+
+def test_plate_strip_bends_along_its_weave():
+    """The cantilever strip of the plate test (``nu = 0``), ``bend_aniso = (D, D/4, D/2)``, cut along the weft, the
+    warp and at 45 degrees: the tip deflection against ``p L^4 / (8 D_eff)``, ``1 / D_eff`` the bending compliance
+    along the strip (``D``, ``D/4``, ``1 / (1/D + 4/D + 2/D) * 4``): within 20% (the plate test's mesh error), and the
+    warp over the weft within 5% of 4."""
+    E, h, rho, length, width, nx, ny = 1.0e10, 2.0e-3, 1000.0, 0.3, 0.06, 16, 4
+    D = E * h**3 / 12.0
+    Db = np.array([D, D / 4.0, D / 2.0])
+    v, f = grid(nx, ny, length, width)
+    dx = length / (nx - 1)
+    ratios = []
+    for theta in (0.0, 0.5 * np.pi, 0.25 * np.pi):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        ids = cloth(builder, v, f, density=rho * h, tri_ke=0.5 * E * h, tri_ka=0.0, bend_aniso=Db,
+                    uv=_panel(v, theta), damping=0.05)
+        for k in np.nonzero(v[:, 0] < 1.5 * dx)[0]:
+            builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
+        model = builder.finalize()
+        out, _ = simulate(model, DiSMechSolver(model, iterations=10), 200, 0.02)
+        tip = out.particle_q.numpy()[v[:, 0] > length - 1.0e-9, 2].mean()
+        T = _voigt_rotation(theta)
+        compliance = np.linalg.inv(T.T @ np.diag(Db) @ T)[0, 0]
+        ratios.append(tip / (-rho * h * 9.81 * (length - dx) ** 4 / 8.0 * compliance))
+    assert all(1.0 < r < 1.2 for r in ratios), ratios
+    assert abs(ratios[1] / ratios[0] - 1.0) < 0.05, ratios
+
+
+def test_woven_sheet_is_frame_invariant(rng):
+    """A woven sheet clamped along one edge, sagging and twisting under gravity at an angle; then the same with
+    mesh and gravity turned by a random rotation, the panel the same: the motion turns with them."""
+    v, f = grid(8, 6, 0.3, 0.2, rng, jitter=0.3)
+    uv = _panel(v, 0.4)
+    Q = np.linalg.qr(rng.normal(size=(3, 3)))[0]
+    g = np.array([0.0, 3.0, -9.81])
+    out = []
+    for R in (np.eye(3), Q):
+        builder = newton.ModelBuilder()
+        ids = cloth(builder, v @ R.T, f, density=0.2, aniso=(2.0e3, 5.0e2, 1.0e2), bend_aniso=(2.0e-3, 5.0e-4, 1.0e-4),
+                    uv=uv, damping=0.01)
+        for k in np.flatnonzero(v[:, 0] < 1.0e-9):
+            builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
+        model = builder.finalize()
+        model.set_gravity(tuple(R @ g))
+        x = simulate(model, DiSMechSolver(model, iterations=10), 50, 0.01)[0].particle_q.numpy()
+        out.append(x @ R)
+    sag = np.abs(out[0] - v).max()
+    assert sag > 0.02
+    assert np.abs(out[1] - out[0]).max() < 2.0e-5 * sag  # 3.8e-6 at the worst of 16 seeds
+
+
 def test_shell_lands_on_the_ground():
     """A falling plate, the ground found by the solver itself (no collision pipeline): it comes to rest at its
     contact thickness, without sliding."""

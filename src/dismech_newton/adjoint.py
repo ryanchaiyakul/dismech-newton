@@ -66,13 +66,15 @@ class StepAdjoint:
         self.q_star, self.q_pred, self.q, self.qd, self.residual, self.mass = (grad(n) for _ in range(6))
         self.edge_d1 = grad(s.der.edge_length.shape[0], wp.vec3)
         self.ref_twist = grad(s.triplets.count)
+        self.dahl = grad(s.triplets.count, wp.vec3)
         self.elements = [
             SimpleNamespace(blk=b, eps_prev=grad(b.count, b.k.vec), strain=grad(b.count, b.k.vec),
-                            xs=grad(b.count, b.k.xvec), g=grad(b.count, b.k.xvec))
+                            xs=grad(b.count, b.k.xvec), g=grad(b.count, b.k.xvec), params=grad(b.count, b.params.dtype),
+                            rest=grad(b.count, b.k.vec))
             for b in s.elements if b.count
         ]
-        self._intermediates = [self.q_star, self.q_pred, self.q, self.qd, self.edge_d1, self.ref_twist,
-                               *(a for e in self.elements for a in (e.eps_prev, e.strain))]
+        self._intermediates = [self.q_star, self.q_pred, self.q, self.qd, self.edge_d1, self.ref_twist, self.dahl,
+                               *(a for e in self.elements for a in (e.eps_prev, e.strain, e.params, e.rest))]
         nd = s.num_node_dofs
         self._q_nodes = self.q[:nd].reshape((nd // 3, 3)).view(wp.vec3)
         self._rhs, self._lam = (wp.zeros(n, dtype=float, device=dev) for _ in range(2))
@@ -86,7 +88,7 @@ class StepAdjoint:
         s = self.solver
         s_in, s_out = state_in.dismech, state_out.dismech
         seeds = {self.q: s_out.q.grad, self.qd: s_out.qd.grad, self.edge_d1: s_out.edge_d1_q.grad,
-                 self.ref_twist: s_out.triplet_ref_twist_q.grad,
+                 self.ref_twist: s_out.triplet_ref_twist_q.grad, self.dahl: s_out.triplet_dahl_q.grad,
                  **{e.strain: getattr(s_out, e.blk.stored).grad for e in self.elements}}
         seeds = {a: g for a, g in seeds.items() if g is not None}
         if not seeds:
@@ -95,7 +97,8 @@ class StepAdjoint:
         h = s.theta * dt  # the implicit Euler step solved
         strains = {b.stored: getattr(s_out, b.stored) for b in s.elements} | {e.blk.stored: e.strain
                                                                              for e in self.elements}  # (empty blocks)
-        end = SimpleNamespace(q=self.q, edge_d1_q=self.edge_d1, triplet_ref_twist_q=self.ref_twist, **strains)
+        end = SimpleNamespace(q=self.q, edge_d1_q=self.edge_d1, triplet_ref_twist_q=self.ref_twist,
+                              triplet_dahl_q=self.dahl, **strains)
         with suspended_tape():
             for a in self._intermediates:
                 a.grad.zero_()
@@ -168,10 +171,11 @@ class StepAdjoint:
             blk, k = e.blk, e.blk.k
             v = _detached(blk.bind(state_in.dismech))
             wp.launch(k.gather, dim=blk.count, inputs=[_detached(self.q_star), v], outputs=[e.xs], device=dev)
+            params, rest = self._params(e, state_in, dt)
             tape = wp.Tape()
             with tape:
                 wp.launch(k.forces, dim=blk.count,
-                          inputs=[e.xs, v, _detached(blk.params), _detached(blk.rest), _detached(e.eps_prev), dt],
+                          inputs=[e.xs, v, _detached(params), _detached(rest), _detached(e.eps_prev), dt],
                           outputs=[e.g], device=dev)
             for row in range(k.D):
                 e.xs.grad.zero_()
@@ -181,6 +185,13 @@ class StepAdjoint:
                           outputs=[A.vals], device=dev)
         dof_mass(s.model, self.mass)
         wp.launch(diagonal_kernel, dim=s.num_dofs, inputs=[self.dofs], outputs=[A.indptr, A.vals], device=dev)
+
+    @staticmethod
+    def _params(e, state_in: State, dt: float):
+        """The element's ``(params, rest)`` in the step (with Dahl: from ``state_in``'s stresses, on any tape)."""
+        if e.blk.effective is None:
+            return e.blk.params, e.blk.rest
+        return e.blk.effective(state_in.dismech, dt, e.params, e.rest)
 
     def _residual(self, state_in: State, dt: float, contacts: Slots | None) -> wp.Tape:
         """``r(q_star)`` on a tape, every input with its adjoint."""
@@ -197,7 +208,8 @@ class StepAdjoint:
                 e.xs.grad.zero_()
                 e.g.grad.zero_()
                 wp.launch(k.gather, dim=blk.count, inputs=[self.q_star, v], outputs=[e.xs], device=dev)
-                wp.launch(k.forces, dim=blk.count, inputs=[e.xs, v, blk.params, blk.rest, e.eps_prev, dt],
+                params, rest = self._params(e, state_in, dt)
+                wp.launch(k.forces, dim=blk.count, inputs=[e.xs, v, params, rest, e.eps_prev, dt],
                           outputs=[e.g], device=dev)
                 wp.launch(k.scatter, dim=blk.count, inputs=[e.g, v, s.fixed], outputs=[self.residual], device=dev)
             if contacts is not None:

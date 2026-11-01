@@ -161,7 +161,7 @@ class DiSMechSolver(SolverBase):
 
     def _record(self, tape: wp.Tape, state_in: State, state_out: State, dt: float) -> None:
         s_in, s_out = state_in.dismech, state_out.dismech
-        names = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", *(e.stored for e in self.elements))
+        names = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q", *(e.stored for e in self.elements))
         outputs = [getattr(s_out, k) for k in names]
         if not any(a.requires_grad for a in outputs):
             return
@@ -191,8 +191,8 @@ class DiSMechSolver(SolverBase):
         self.update_proxies(state_out)
 
     def _carry(self, prev_nodes: wp.array, p, nodes: wp.array, s) -> None:
-        """``s``'s edge frames, reference twists and stored strains as a step from ``p`` leaves them (each a state's
-        ``dismech``, or the adjoint's stand-in; ``nodes`` its ``q``'s positions)."""
+        """``s``'s edge frames, reference twists, stored strains and Dahl stresses as a step from ``p`` leaves them
+        (each a state's ``dismech``, or the adjoint's stand-in; ``nodes`` its ``q``'s positions)."""
         d, tr, dev = self.der, self.triplets, self.device
         wp.launch(advance_frames_kernel, dim=d.edge_length.shape[0], inputs=[prev_nodes, nodes,
                   d.edge_node0, d.edge_node1, p.edge_d1_q], outputs=[s.edge_d1_q], device=dev)
@@ -200,6 +200,7 @@ class DiSMechSolver(SolverBase):
                   outputs=[s.triplet_ref_twist_q], device=dev)
         for e in self.elements:
             e.store(s)
+        tr.carry(p, s)
 
     def restart(self, state: State, prev: State) -> None:
         """Start the next step from ``state``, its DOFs set (to data, say) and the rest of its state as a step from

@@ -2,15 +2,18 @@
 ``example_cable_bundle_hysteresis``): the same bundle, stiffness, obstacles and timing. The capsules sweep across in
 1 s, hold for 1 s and are taken away.
 
-Newton's example adds Dahl friction, a phenomenological bending hysteresis inside each cable; this one has none
-(Newton's ``--no-dahl``): what holds the bend is Coulomb friction (mu 1) between the cables and on the ground.
+Each cable has Newton's Dahl friction, a bending and twist hysteresis inside the cable (``eps_max`` 2 rad, ``tau``
+0.1 rad: ``add_rod``'s ``dahl_eps_max``, ``dahl_tau``), and Coulomb friction (mu 1) between the cables and on the
+ground. ``--no-dahl``: friction alone holds the bend.
 
 Shows: kinematic bodies moved by the example, their pose and velocity written into the state every substep
-(:class:`Obstacles`): the solver sweeps a shape over the step with its velocity. Newton's test: after the release the
-cables keep their length (within 20%) and spring back (end-to-end distance over arc length above 0.9).
+(:class:`Obstacles`): the solver sweeps a shape over the step with its velocity. Newton's tests: after the release the
+cables keep their length (within 20%); with Dahl they keep a bend (end-to-end distance over arc length between 0.5 and
+0.9), without it they spring back (above 0.9).
 
     uv run examples/newton/cable_bundle_hysteresis.py
     uv run examples/newton/cable_bundle_hysteresis.py --viewer null --test
+    uv run examples/newton/cable_bundle_hysteresis.py --no-dahl
 """
 
 import sys
@@ -78,13 +81,16 @@ class Example(CableExample):
     num_cables, num_elements, length, radius = 7, 40, 4.0, 0.02
 
     def __init__(self, viewer, args=None):
+        self.dahl = not getattr(args, "no_dahl", False)
+        dahl = dict(dahl_eps_max=getattr(args, "eps_max", 2.0), dahl_tau=getattr(args, "tau", 0.1)) if self.dahl else {}
         builder = newton.ModelBuilder()
         offsets = NewtonExample.bundle_start_offsets_yz(None, self.num_cables, self.radius, 1.1)
         self.rods = []
         for dy, dz in offsets:
             rod = newton.Rod.create_straight(start=wp.vec3(-0.5, dy, 0.3 + dz), direction=wp.vec3(1.0, 0.0, 0.0),
                                              length=self.length, segment_count=self.num_elements, radius=self.radius)
-            self.rods.append(DiSMechSolver.add_rod(builder, rod, bend_stiffness=1.0e2, bend_damping=5.0))
+            self.rods.append(DiSMechSolver.add_rod(builder, rod, bend_stiffness=1.0e2, bend_damping=5.0,
+                                                     **dahl))
         obstacles, x0 = [], []
         radius, height = 0.05, 0.8
         for i, x in enumerate(np.linspace(0.5, 2.5, 4)):
@@ -118,11 +124,17 @@ class Example(CableExample):
             return
         ratio, straight = self.shape()
         assert 0.8 < ratio.min() and ratio.max() < 1.2, f"cables changed length: {ratio.round(3)}"
-        assert straight.min() > 0.9, f"cables did not spring back: {straight.round(3)}"
+        if self.dahl:
+            assert 0.5 < straight.min() and straight.max() < 0.9, f"cables lost their bend: {straight.round(3)}"
+        else:
+            assert straight.min() > 0.9, f"cables did not spring back: {straight.round(3)}"
 
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--no-dahl", action="store_true", help="no Dahl hysteresis: friction alone")
+    parser.add_argument("--eps-max", type=float, default=2.0, help="Dahl's largest plastic strain [rad]")
+    parser.add_argument("--tau", type=float, default=0.1, help="Dahl's memory length [rad]")
     parser.set_defaults(num_frames=int(3.0 * CableExample.fps))
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

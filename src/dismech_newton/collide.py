@@ -206,7 +206,10 @@ def _bodies(model: Model, device) -> Bodies:
     props = getattr(model, "_shape_mesh_properties", None)
     b.kind, b.scale, b.source = model.shape_type, model.shape_scale, model.shape_source_ptr
     b.xform, b.body = model.shape_transform, model.shape_body
-    b.margin, b.mu, b.radius = model.shape_margin, model.shape_material_mu, model.shape_collision_radius
+    b.margin, b.mu = model.shape_margin, model.shape_material_mu
+    # the cull sphere about the shape's origin; Newton's mesh radius is about its AABB's centre, so meshes cull by BVH
+    mesh = (kind == int(GeoType.MESH)) | (kind == int(GeoType.CONVEX_MESH))
+    b.radius = wp.array(np.where(mesh, 1.0e30, model.shape_collision_radius.numpy()), dtype=float, device=device)
     b.props = props if props is not None else wp.zeros(len(kind), dtype=wp.int32, device=device)
     b.shapes = wp.array(np.flatnonzero(on), dtype=wp.int32, device=device)
     b.body_q = model.body_q if model.body_count else wp.zeros(1, dtype=wp.transform, device=device)

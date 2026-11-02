@@ -40,6 +40,12 @@ viewer = [
     "matplotlib>=3.8",
     "viser>=1.1.1",
 ]
+mujoco = [
+    "mujoco~=3.12.0",
+    "mujoco-warp~=3.12.0",
+    "trimesh>=4.6.8",  # robot meshes (URDF)
+    "pycollada>=0.9",
+]
 splat = [
     "torch>=2.9",
     "gswarp>=1.1",

@@ -17,7 +17,7 @@ from newton import GeoType, Model, ShapeFlags, State
 from newton._src.geometry import kernels as G  # its shape SDFs; triangle_...: exact zeros off the closest feature
 
 from .builder import _P
-from .contact import Slots, clear, contact_point, emit, pair_fixed
+from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
 from .state import node
 
 SLOTS = 8  # contacts per feature (node or edge) on rods
@@ -27,6 +27,7 @@ EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod
 OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
 PARALLEL = 1.0e-3  # edges with sin^2 of their angle below this: no edge-edge pair (their nodes' pairs hold it, IPC)
 BISECT = 20  # bisections for a rod edge's closest point to a shape
+FLAT = 0.015  # 1 - cos 10 deg: normals along an edge within this of its closest point's are its face's (a line contact)
 
 
 @wp.struct
@@ -148,7 +149,7 @@ class Offset:
         self.mesh = mesh = _mesh(model, dev)
         self.fixed, self.self_contact = fixed, int(self_contact)
         self.num_nodes, self.num_edges, self.num_faces = model.particle_count, mesh.edges.shape[0], mesh.faces.shape[0]
-        self.shape_key0 = self.num_nodes + self.num_edges + self.num_faces  # shape k's contact key: shape_key0 + k
+        self.shape_key0 = self.num_nodes + self.num_edges + self.num_faces  # shape k's keys: shape_key0 + 2 k + side
         self.num_rod_edges = model.dismech.edge_node0.shape[0]
         self.pad = 2.0 * float(mesh.radius.numpy().max()) * REACH
         e, x = mesh.edges.numpy(), model.particle_q.numpy()
@@ -195,6 +196,12 @@ class Offset:
         self.limit.fill_(self.cap)
         wp.launch(_offset_kernel, dim=self.num_nodes + self.num_edges,
                   inputs=[self._bvh.id, faces, self._lo, self._hi, sc], device=dev)
+
+    def reactions(self, q: wp.array, s: Slots, arm: Arm, eps: float, body_f: wp.array) -> None:
+        """Add to ``body_f`` each shape pair's force at ``q`` on its body (equal and opposite to the nodes'), with its
+        torque about the body's centre of mass at the step's end: world frame, Newton's ``body_f`` layout."""
+        wp.launch(_reaction_kernel, dim=s.active.shape[0], inputs=[q, s, arm, eps, self.shape_key0, self.bodies, body_f],
+                  device=self.fixed.device)
 
 
 @wp.struct
@@ -310,6 +317,22 @@ def _anchor(b: Bodies, k: int, x: wp.vec3):
     return x + dx, dx
 
 
+@wp.kernel
+def _reaction_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int, b: Bodies,
+                     body_f: wp.array[wp.spatial_vector]):
+    i = wp.tid()
+    if s.active[i] == 0 or s.key[i] < key0:
+        return
+    j = b.body[shape_of(s.key[i], key0)]
+    if j < 0:
+        return
+    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    com = wp.transform_point(b.body_q[j], b.body_com[j])
+    if b.body_qd.shape[0] > 0:
+        com += b.h * wp.spatial_top(b.body_qd[j])
+    wp.atomic_add(body_f, j, wp.spatial_vector(g, wp.cross(s.anchor[i] - com, g)))
+
+
 @wp.func
 def _ahead(x: wp.vec3, a: wp.vec3, b: wp.vec3) -> float:
     """``(x - a) . (b - a)``: positive iff ``x`` lies past ``a`` toward ``b``."""
@@ -330,16 +353,53 @@ def _in_node_region(q: wp.array[float], m: Mesh, v: int, x: wp.vec3, tol: float 
 @wp.func
 def _edge_holds(q: wp.array[float], m: Mesh, b: Bodies, k: int, X: wp.transform, i: int, n: wp.vec3, far: float) -> bool:
     """Rod node ``i``'s pair with shape ``k`` (normal ``n`` at ``i``) is a rod edge's: the shape's point lies past ``i``
-    toward a neighbour, and that edge's closest point to the shape is inside it (:func:`_edge_contacts`'s test), so
-    the edge holds the pair. Else the node does, a local minimum along its rod or not."""
+    toward a neighbour, and that edge's contact (:func:`_edge_scan`, as :func:`_edge_contacts` finds it) is inside it
+    and does not reach ``i``. Else the node does, a local minimum along its rod or not."""
     xv = node(q, i)
     for a in range(m.adj_ptr[i], m.adj_ptr[i + 1]):
         xn = node(q, m.adj[a])
         if _ahead(xv - n, xv, xn) > 0.0:
-            d1, n1 = _shape_gap(b, k, X, xn, far + wp.length(xn - xv))
-            if _ahead(xn - n1, xn, xv) > 0.0:
+            r = _edge_scan(b, k, X, xv, xn, far + wp.length(xn - xv), 2 * BISECT + 1)  # (its far end unused)
+            if r[1] > OPEN and r[0] < 1.0 - OPEN:
                 return True
     return False
+
+
+@wp.func
+def _edge_scan(b: Bodies, k: int, X: wp.transform, xa: wp.vec3, xb: wp.vec3, far: float,
+               passes: int = 3 * BISECT + 1) -> wp.vec3:
+    """The edge ``xa xb``'s closest point ``t`` to shape ``k`` (its gap's slope changes sign once on a convex shape; an
+    end's within ``2^-BISECT``), and how far either way from it the shape's normal stays ``t``'s: lying along a face,
+    the edge touches it on that segment (on a curved surface, ``t`` alone). One gap per pass, so one inlined copy;
+    ``2 BISECT + 1`` passes leave the far end at ``t``."""
+    t0 = float(0.0)
+    t1 = float(1.0)
+    t = float(0.0)
+    lo = float(0.0)
+    nt = wp.vec3(0.0)
+    for it in range(passes):
+        u = wp.where(it == BISECT, t, 0.5 * (t0 + t1))
+        d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, u), far)
+        if it < BISECT:
+            if wp.dot(n, xb - xa) < 0.0:
+                t0 = u
+            else:
+                t1 = u
+            t = 0.5 * (t0 + t1)
+        elif it == BISECT:  # then from t toward 0, toward 1: t0 on the face, t1 off it
+            nt = n
+            t0 = t
+            t1 = 0.0
+        else:
+            if wp.dot(n, nt) >= 1.0 - FLAT:
+                t0 = u
+            else:
+                t1 = u
+            if it == 2 * BISECT:
+                lo = t0
+                t0 = t
+                t1 = 1.0
+    return wp.vec3(t, lo, t0)
 
 
 @wp.func
@@ -489,10 +549,12 @@ def _keep_pair(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, th: f
 
 
 @wp.func
-def _keep_shape(sc: Scene, base: int, k: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3, th: float):
-    """:func:`_keep` against shape ``k``, at its world point ``x`` (the step's start) with the normal ``n``."""
+def _keep_shape(sc: Scene, base: int, k: int, side: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3,
+                th: float):
+    """:func:`_keep` against shape ``k``, at its world point ``x`` (the step's start) with the normal ``n``; ``side``:
+    which end of a rod edge's line contact (0 for a single point)."""
     xb, db = _anchor(sc.b, k, x)
-    key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + k
+    key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + 2 * k + side
     _keep(sc, base, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]))
 
 
@@ -537,24 +599,20 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
         if wp.length(c - wp.lerp(xa, xb, t)) > b.radius[k] + reach:
             continue
         far = reach + wp.length(xb - xa)  # a mesh's query radius
-        d, n = _shape_gap(b, k, X, xa, far)
-        d1, n1 = _shape_gap(b, k, X, xb, far)
-        if _ahead(xa - n, xa, xb) <= 0.0 or _ahead(xb - n1, xb, xa) <= 0.0:
-            continue  # an end is the closest: its node's pair
-        t0 = float(0.0)
-        t1 = float(1.0)
-        for it in range(BISECT):  # the gap's slope along the edge changes sign once on a convex shape
-            d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, 0.5 * (t0 + t1)), far)
-            if wp.dot(n, xb - xa) < 0.0:
-                t0 = 0.5 * (t0 + t1)
-            else:
-                t1 = 0.5 * (t0 + t1)
-        t = 0.5 * (t0 + t1)
-        d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, t), far)
-        if d <= reach:
-            _keep_shape(
-                sc, base, k, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - t, t, 0.0, 0.0), wp.lerp(xa, xb, t) - d * n, n, th
-            )
+        # The closest point; lying along a face, the edge touches it on a segment, and the segment's other end too, so
+        # it holds when the edge tilts either way (else the frozen point is the wrong end and the other sinks in). A
+        # point at a node is the node's pair.
+        r = _edge_scan(b, k, X, xa, xb, far)
+        other = wp.where(r[0] - r[1] > r[2] - r[0], r[1], r[2])
+        ends = wp.where(wp.abs(other - r[0]) > OPEN, 2, 1)  # (a runtime bound: one inlined gap)
+        for side in range(ends):
+            u = wp.where(side == 0, r[0], other)
+            if u <= OPEN or u >= 1.0 - OPEN:
+                continue
+            x = wp.lerp(xa, xb, u)
+            d, n = _shape_gap(b, k, X, x, far)
+            if d <= reach:
+                _keep_shape(sc, base, k, side, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n, n, th)
     query = wp.bvh_query_aabb(bvh, lo, hi)
     f = int(0)
     while wp.bvh_query_next(query, f):
@@ -627,7 +685,7 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
             continue
         d, n = _shape_gap(b, k, X, xv, reach)
         if d <= reach and not (on_rod and _edge_holds(q, m, b, k, X, i, n, reach)):
-            _keep_shape(sc, base, k, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), xv - d * n, n, th)
+            _keep_shape(sc, base, k, 0, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), xv - d * n, n, th)
     if m.faces.shape[0] == 0:
         return
     query = wp.bvh_query_aabb(face_bvh, xv, xv)

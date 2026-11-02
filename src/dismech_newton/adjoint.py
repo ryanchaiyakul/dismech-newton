@@ -31,6 +31,7 @@ from .contact import (
     contact_hessian,
     contact_point,
     flexibility,
+    shape_of,
 )
 from .linear import _convert, sparse_solver
 from .state import (
@@ -142,7 +143,7 @@ class StepAdjoint:
         x, r, z, p, hp = self._cg
         wp.copy(self._h, A.vals)
         wp.launch(_barrier_assemble_kernel, dim=c.active.shape[0],
-                  inputs=[self.q_star, c, eps, s.fixed, A.indptr, A.indices, A.vals], device=dev)
+                  inputs=[self.q_star, c, s.contact.arm, eps, s.fixed, A.indptr, A.indices, A.vals], device=dev)
         wp.launch(_convert, dim=n, inputs=[self._rhs], outputs=[r], device=dev)
         x.zero_()
         self.linear.solve(r, z)
@@ -354,11 +355,12 @@ def _contact_residual_kernel(
     c0 = wp.vec3(0.0)
     if c.key[i] >= key0:
         moved = c.c0[i] - contact_point(q_in0, pair, w, c.anchor[i])
-        X = _shape_pose(b, c.key[i] - key0)
-        if pair[1] >= 0:
-            w = _edge_shape_weights(q_in, pair, w, b, c.key[i] - key0, X)
+        sk = shape_of(c.key[i], key0)
+        X = _shape_pose(b, sk)
+        if pair[1] >= 0 and c.key[i] == key0 + 2 * sk:  # (a line contact's other end: held)
+            w = _edge_shape_weights(q_in, pair, w, b, sk, X)
         x = contact_point(q_in, pair, w, wp.vec3(0.0))
-        dist, n = _shape_gap(b, c.key[i] - key0, X, x, 1.0e6)
+        dist, n = _shape_gap(b, sk, X, x, 1.0e6)
         anchor = x - dist * n + moved
         c0 = dist * n
         o = wp.dot(n, x - anchor) - LIFT * th

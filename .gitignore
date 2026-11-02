@@ -15,3 +15,7 @@ save
 
 # Cached example results (examples/utils/common.py: cached)
 .cache/
+
+# Experiment worktrees (CLAUDE.md)
+.claude/worktrees/
+CLAUDE.md

@@ -15,7 +15,8 @@ vec12f = wp.types.vector(12, float)
 
 NAMESPACE = "dismech"
 _P = f"{NAMESPACE}:"
-ROD_GROUP = -0x5DE7  # every colliding rod capsule's collision group: a negative group collides with all but itself
+ROD_GROUP = 0  # every colliding rod capsule's collision group: Newton pairs group 0 with nothing (the solver's own
+# contact finds the rod's), so no rigid solver or coupler collides with the capsules
 
 # (frequency, name, dtype, references)
 ATTRIBUTES = [
@@ -129,9 +130,9 @@ def add_rod(
     whatever way the segments run. Twist and bending at a junction are pairwise with that first segment.
 
     Stiffness defaults to section rigidity / rest length, else stretch 1e5, bend 0, twist = bend. ``proxies``: a
-    kinematic capsule per segment, posed every step (rendering, and what Newton's pipeline sees). ``collide``: the
+    kinematic capsule per segment, posed every step (rendering). ``collide``: the
     rod takes part in the solver's contacts (:mod:`.collide`), its friction ``cfg.mu`` (without ``cfg``, 0.3); its
-    capsules are in :data:`ROD_GROUP`, so a pipeline never pairs two of them. ``dahl_eps_max``, ``dahl_tau``
+    capsules are in :data:`ROD_GROUP`, so no Newton pipeline pairs them. ``dahl_eps_max``, ``dahl_tau``
     (both > 0): Newton's Dahl hysteresis on bending and twist (:func:`.rod.dahl_advance`).
     """
     points, edges, frames = rod._normalize_and_validate_geometry()

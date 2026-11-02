@@ -539,7 +539,11 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
         _drop(sc, s.pair[far], wp.dot(s.normal[far], s.c0[far]))
         clear(s, slot)
     s.key[slot] = key
-    emit(s, slot, sc.q, pair, w, n, xb, db, th, mu)
+    radius = wp.vec4(0.0)
+    for k in range(4):
+        if pair[k] >= 0 and m.rod[pair[k]] >= 0:
+            radius[k] = m.radius[pair[k]]
+    emit(s, slot, sc.q, pair, w, n, xb, db, th, mu, radius)
 
 
 @wp.func

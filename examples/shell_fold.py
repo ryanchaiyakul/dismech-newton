@@ -28,7 +28,7 @@ import warp as wp
 from cantilever import GRAVITY
 from utils.common import THEORY, CableExample, default_frames, grid, inset, inset_scale
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 def eyelet(n: int = 400):
@@ -101,14 +101,14 @@ class Example(CableExample):
         self.nx, self.ny = int(round(self.length / self.spacing)) + 1, int(round(self.width / self.spacing)) + 1
         v, f = grid(self.nx, self.ny, self.length, self.width)
         v[:, 2] += self.radius  # on the table
-        DiSMechSolver.add_cloth_mesh(builder, vertices=v.tolist(), indices=f.ravel().tolist(), density=self.density,
+        SolverDiSMech.add_cloth_mesh(builder, vertices=v.tolist(), indices=f.ravel().tolist(), density=self.density,
                                      tri_ke=self.tri_ke, tri_ka=0.0, edge_ke=0.0, bend_stiffness=self.bend_stiffness,
                                      damping=self.damping, particle_radius=self.radius)
         model = builder.finalize()
         model.particle_mu = self.mu
         # A factorised once a step (refactoring at 5 iterations: 4/6 runs pass, ~40% slower); 20 iterations: at 10
         # the landing creases where the layers meet (steps end on the budget), at 20 it is smooth, as fast (gated)
-        self.start(viewer, model, DiSMechSolver(model, refactor=False, iterations=20))
+        self.start(viewer, model, SolverDiSMech(model, refactor=False, iterations=20))
         if self.drag:
             self.drives = (AirDrag(model, self.nx, self.ny, self.density, self.drag),)
 

@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 def usd_mesh(path, prim, **kwargs):
@@ -52,7 +52,7 @@ class Example(CableExample):
         up = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.pi / 2.0)  # the assets are y-up
 
         builder = newton.ModelBuilder()
-        DiSMechSolver.add_cloth_mesh(
+        SolverDiSMech.add_cloth_mesh(
             builder, vertices=mesh.vertices.tolist(), indices=faces.ravel(), rot=up, density=0.3,
             particle_radius=2.5e-3, aniso=(1.0e2, 1.0e2, 1.0e1), bend_aniso=3.0 * np.array([2.0e-5, 1.0e-5, 5.0e-6]),
             uv=panel, damping=0.0,
@@ -64,7 +64,7 @@ class Example(CableExample):
         model = builder.finalize()
         model.particle_mu = 0.2
         model.shape_material_mu.fill_(0.2)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         edges = np.unique(np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), 1), axis=0)
         self.crossings = Crossings(edges, faces, model.device)
         n = model.particle_count  # and the cloth's edges through the avatar: its triangles after the cloth's nodes

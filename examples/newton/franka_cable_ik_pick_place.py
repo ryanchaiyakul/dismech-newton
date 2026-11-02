@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 TCP = 0.107  # hand origin to the point between the fingertips [m]
 
@@ -46,7 +46,8 @@ TCP = 0.107  # hand origin to the point between the fingertips [m]
 def add_franka(builder: newton.ModelBuilder, base_z: float) -> None:
     builder.add_urdf(newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
                      xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()), floating=False,
-                     enable_self_collisions=False, parse_visuals_as_colliders=False)
+                     enable_self_collisions=False, parse_visuals_as_colliders=False,
+                     joint_damping_mode="drive")  # Newton 1.6's mapping (the URDF damping drives the joints)
     n = len(FRANKA_Q)
     builder.joint_q[-n:] = FRANKA_Q
     builder.joint_target_q[-n:] = FRANKA_Q
@@ -78,7 +79,7 @@ class Example(CableExample):
         points = np.column_stack((x, np.full(n, float(CABLE_CENTER[1])), np.full(n, float(CABLE_CENTER[2]))))
         cfg = newton.ModelBuilder.ShapeConfig(density=100.0, mu=1.0)
         r = self.segments / 19  # Newton's per-joint values are for its 19 segments: the same cable (EA, EI) at others
-        DiSMechSolver.add_rod(builder, newton.Rod(points, radius=self.radius), cfg=cfg, stretch_stiffness=1.0e2 * r,
+        SolverDiSMech.add_rod(builder, rod=newton.Rod(points, radius=self.radius), cfg=cfg, stretch_stiffness=1.0e2 * r,
                               stretch_damping=1.0e-1 * r, bend_stiffness=4.0e-4 * r, bend_damping=8.0e-7 * r,
                               collide=True)
         builder.add_ground_plane(height=self.surface, cfg=newton.ModelBuilder.ShapeConfig(mu=1.0))
@@ -113,7 +114,7 @@ class Example(CableExample):
         gripper = [b for b in franka if "hand" in model.body_label[b] or "finger" in model.body_label[b]]
         return SolverCoupledProxy(model, entries=[
             SolverCoupled.Entry(name="mjc", solver=mujoco, bodies=franka, joints=joints),
-            SolverCoupled.Entry(name="soft", solver=DiSMechSolver, particles=list(range(model.particle_count)),
+            SolverCoupled.Entry(name="soft", solver=SolverDiSMech, particles=list(range(model.particle_count)),
                                 bodies=capsules, joints=[j for j in range(model.joint_count) if j not in joints]),
         ], coupling=SolverCoupledProxy.Config(proxies=[
             SolverCoupledProxy.Proxy(source="mjc", destination="soft", bodies=gripper)]))

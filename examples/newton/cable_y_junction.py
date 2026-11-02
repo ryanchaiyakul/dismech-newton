@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 class Example(CableExample):
@@ -47,16 +47,16 @@ class Example(CableExample):
         builder = newton.ModelBuilder()
         builder.rigid_gap = 0.002
         builder.add_ground_plane()
-        self.bodies = DiSMechSolver.add_rod(
-            builder, newton.Rod(np.array(points), edges=edges, radius=self.radius),
+        self.bodies, _ = SolverDiSMech.add_rod(
+            builder, rod=newton.Rod(np.array(points), edges=edges, radius=self.radius),
             stretch_stiffness=self.stretch_stiffness, bend_stiffness=self.bend_stiffness,
             bend_damping=self.bend_damping, label="y_graph",
         )
         self.pinned = self.bodies[n - 1]  # the first branch's tip segment
-        DiSMechSolver.fix_segment(builder, self.pinned)
+        SolverDiSMech.fix_segment(builder, self.pinned)
         model = builder.finalize()
         model.shape_material_mu.fill_(1.0)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         self.x0 = self.state_0.particle_q.numpy().copy()
         if hasattr(viewer, "set_camera"):
             viewer.set_camera(pos=wp.vec3(2.10, 0.0, self.z0 - 0.15), pitch=0.0, yaw=-180.0)

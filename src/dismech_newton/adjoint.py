@@ -31,7 +31,11 @@ from .contact import (
     contact_hessian,
     contact_point,
     flexibility,
+    node_map,
+    roll_point,
     shape_of,
+    slot_map,
+    slot_roll,
 )
 from .linear import _convert, sparse_solver
 from .state import (
@@ -52,7 +56,7 @@ CG_ITERATIONS = 100
 
 
 class StepAdjoint:
-    """The adjoint of :meth:`DiSMechSolver.step`, built on its first :meth:`~DiSMechSolver.vjp`."""
+    """The adjoint of :meth:`SolverDiSMech.step`, built on its first :meth:`~SolverDiSMech.vjp`."""
 
     def __init__(self, solver):
         s, dev = solver, solver.device
@@ -295,22 +299,27 @@ def _spmv_kernel(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], vals: 
 @wp.kernel
 def _contact_matvec_kernel(q: wp.array[float], c: Slots, eps: float, fixed: wp.array[wp.int32],
                            x: wp.array[wp.float64], y: wp.array[wp.float64]):
-    """``y += C^T H_c C x`` on the free DOFs, :func:`~.contact.contact_hessian` at ``q``."""
+    """``y += J^T H_c J x`` on the free DOFs (``J``: :func:`~.contact.node_map` per node),
+    :func:`~.contact.contact_hessian` at ``q``."""
     i = wp.tid()
     pair = c.pair[i]
     w = c.w[i]
     v = wp.vec3d()
     for j in range(4):
         if pair[j] >= 0:
+            xj = wp.vec3d()
             for a in range(3):
                 if fixed[3 * pair[j] + a] == 0:
-                    v[a] += wp.float64(w[j]) * x[3 * pair[j] + a]
-    hv = wp.mat33d(contact_hessian(contact_point(q, pair, w, c.anchor[i]), c, i, eps)) * v
+                    xj[a] = x[3 * pair[j] + a]
+            v += wp.mat33d(slot_map(c, i, j)) * xj
+    cq = contact_point(q, pair, w, c.anchor[i]) + slot_roll(q, c, i)
+    hv = wp.mat33d(contact_hessian(cq, c, i, eps)) * v
     for j in range(4):
         if pair[j] >= 0:
+            yj = wp.transpose(wp.mat33d(slot_map(c, i, j))) * hv
             for a in range(3):
                 if fixed[3 * pair[j] + a] == 0:
-                    wp.atomic_add(y, 3 * pair[j] + a, wp.float64(w[j]) * hv[a])
+                    wp.atomic_add(y, 3 * pair[j] + a, yj[a])
 
 
 @wp.kernel
@@ -374,10 +383,13 @@ def _contact_residual_kernel(
     k = c.stiffness[i] * wp.max(flexibility(pair, c.w[i], mass0, fixed), 1.0e-30) / wp.max(
         flexibility(pair, w, mass, fixed), 1.0e-30)
     rho = -barrier(wp.dot(n, c0), th, k, c.lam[i])[1]
-    g, h, fr = contact_force(contact_point(q, pair, w, anchor), n, c0, th, k, c.lam[i], c.mu[i] * rho, eps)
+    roll, ta, tb = c.roll[i], c.ta[i], c.tb[i]  # the rods' surface turn, as the step froze it
+    c0 = c0 + roll_point(q_in, pair, w, roll, n, ta, tb)
+    cq = contact_point(q, pair, w, anchor) + roll_point(q, pair, w, roll, n, ta, tb)
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps)
     for j in range(4):
         if pair[j] >= 0:
-            scatter_node(r, fixed, pair[j], w[j] * g)
+            scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)
 
 
 

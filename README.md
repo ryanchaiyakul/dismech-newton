@@ -5,11 +5,17 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![CUDA 13](https://img.shields.io/badge/CUDA-13-76B900)
 
-Discrete elastic rods and shells for [NVIDIA Newton](https://github.com/newton-physics/newton).
+Implicit discrete elastic rods and shells inpsired by [Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/) for [NVIDIA Newton](https://github.com/newton-physics/newton).
 
-**`DiSMechSolver`**: implicit discrete rods and shells inspired by [Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/).
+## Newton Examples
 
-## Examples
+> TODO: put some pngs of these examples like newton
+
+## Theory (Not sure best title but only like compared against theory)
+
+top is rods only cantilever, knot, twist
+
+bottom is shell cantilver, contact eyelet not sure last
 
 <table>
   <tr>

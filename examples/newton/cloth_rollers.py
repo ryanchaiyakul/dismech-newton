@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample, Drive, frame_box, smoothstep
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 class Spin:
@@ -64,13 +64,14 @@ class Example(CableExample):
         end_x = x2 - r2 - 1.2 * 0.4  # Newton's: its end row 0.48 off roller 2
         verts, faces, _, ext = rolled_cloth_mesh(length=self.length, nu=self.rows, thickness=self.thickness,
                                                  target_x=end_x - x1, target_y=z1 - z2, extension_segments=20)
-        builder = newton.ModelBuilder(gravity=0.0)
-        ids = DiSMechSolver.add_cloth_mesh(
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        ids = SolverDiSMech.add_cloth_mesh(
             builder, pos=wp.vec3(x1, self.y0, z1), rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * np.pi),
             vertices=[wp.vec3(v) for v in verts], indices=faces.ravel(), particle_radius=self.radius, **self.material,
         )
+        self.seam = ids[:self.nv]  # the first row (the roll's core), turned with roller 1
         self.end = ids[(self.rows + ext - 1) * self.nv:]  # the last row, carried round roller 2
-        for k in self.end:
+        for k in [*self.seam, *self.end]:
             builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
         axis_y = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * np.pi)  # a cylinder's axis is its z
         for x, z, r in self.roller:
@@ -79,11 +80,11 @@ class Example(CableExample):
         model = builder.finalize()
         model.particle_mu = self.mu
         model.shape_material_mu.fill_(self.mu)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model, refactor=True))
         self.rest = model.particle_q.numpy().astype(np.float64)
         speed = self.rate * 9.9  # Newton's surface speed: roller 1's turn rate times its radius
         self.spin = Spin(model, np.array([speed / 9.9, speed / r2]))
-        self.carry = Drive(model, [3 * k + c for k in self.end for c in range(3)])
+        self.carry = Drive(model, [3 * k + c for k in [*self.seam, *self.end] for c in range(3)])
         self.drives = (self.spin, self.carry)
         self.crossings = Crossings(
             np.unique(np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), 1), axis=0),
@@ -92,12 +93,14 @@ class Example(CableExample):
         frame_box(viewer, -45.0, 60.0, -25.0, 25.0, y=self.y0 - 60.0)
 
     def carried(self, t: float) -> np.ndarray:
-        """The end row's displacement from rest: turned about roller 2's axis (+y) with it."""
-        (_, _, _), (x2, z2, r2) = self.roller
-        a = self.spin.rate[1] * self.turned(t)
-        x, z = self.rest[self.end, 0] - x2, self.rest[self.end, 2] - z2
-        c, s = np.cos(a), np.sin(a)
-        return np.column_stack([c * x + s * z - x, np.zeros_like(x), -s * x + c * z - z]).ravel()
+        """The seam's and end row's displacements from rest: turned about their rollers' axes (+y) with them."""
+        out = []
+        for rows, (cx, cz, _), rate in zip((self.seam, self.end), self.roller, self.spin.rate):
+            a = rate * self.turned(t)
+            x, z = self.rest[rows, 0] - cx, self.rest[rows, 2] - cz
+            c, s = np.cos(a), np.sin(a)
+            out.append(np.column_stack([c * x + s * z - x, np.zeros_like(x), -s * x + c * z - z]).ravel())
+        return np.concatenate(out)
 
     def speed(self, t: float) -> float:
         """The rollers' speed over full speed: up a smoothstep over ``ramp``, none after ``spin_time``."""

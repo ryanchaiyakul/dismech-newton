@@ -4,7 +4,7 @@ Each splat belongs to one edge and is rigid in that edge's material frame ``(m1,
 proxies take (seams at the nodes are expected). The canonical parameters are constant in time; the skin maps a state
 to world-space means and covariances in a kernel that records on a ``wp.Tape``. It reads the flat ``q`` (node
 positions and twists) and ``edge_d1_q``, both seeds of the step adjoint, so a loss on the splats backpropagates through
-:meth:`DiSMechSolver.step` with no solver changes.
+:meth:`SolverDiSMech.step` with no solver changes.
 
 Covariances are returned as ``cov6 = (xx, xy, xz, yy, yz, zz)`` (``cov3D_precomp`` of the Inria 3DGS rasterizer),
 smooth in the state where quaternions are not.

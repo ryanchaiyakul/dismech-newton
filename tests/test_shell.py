@@ -7,7 +7,7 @@ import pytest
 import warp as wp
 from rollouts import cloth, grid
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import shell as S
 
 
@@ -110,7 +110,7 @@ def test_curved_shell_at_rest_stays(rng):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     cloth(builder, v, f, density=1.0, tri_ke=1.0e4, tri_ka=1.0e4, edge_ke=1.0)
     model = builder.finalize()
-    moved, _ = simulate(model, DiSMechSolver(model), 5, 0.01)
+    moved, _ = simulate(model, SolverDiSMech(model), 5, 0.01)
     assert np.abs(moved.particle_q.numpy() - v).max() < 1.0e-6
 
 
@@ -130,7 +130,7 @@ def test_plate_strip_converges_to_beam_theory(exact):
         for k in np.nonzero(v[:, 0] < 1.5 * dx)[0]:
             builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
         model = builder.finalize()
-        out, _ = simulate(model, DiSMechSolver(model, iterations=10, exact=exact), 200, 0.02)
+        out, _ = simulate(model, SolverDiSMech(model, iterations=10, exact=exact), 200, 0.02)
         tip = out.particle_q.numpy()[v[:, 0] > length - 1.0e-9, 2].mean()
         ratios.append(tip / (-rho * h * 9.81 * (length - dx) ** 4 / (8.0 * D)))
     assert 1.0 < ratios[1] < ratios[0] < 1.2, ratios
@@ -192,7 +192,7 @@ def test_uniaxial_stretch(C, theta):
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
     flatten_state(s1)
-    solver = DiSMechSolver(model, iterations=10)
+    solver = SolverDiSMech(model, iterations=10)
     for _ in range(100):
         s0.particle_f.assign(force)
         solver.step(s0, s1, None, None, 0.05)
@@ -224,7 +224,7 @@ def test_plate_strip_bends_along_its_weave():
         for k in np.nonzero(v[:, 0] < 1.5 * dx)[0]:
             builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
         model = builder.finalize()
-        out, _ = simulate(model, DiSMechSolver(model, iterations=10), 200, 0.02)
+        out, _ = simulate(model, SolverDiSMech(model, iterations=10), 200, 0.02)
         tip = out.particle_q.numpy()[v[:, 0] > length - 1.0e-9, 2].mean()
         T = _voigt_rotation(theta)
         compliance = np.linalg.inv(T.T @ np.diag(Db) @ T)[0, 0]
@@ -249,7 +249,7 @@ def test_woven_sheet_is_frame_invariant(rng):
             builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
         model = builder.finalize()
         model.set_gravity(tuple(R @ g))
-        x = simulate(model, DiSMechSolver(model, iterations=10), 50, 0.01)[0].particle_q.numpy()
+        x = simulate(model, SolverDiSMech(model, iterations=10), 50, 0.01)[0].particle_q.numpy()
         out.append(x @ R)
     sag = np.abs(out[0] - v).max()
     assert sag > 0.02
@@ -267,7 +267,7 @@ def test_shell_lands_on_the_ground():
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
     model = builder.finalize()
     model.particle_mu = 0.5
-    out, _ = simulate(model, DiSMechSolver(model, iterations=10), 240, 1.0 / 240.0)
+    out, _ = simulate(model, SolverDiSMech(model, iterations=10), 240, 1.0 / 240.0)
     x = out.particle_q.numpy()
     assert np.abs(x[:, 2] - 0.004).max() < 2.0e-4
     assert np.abs(x[:, :2] - v[:, :2]).max() < 1.0e-3
@@ -315,7 +315,7 @@ def test_sheet_on_sheet(self_contact):
     upper = cloth(builder, v2, f, density=0.2, tri_ke=1.0e3, tri_ka=1.0e3, edge_ke=1.0e-3, particle_radius=r,
                   damping=1.0e-2)
     model = builder.finalize()
-    solver = DiSMechSolver(model, self_contact=self_contact)
+    solver = SolverDiSMech(model, self_contact=self_contact)
     out, _ = simulate(model, solver, 240, 1.0 / 240.0)
     z = out.particle_q.numpy()[upper, 2]
     if self_contact:
@@ -331,16 +331,16 @@ def test_sheet_over_rod():
     rs, rr = 0.004, 0.01
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     pts = np.column_stack([np.zeros(4), np.linspace(-0.3, 0.3, 4), np.zeros(4)])
-    bodies = DiSMechSolver.add_rod(builder, newton.Rod(pts, radius=rr), stretch_stiffness=1.0e5,
+    bodies, _ = SolverDiSMech.add_rod(builder, rod=newton.Rod(pts, radius=rr), stretch_stiffness=1.0e5,
                                    bend_stiffness=1.0, twist_stiffness=1.0)
     for b in bodies:
-        DiSMechSolver.fix_segment(builder, b)
+        SolverDiSMech.fix_segment(builder, b)
     v, f = grid(7, 7, 0.3, 0.3)
     v += [-0.15 + 0.021, -0.15 + 0.013, 0.03]  # rod between vertex columns
     ids = cloth(builder, v, f, density=0.2, tri_ke=1.0e3, tri_ka=1.0e3, edge_ke=1.0e-4, particle_radius=rs,
                 damping=1.0)  # damped: the swing settles over the rod by the end
     model = builder.finalize()
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     out, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     tris = np.asarray(ids)[f]
     seg = np.column_stack([np.zeros(61), np.linspace(-0.3, 0.3, 61), np.zeros(61)])
@@ -367,15 +367,15 @@ def test_rod_on_rod():
     r = 0.01
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     lower = np.column_stack([np.linspace(-0.3, 0.3, 4), np.zeros(4), np.zeros(4)])
-    for b in DiSMechSolver.add_rod(builder, newton.Rod(lower, radius=r), stretch_stiffness=1.0e5, bend_stiffness=1.0,
-                                   twist_stiffness=1.0, collide=True):
-        DiSMechSolver.fix_segment(builder, b)
+    for b in SolverDiSMech.add_rod(builder, rod=newton.Rod(lower, radius=r), stretch_stiffness=1.0e5, bend_stiffness=1.0,
+                                   twist_stiffness=1.0, collide=True)[0]:
+        SolverDiSMech.fix_segment(builder, b)
     s = np.linspace(-0.3, 0.3, 7)
     upper = np.column_stack([0.013 + s * np.sin(0.6), s * np.cos(0.6), np.full(7, 0.05)])
-    DiSMechSolver.add_rod(builder, newton.Rod(upper, radius=r), stretch_stiffness=1.0e4, bend_stiffness=0.05,
+    SolverDiSMech.add_rod(builder, rod=newton.Rod(upper, radius=r), stretch_stiffness=1.0e4, bend_stiffness=0.05,
                           twist_stiffness=0.05, collide=True)
     model = builder.finalize()
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     _, frames = simulate(model, solver, 120, 1.0 / 240.0, every=1)
     gaps = [polyline_gap(x[:4], x[4:]) for x in frames]
     assert overflow(solver) == 0
@@ -395,10 +395,10 @@ def test_rod_on_hammock():
     for k in np.asarray(ids)[border]:
         builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
     pts = np.column_stack([np.linspace(-0.12, 0.12, 13), np.full(13, 0.031), np.full(13, 0.03)])
-    DiSMechSolver.add_rod(builder, newton.Rod(pts, radius=rr), stretch_stiffness=1.0e4, bend_stiffness=1.0e-2,
+    SolverDiSMech.add_rod(builder, rod=newton.Rod(pts, radius=rr), stretch_stiffness=1.0e4, bend_stiffness=1.0e-2,
                           twist_stiffness=1.0e-2)
     model = builder.finalize()
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     out, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     rod = np.arange(len(v), model.particle_count)
     tris = np.asarray(ids)[f]
@@ -457,7 +457,7 @@ def test_sheet_on_shape(shape):
                 damping=1.0e-2)
     model = builder.finalize()
     model.particle_mu = 0.5
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     out, frames = simulate(model, solver, 360, 1.0 / 240.0, every=4)
     gaps = np.array([np.minimum(sdf(x[ids], shape, h, h), x[ids, 2]) for x in frames])  # (frames, vertices)
     k, v = np.unravel_index(gaps.argmin(), gaps.shape)
@@ -479,10 +479,10 @@ def test_rod_on_shape(shape):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     add_shape(builder, shape, h)
     pts = np.column_stack([np.linspace(-0.45, 0.45, 4), np.full(4, 0.013), np.full(4, h + 2 * r)])
-    DiSMechSolver.add_rod(builder, newton.Rod(pts, radius=r), stretch_stiffness=1.0e5, bend_stiffness=10.0,
+    SolverDiSMech.add_rod(builder, rod=newton.Rod(pts, radius=r), stretch_stiffness=1.0e5, bend_stiffness=10.0,
                           twist_stiffness=10.0)
     model = builder.finalize()
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     _, frames = simulate(model, solver, 240, 1.0 / 240.0, every=4)
     s = np.linspace(0.0, 1.0, 31)[:, None]
     gaps = [sdf(np.concatenate([(1 - s) * x[k] + s * x[k + 1] for k in range(3)]), shape, h).min() for x in frames]

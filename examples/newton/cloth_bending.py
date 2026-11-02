@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 class Example(CableExample):
@@ -44,7 +44,7 @@ class Example(CableExample):
         stage = Usd.Stage.Open(newton.examples.get_asset("curvedSurface.usd"))
         mesh = newton.usd.get_mesh(stage.GetPrimAtPath("/root/cloth"))
         builder = newton.ModelBuilder()
-        DiSMechSolver.add_cloth_mesh(
+        SolverDiSMech.add_cloth_mesh(
             builder, pos=wp.vec3(0.0, 0.0, 10.0), rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.pi / 6.0),
             vertices=[wp.vec3(v) for v in mesh.vertices], indices=mesh.indices, particle_radius=self.radius,
             **self.material,
@@ -53,7 +53,7 @@ class Example(CableExample):
         model = builder.finalize()
         model.particle_mu = self.mu
         model.shape_material_mu.fill_(self.mu)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         f = np.asarray(mesh.indices).reshape(-1, 3)
         self.edges = np.unique(np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1), axis=0)
         x0 = model.particle_q.numpy()

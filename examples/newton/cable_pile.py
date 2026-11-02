@@ -1,6 +1,6 @@
 """A hundred wavy cables drop onto the ground and settle into a pile (Newton's ``example_cable_pile``).
 
-Shows: many rods in one model (``add_rod``), ground contact and friction (``DiSMechSolver``).
+Shows: many rods in one model (``add_rod``), ground contact and friction (``SolverDiSMech``).
 
     uv run examples/newton/cable_pile.py
     uv run examples/newton/cable_pile.py --viewer null --test
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 class Example(CableExample):
@@ -41,13 +41,13 @@ class Example(CableExample):
                 x, y = (along, offset + wave) if layer % 2 == 0 else (offset + wave, along)
                 points = np.column_stack((x, y, np.full_like(s, z)))
                 # Each rod: nodes from ``points``, one capsule proxy per segment for contact.
-                self.rods.append(DiSMechSolver.add_rod(
-                    builder, newton.Rod(points, radius=self.radius), stretch_stiffness=5.0e5, bend_stiffness=1.0e2,
+                self.rods.append(SolverDiSMech.add_rod(
+                    builder, rod=newton.Rod(points, radius=self.radius), stretch_stiffness=5.0e5, bend_stiffness=1.0e2,
                     bend_damping=2.0e1,
-                ))
+                )[0])
         model = builder.finalize()
         model.shape_material_mu.fill_(1.0)  # Coulomb mu = 1: the rods' and the ground's
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
 
     def test_final(self):
         z = self.state_0.particle_q.numpy()[:, 2]

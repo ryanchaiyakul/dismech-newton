@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 @wp.func
@@ -89,8 +89,8 @@ class Example(CableExample):
         for dy, dz in offsets:
             rod = newton.Rod.create_straight(start=wp.vec3(-0.5, dy, 0.3 + dz), direction=wp.vec3(1.0, 0.0, 0.0),
                                              length=self.length, segment_count=self.num_elements, radius=self.radius)
-            self.rods.append(DiSMechSolver.add_rod(builder, rod, bend_stiffness=1.0e2, bend_damping=5.0,
-                                                     **dahl))
+            self.rods.append(SolverDiSMech.add_rod(builder, rod=rod, bend_stiffness=1.0e2, bend_damping=5.0,
+                                                     **dahl)[0])
         obstacles, x0 = [], []
         radius, height = 0.05, 0.8
         for i, x in enumerate(np.linspace(0.5, 2.5, 4)):
@@ -103,7 +103,7 @@ class Example(CableExample):
         mu = np.ones(model.shape_count, dtype=np.float32)  # cables and ground: Coulomb mu 1
         mu[np.isin(model.shape_body.numpy(), obstacles)] = 0.0  # Newton's frictionless obstacles (a pair: the mean)
         model.shape_material_mu.assign(mu)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         self.obstacles = Obstacles(self, obstacles, x0)
         self.drives = (self.obstacles,)
         self.rest = self.state_0.particle_q.numpy().reshape(self.num_cables, -1, 3)

@@ -6,7 +6,7 @@ import pytest
 import warp as wp
 from rollouts import ClampedRollout, cloth, grid
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton.state import dof_constants
 
 
@@ -15,7 +15,7 @@ def _free(kind: str):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     if kind == "rod":
         rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.5, segment_count=10, radius=0.01)
-        DiSMechSolver.add_rod(builder, rod, stretch_stiffness=1.0e3, bend_stiffness=0.05, twist_stiffness=0.05)
+        SolverDiSMech.add_rod(builder, rod=rod, stretch_stiffness=1.0e3, bend_stiffness=0.05, twist_stiffness=0.05)
     else:
         v, f = grid(5, 4, 0.3, 0.2)
         cloth(builder, v, f, density=0.5, tri_ke=2.0e3, tri_ka=1.0e3, edge_ke=1.0e-2, damping=0.0)
@@ -34,7 +34,7 @@ def test_free_body_keeps_momentum_and_loses_energy(rng, kind, options):
     sheet on midpoint is left out: it gains energy (1.7x here, more when thrown harder), the midpoint rule's
     nonlinear instability on a membrane."""
     model = _free(kind)
-    solver = DiSMechSolver(model, self_contact=False, **options)
+    solver = SolverDiSMech(model, self_contact=False, **options)
     mass = dof_constants(model)[0].numpy().astype(np.float64)
     nd = 3 * model.particle_count
     s0, s1 = model.state(), model.state()

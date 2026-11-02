@@ -10,7 +10,7 @@ import warp as wp
 from fd import assert_derivative, jacobian
 from utils.common import grid
 
-from dismech_newton import DiSMechSolver, add_cloth_mesh, flatten_state, suspended_tape
+from dismech_newton import SolverDiSMech, add_cloth_mesh, flatten_state, suspended_tape
 from dismech_newton.contact import SMOOTH
 from dismech_newton.state import dof_constants
 
@@ -157,9 +157,9 @@ class Rollout:
             for start, direction, clamped in self._rods():
                 start = np.add(start, self.offset(c, copies))
                 rod = newton.Rod.create_straight(start, direction, 0.5, segment_count=self.segments, radius=RADIUS)
-                bodies = DiSMechSolver.add_rod(builder, rod, cfg=cfg, **self.rod_options)
+                bodies, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=cfg, **self.rod_options)
                 if clamped:
-                    DiSMechSolver.fix_segment(builder, bodies[0])
+                    SolverDiSMech.fix_segment(builder, bodies[0])
         return builder.finalize()
 
     def _matrix(self, key: str, size: int) -> np.ndarray:
@@ -174,7 +174,7 @@ class Rollout:
             X = np.zeros((1, len(self.directions)))
         copies = len(X)
         model = self.model(copies)
-        solver = DiSMechSolver(model, **options)
+        solver = SolverDiSMech(model, **options)
         arrays = self.parameters(model, solver)
         for key, a in arrays.items():
             base = a.numpy()
@@ -366,9 +366,9 @@ class JunctionRollout(ClampedRollout):
         for c in range(copies):
             j = np.add((0.0, 0.0, self.height), self.offset(c, copies))
             points = [j] + [j + d * k * h for d in dirs for k in (1, 2)]
-            bodies = DiSMechSolver.add_rod(builder, newton.Rod(np.array(points), edges=edges, radius=RADIUS),
+            bodies, _ = SolverDiSMech.add_rod(builder, rod=newton.Rod(np.array(points), edges=edges, radius=RADIUS),
                                            cfg=_cfg(builder, self.mu), **self.rod_options)
-            DiSMechSolver.fix_segment(builder, bodies[0])
+            SolverDiSMech.fix_segment(builder, bodies[0])
         return builder.finalize()
 
 
@@ -524,7 +524,7 @@ class SheetContactRollout(ShellRollout):
             if self.scene in ("foot", "edge"):
                 for k in ids[: 2 * self.ny]:
                     builder.particle_flags[k] &= ~newton.ParticleFlags.ACTIVE
-                DiSMechSolver.add_rod(builder, self._rod(o), cfg=_cfg(builder, self.mu), **self.rod_options)
+                SolverDiSMech.add_rod(builder, rod=self._rod(o), cfg=_cfg(builder, self.mu), **self.rod_options)
         model = builder.finalize()
         model.particle_mu = self.mu
         return model
@@ -579,7 +579,7 @@ class SphereRollout(Rollout):
                                      radius=self.radius, cfg=_cfg(builder, self.mu))
             rod = newton.Rod.create_straight(o + (-0.3125, 0.0, RADIUS * ONSET), (1.0, 0.0, 0.0), 0.5,
                                              segment_count=self.segments, radius=RADIUS)
-            DiSMechSolver.add_rod(builder, rod, cfg=_cfg(builder, self.mu), **self.rod_options)
+            SolverDiSMech.add_rod(builder, rod=rod, cfg=_cfg(builder, self.mu), **self.rod_options)
         return builder.finalize()
 
     def _velocity(self, rng, model):

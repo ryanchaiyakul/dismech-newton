@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 from utils.common import THEORY, FrameGraph, frame_box, inset, inset_scale
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 
 GRAVITY = 9.81
 
@@ -34,9 +34,9 @@ def _place_points(src: wp.array[wp.vec3], offset: wp.vec3, start: int, dst: wp.a
 
 # name: (solver, its options, color)
 DER_SOLVERS = {
-    "DER ADMM, implicit Euler": (DiSMechSolver, {}, (0.3, 0.8, 0.6)),
+    "DER ADMM, implicit Euler": (SolverDiSMech, {}, (0.3, 0.8, 0.6)),
     # Undamped, ADMM's leftover residual would pump the stiff modes: midpoint on Gauss-Newton.
-    "DER Gauss-Newton, implicit midpoint": (DiSMechSolver, {"exact": True, "theta": 0.5}, (0.6, 0.45, 0.9)),
+    "DER Gauss-Newton, implicit midpoint": (SolverDiSMech, {"exact": True, "theta": 0.5}, (0.6, 0.45, 0.9)),
 }
 VBD_COLORS = ((0.95, 0.55, 0.2), (0.85, 0.25, 0.25), (0.95, 0.75, 0.25), (0.7, 0.3, 0.7))
 
@@ -126,7 +126,7 @@ class Example:
 
     def _der_adder(self, solver, color):
         def add(builder, clamp) -> list[int]:
-            bodies = solver.add_rod(builder, self._rod(clamp), stretch_stiffness=1.0e6, color=color,
+            bodies, _ = solver.add_rod(builder, rod=self._rod(clamp), stretch_stiffness=1.0e6, color=color,
                                     bend_stiffness=self.bend_stiffness, twist_stiffness=self.bend_stiffness,
                                     bend_damping=self.bend_damping)
             solver.fix_segment(builder, bodies[0])
@@ -280,7 +280,7 @@ class TipSim:
         self.model, self.solver, self.substeps = model, solver, substeps
         self.offset = wp.vec3(*offset)  # where it is drawn
         self.state_0, self.state_1 = model.state(), model.state()
-        if isinstance(solver, DiSMechSolver):
+        if isinstance(solver, SolverDiSMech):
             flatten_state(self.state_0)
             flatten_state(self.state_1)
         self.field, self.tip_kernel, self.tip_inputs = tip

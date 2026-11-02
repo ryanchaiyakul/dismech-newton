@@ -19,7 +19,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "newton~=1.6.0",
+    "newton~=1.7.0",
     "scipy>=1.14",
 ]
 
@@ -41,8 +41,8 @@ viewer = [
     "viser>=1.1.1",
 ]
 mujoco = [
-    "mujoco~=3.12.0",
-    "mujoco-warp~=3.12.0",
+    "mujoco~=3.15.0",
+    "mujoco-warp~=3.15.0",
     "trimesh>=4.6.8",  # robot meshes (URDF)
     "pycollada>=0.9",
 ]

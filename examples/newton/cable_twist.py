@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample, Drive, segment_dofs
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 class Example(CableExample):
@@ -38,16 +38,16 @@ class Example(CableExample):
                 None, pos=wp.vec3(-0.25 * length, y, self.radius), num_elements=self.num_elements,
                 length=length, radius=self.radius,
             )
-            bodies = DiSMechSolver.add_rod(
-                builder, rod, stretch_stiffness=1.0e6, bend_stiffness=k, twist_stiffness=k,
+            bodies, _ = SolverDiSMech.add_rod(
+                builder, rod=rod, stretch_stiffness=1.0e6, bend_stiffness=k, twist_stiffness=k,
                 bend_damping=1.0e-2 * k, twist_damping=1.0e-2 * k,
             )
-            DiSMechSolver.fix_segment(builder, bodies[0])  # clamped: its nodes and twist follow the drive
+            SolverDiSMech.fix_segment(builder, bodies[0])  # clamped: its nodes and twist follow the drive
             self.rods.append(bodies)
         builder.add_ground_plane()
         model = builder.finalize()
         model.shape_material_mu.fill_(0.5)  # the rods' and the ground's
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         # The clamped segments' twist angles, prescribed every substep.
         self.spin = Drive(model, [d for bodies in self.rods for d in segment_dofs(model, bodies[0], True)])
         self.drives = (self.spin,)

@@ -31,7 +31,7 @@ from utils.common import (
     smoothstep,
 )
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 A, RHO, E, NU = 1.55e-3, 1200.0, 1.3e6, 0.5  # radius [m], density, Young's modulus, Poisson's ratio
 B = E * np.pi * A**4 / 4.0  # bending stiffness EI
@@ -64,15 +64,15 @@ class Example(CableExample):
         x = np.linspace(0.0, self.length, segments + 1)
         z = 1.0e-3 * np.sin(np.pi * x / self.length) ** 2  # seeds the Euler buckle
         nodes = np.column_stack((x, np.zeros_like(x), 0.5 + z))
-        builder = newton.ModelBuilder(gravity=0.0)
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         rod = newton.Rod(nodes, radius=A, youngs_modulus=E, shear_modulus=E / (2.0 * (1.0 + NU)))
-        bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=RHO),
+        bodies, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=RHO),
                                            bend_damping=damping, twist_damping=damping)
         for body in (bodies[0], bodies[-1]):
-            DiSMechSolver.fix_segment(builder, body)
+            SolverDiSMech.fix_segment(builder, body)
         model = builder.finalize()
         model.shape_material_mu.fill_(friction)
-        solver = DiSMechSolver(model)
+        solver = SolverDiSMech(model)
         self.start(None if display else viewer, model, solver)
         self.end = Drive(model, segment_dofs(model, bodies[-1]))  # the last segment's nodes and twist
         self.drives = (self.end,)

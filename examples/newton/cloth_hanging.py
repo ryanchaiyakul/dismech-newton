@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 def newton_grid(**grid):
@@ -65,7 +65,7 @@ class Example(CableExample):
                             damping=0.0)
         else:
             material = dict(tri_ke=1.0e3, tri_ka=1.0e3, tri_kd=1.0e2, edge_ke=1.0e1, edge_kd=0.0)
-        ids = DiSMechSolver.add_cloth_mesh(
+        ids = SolverDiSMech.add_cloth_mesh(
             builder, vertices=[wp.vec3(v) for v in vertices], indices=faces.ravel(), particle_radius=self.radius,
             density=self.mass / self.cell**2, **material,
         )
@@ -74,7 +74,7 @@ class Example(CableExample):
         model = builder.finalize()
         model.particle_mu = self.mu
         model.shape_material_mu.fill_(self.mu)
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         edges = np.unique(np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), 1), axis=0)
         self.crossings = Crossings(edges, faces, model.device)
         self.cross = 0

@@ -22,6 +22,7 @@ GROW = wp.constant(2.0)  # a node's load scale grows at most this factor per ste
 DECAY = wp.constant(0.99)  # and relaxes by this factor per step, toward 1
 IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
 MAX_SCALE = wp.constant(1.0e5)  # and stays below this (unbounded, it spreads pair to pair and overflows k)
+CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most this many k (its log's: d >= tau/10)
 STIFFNESS = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
 SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
@@ -31,7 +32,8 @@ LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the
 class Slots:
     """Per contact: ``pair`` with weights ``w``, the normal from ``b`` to ``a``, the anchor, the start ``c0`` of
     ``C q`` (minus the anchor's motion), the thickness, friction coefficient, lagged normal force ``rho``,
-    stiffness and multiplier ``lam``; ``key``: the other feature, which a source keeps each contact once by."""
+    stiffness and multiplier ``lam``; ``key``: the other feature, which a source keeps each contact once by;
+    ``roll``, ``ta``, ``tb``: its rod edges' surface turn (:func:`roll_point`)."""
 
     active: wp.array[wp.int32]
     pair: wp.array[wp.vec4i]
@@ -45,6 +47,9 @@ class Slots:
     stiffness: wp.array[float]
     lam: wp.array[float]
     key: wp.array[wp.int32]
+    roll: wp.array[wp.vec4]
+    ta: wp.array[wp.vec3]
+    tb: wp.array[wp.vec3]
 
 
 @wp.struct
@@ -103,6 +108,37 @@ def contact_point(q: wp.array[float], pair: wp.vec4i, w: wp.vec4, anchor: wp.vec
 
 
 @wp.func
+def roll_point(q: wp.array[float], pair: wp.vec4i, w: wp.vec4, roll: wp.vec4, n: wp.vec3, ta: wp.vec3,
+               tb: wp.vec3) -> wp.vec3:
+    """The rods' surface points' motion beyond their centrelines': a side on a rod edge ``x0 -> x1`` (tangent
+    ``t``, radius ``r``) turns by ``t0 x t``, moving its contact point ``-r n`` by ``r t (n . (x1 - x0)) / L`` to
+    first order (``roll = (-r/L, r/L)`` on the edge's nodes; ``t`` its side's: ``ta`` where ``w > 0``). Tangential
+    (``t`` normal to ``n``): it moves only friction's slip, so a cable on a turning pulley rolls with it, its
+    centreline at ``w (R + r)``."""
+    c = wp.vec3(0.0)
+    for k in range(4):
+        if roll[k] != 0.0:
+            c += roll[k] * wp.dot(n, node(q, pair[k])) * wp.where(w[k] > 0.0, ta, tb)
+    return c
+
+
+@wp.func
+def node_map(w: wp.vec4, roll: wp.vec4, n: wp.vec3, ta: wp.vec3, tb: wp.vec3, k: int) -> wp.mat33:
+    """``d (C q + roll) / d x_k``: ``w_k I + roll_k t n^T``."""
+    return w[k] * wp.identity(3, float) + roll[k] * wp.outer(wp.where(w[k] > 0.0, ta, tb), n)
+
+
+@wp.func
+def slot_map(s: Slots, i: int, k: int) -> wp.mat33:
+    return node_map(s.w[i], s.roll[i], s.normal[i], s.ta[i], s.tb[i], k)
+
+
+@wp.func
+def slot_roll(q: wp.array[float], s: Slots, i: int) -> wp.vec3:
+    return roll_point(q, s.pair[i], s.w[i], s.roll[i], s.normal[i], s.ta[i], s.tb[i])
+
+
+@wp.func
 def shape_of(key: int, key0: int) -> int:
     """A shape pair's shape from its key ``key0 + 2 shape + side`` (side 1: a line contact's other end)."""
     return (key - key0) // 2
@@ -144,8 +180,9 @@ def arm_flexibility(arm: Arm, s: Slots, i: int) -> float:
 
 @wp.func
 def pair_point(q: wp.array[float], s: Slots, i: int, arm: Arm, anchor: wp.vec3) -> wp.vec3:
-    """:func:`contact_point` with the anchor moved by its body's DOFs in ``q`` if it yields."""
-    c = contact_point(q, s.pair[i], s.w[i], anchor)
+    """:func:`contact_point` with the anchor moved by its body's DOFs in ``q`` if it yields, plus the rods' surface
+    turn (:func:`roll_point`)."""
+    c = contact_point(q, s.pair[i], s.w[i], anchor) + slot_roll(q, s, i)
     b = arm_body(arm, s, i)
     if b >= 0:
         r = s.anchor[i] - arm.com[b]
@@ -176,14 +213,43 @@ def emit(
     db: wp.vec3,
     th: float,
     mu: float,
+    radius: wp.vec4,
 ):
-    """Activate slot ``i``; ``xb``: the anchor at the end of the step, ``db``: its displacement over it."""
+    """Activate slot ``i``; ``xb``: the anchor at the end of the step, ``db``: its displacement over it; ``radius``:
+    per node its rod's (0 off rods): a side on two rod nodes (an edge) rolls (:func:`roll_point`)."""
     s.active[i] = 1
     s.pair[i] = pair
     s.w[i] = w
     s.normal[i] = n
     s.anchor[i] = xb
-    s.c0[i] = contact_point(q, pair, w, xb) + db
+    roll = wp.vec4(0.0)
+    s.ta[i] = wp.vec3(0.0)
+    s.tb[i] = wp.vec3(0.0)
+    for side in range(2):
+        k0 = int(-1)
+        k1 = int(-1)
+        count = int(0)
+        for k in range(4):
+            if pair[k] >= 0 and (w[k] > 0.0) == (side == 0):
+                count += 1
+                if k0 < 0:
+                    k0 = k
+                else:
+                    k1 = k
+        if count == 2:
+            if radius[k0] > 0.0 and radius[k1] > 0.0:
+                e = node(q, pair[k1]) - node(q, pair[k0])
+                t = e - wp.dot(e, n) * n
+                if wp.length(t) > 0.0:
+                    rl = 0.5 * (radius[k0] + radius[k1]) / wp.length(e)
+                    roll[k0] = -rl
+                    roll[k1] = rl
+                    if side == 0:
+                        s.ta[i] = wp.normalize(t)
+                    else:
+                        s.tb[i] = wp.normalize(t)
+    s.roll[i] = roll
+    s.c0[i] = contact_point(q, pair, w, xb) + db + slot_roll(q, s, i)
     s.thickness[i] = th
     s.mu[i] = mu
 
@@ -220,6 +286,7 @@ class BarrierBlock:
         self.lam_key = wp.full(size, -1, dtype=wp.int32, device=self.device)
         self.moved = wp.zeros(1, dtype=wp.int32, device=self.device)  # a multiplier moved the pair past tolerance
         self.left = wp.zeros(1, dtype=wp.int32, device=self.device)  # the step's updates left
+        self.unsettled = wp.zeros(1, dtype=wp.int32, device=self.device)  # begin_step's
         self.arm = make_arm(model, getattr(source, "shape_key0", 0), 0, 0)  # no yielding bodies (the solver's to set)
 
     def _launch(self, kernel, inputs, dim=None):
@@ -229,8 +296,10 @@ class BarrierBlock:
     def reset(self) -> None:
         self.lam_key.fill_(-1)
 
-    def begin_step(self, state_in: State, dt: float, mass: wp.array) -> None:
-        """The pairs near the step's start and their lagged normal forces."""
+    def begin_step(self, state_in: State, dt: float, mass: wp.array, unsettled: wp.array) -> None:
+        """The pairs near the step's start and their lagged normal forces; ``unsettled[0]``: the last step ended
+        unconverged (its pairs' depths are its solve's error, not their load: no load scale grows)."""
+        self.unsettled = unsettled
         self.slip = self.slip_speed * dt
         self.dt, self.mass = dt, mass
         self.arm.inv_h2 = 1.0 / (dt * dt)
@@ -248,7 +317,7 @@ class BarrierBlock:
         self._launch(_carry_kernel, [self.block, self.lam, self.lam_key, self.s])
         self._launch(_lift_kernel, [q, lift, self.s])
         self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.mass, self.fixed, self.scale,
-                                   int(start), self.s, self.arm])
+                                   int(start), self.unsettled, self.s, self.arm])
 
     def snapshot(self) -> Slots | None:
         """This step's active pairs, gathered for its adjoint if any carries force at its end (one host read; two if
@@ -359,7 +428,8 @@ def _rebase_kernel(q: wp.array[float], q0: wp.array[float], s: Slots):
     slip, and its normal force is the start's (an overshooting iterate's would push along the motion)."""
     i = wp.tid()
     if s.active[i] != 0:
-        s.c0[i] = s.c0[i] - contact_point(q, s.pair[i], s.w[i], wp.vec3(0.0)) + contact_point(q0, s.pair[i], s.w[i], wp.vec3(0.0))
+        s.c0[i] = (s.c0[i] - contact_point(q, s.pair[i], s.w[i], wp.vec3(0.0)) - slot_roll(q, s, i)
+                   + contact_point(q0, s.pair[i], s.w[i], wp.vec3(0.0)) + slot_roll(q0, s, i))
 
 
 @wp.kernel
@@ -398,11 +468,11 @@ def _decay_kernel(scale: wp.array[float]):
 
 @wp.kernel
 def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scale: wp.array[float], grow: int,
-                s: Slots, arm: Arm):
+                unsettled: wp.array[wp.int32], s: Slots, arm: Arm):
     """The pair's stiffness ``c / (C M^-1 C^T)`` (``c``: stiffness / dt^2) times its
     nodes' largest load scale, and its normal force at the step's start (in ``rho``): friction's ``lam``. At a step's
     start (``grow``), a pair compressed deeper than :data:`LOAD` thicknesses raises its nodes' scales (at most
-    :data:`GROW` times), so a node's pairs come to hold its load that deep."""
+    :data:`GROW` times), so a node's pairs come to hold its load that deep: if the last step converged."""
     i = wp.tid()
     if s.active[i] != 0:
         sc = float(1.0)  # the pair's nodes' largest load scale
@@ -412,7 +482,7 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
         k = c / wp.max(flexibility(s.pair[i], s.w[i], mass, fixed) + arm_flexibility(arm, s, i), 1.0e-30) * sc
         x = s.thickness[i] - wp.dot(s.normal[i], s.c0[i]) + s.lam[i] / k  # its compression at the step's start
         # (the multiplier's force as the barrier's compression)
-        if grow != 0 and x > LOAD * s.thickness[i]:  # held deeper than LOAD: the next steps' pairs stiffer
+        if grow != 0 and unsettled[0] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs
             up = wp.min(sc * wp.min(GROW, x / (LOAD * s.thickness[i])), MAX_SCALE)
             for j in range(4):
                 if s.pair[i][j] >= 0:
@@ -470,7 +540,7 @@ def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fix
         touching[0] = 1
     for j in range(4):
         if s.pair[i][j] >= 0:
-            scatter_node(b, fixed, s.pair[i][j], s.w[i][j] * g)
+            scatter_node(b, fixed, s.pair[i][j], wp.transpose(slot_map(s, i, j)) * g)
     body = arm_body(arm, s, i)
     if body >= 0:
         r = s.anchor[i] - arm.com[body]
@@ -497,6 +567,7 @@ def _barrier_assemble_kernel(
     w = s.w[i]
     n = s.normal[i]
     g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
     H = h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
     f = float(1.0)
     for j in range(4):
@@ -507,13 +578,13 @@ def _barrier_assemble_kernel(
         for bb in range(4):
             nb = pair[bb]
             if na >= 0 and nb >= na and w[a] * w[bb] > 0.0:
-                v = f * w[a] * w[bb]
+                B = f * wp.transpose(slot_map(s, i, a)) * H * slot_map(s, i, bb)
                 for c in range(3):
                     for c2 in range(3):
                         if (nb > na or c2 >= c) and fixed[3 * na + c] == 0 and fixed[3 * nb + c2] == 0:
                             slot = row_slot(indptr, indices, 3 * na + c, 3 * nb + c2)
                             if slot >= 0:
-                                wp.atomic_add(vals, slot, wp.float64(v * H[c, c2]))
+                                wp.atomic_add(vals, slot, wp.float64(B[c, c2]))
     body = arm_body(arm, s, i)
     if body >= 0:  # the anchor's DOFs: -P^T H C and P^T H P (exact: all in the pattern)
         r = s.anchor[i] - arm.com[body]
@@ -523,9 +594,10 @@ def _barrier_assemble_kernel(
             for a in range(4):
                 na = pair[a]
                 if na >= 0:
+                    JHP = wp.transpose(slot_map(s, i, a)) * HP
                     for c in range(3):
                         if fixed[3 * na + c] == 0:
-                            wp.atomic_add(vals, row_slot(indptr, indices, 3 * na + c, zm), wp.float64(-w[a] * HP[c]))
+                            wp.atomic_add(vals, row_slot(indptr, indices, 3 * na + c, zm), wp.float64(-JHP[c]))
             for m2 in range(m, arm.k):
                 wp.atomic_add(vals, row_slot(indptr, indices, zm, arm.base[body] + m2),
                               wp.float64(wp.dot(arm_jacobian(arm, body, m2, r), HP)))
@@ -598,9 +670,10 @@ def _carry_kernel(block: int, lam: wp.array[float], lam_key: wp.array[wp.int32],
 def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, tol: float, lam: wp.array[float],
                   lam_key: wp.array[wp.int32],
                   moved: wp.array[wp.int32]):
-    """``lam <- max(0, f(d) - k dl / 2)`` into the store: ``f(d)`` the pair's force at ``q``, ``k dl / 2`` the force
-    its barrier alone holds at the thickness (the ramp's middle), so the pair holds ``f`` there; ``moved`` if that
-    moves its rest by more than ``tol``."""
+    """``lam <- max(0, lam + k (th - d))`` into the store: the quadratic's force at ``q`` less the ``k dl / 2`` its
+    barrier alone holds at the thickness (the ramp's middle), so the pair holds it there (the augmented Lagrangian's
+    update); the log's force below ``th / 2`` is not taken (at an unconverged iterate it diverges, and through the
+    load scale stiffens every later step). ``moved`` if that moves its rest by more than ``tol``."""
     i = wp.tid()
     lam_key[i] = -1
     lam[i] = 0.0
@@ -608,9 +681,8 @@ def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, tol: float, lam: wp.ar
         return
     th, k = s.thickness[i], s.stiffness[i]
     d = wp.dot(s.normal[i], pair_point(q, s, i, arm, s.anchor[i]))
-    f = -barrier(d, th, k, s.lam[i])[1]
     lam_key[i] = s.key[i]
-    lam[i] = wp.max(0.0, f - 0.5 * k * SMOOTH * th)
+    lam[i] = wp.max(0.0, s.lam[i] + k * (th - d))
     if wp.abs(lam[i] - s.lam[i]) > k * tol:
         moved[0] = 1
 

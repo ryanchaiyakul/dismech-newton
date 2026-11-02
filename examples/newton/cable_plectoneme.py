@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample, Drive, close_pairs, segment_dofs, smoothstep
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 N = NewtonExample
 
@@ -34,16 +34,16 @@ class Example(CableExample):
         self.segment_length = float(np.linalg.norm(np.diff(nodes, axis=0), axis=1).mean())
         self.radius = 0.42 * self.segment_length
         builder = newton.ModelBuilder(gravity=N.GRAVITY)
-        bodies = DiSMechSolver.add_rod(
-            builder, newton.Rod(nodes, radius=self.radius), stretch_stiffness=N.STRETCH_STIFFNESS,
+        bodies, _ = SolverDiSMech.add_rod(
+            builder, rod=newton.Rod(nodes, radius=self.radius), stretch_stiffness=N.STRETCH_STIFFNESS,
             bend_stiffness=N.BEND_STIFFNESS, bend_damping=N.BEND_DAMPING, twist_stiffness=N.TWIST_STIFFNESS,
             twist_damping=N.TWIST_DAMPING,
         )
         for body in (bodies[0], bodies[-1]):
-            DiSMechSolver.fix_segment(builder, body)
+            SolverDiSMech.fix_segment(builder, body)
         model = builder.finalize()
         model.shape_material_mu.fill_(0.0)  # Newton's default rod-rod contact: no friction set
-        self.start(viewer, model, DiSMechSolver(model))
+        self.start(viewer, model, SolverDiSMech(model))
         x = self.state_0.particle_q.numpy()
         x[N.NUM_ELEMENTS // 2, 1] += N.SEED_BODY_OFFSET_Y  # Newton's seed: the middle off the plane
         self.state_0.particle_q.assign(x)

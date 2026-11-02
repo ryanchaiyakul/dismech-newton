@@ -17,7 +17,7 @@ import warp as wp
 from utils.common import SIM, inset, segment_distance, segment_dofs
 from utils.stokes import Stokeslets
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 
 PAPER = {
     "youngs_modulus": 3.0e6,  # [Pa]
@@ -104,12 +104,12 @@ class DERFlagella:
         self.rods = []
         for points in self.points:
             rod = _rod(points, p)
-            bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=p["density"]))
-            DiSMechSolver.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
+            bodies, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=p["density"]))
+            SolverDiSMech.fix_segment(builder, bodies[0])  # nodes 0, 1 and the first twist
             self.rods.append(bodies)
         self.model = model = builder.finalize()
         model.shape_material_mu.fill_(p["friction"])
-        self.solver = DiSMechSolver(model)
+        self.solver = SolverDiSMech(model)
         if implicit_drag:  # the paper's explicit drag diverges at the tips of a tight bundle (stokes.py)
             self.stokes.implicit(self.solver.mass.numpy()[: 3 * count * self.nv], self.dt)
         self.state_0, self.state_1 = model.state(), model.state()

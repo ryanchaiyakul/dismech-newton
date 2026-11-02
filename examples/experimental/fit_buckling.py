@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale, smoothstep
 
-from dismech_newton import DiSMechSolver, add_rod, flatten_state, suspended_tape
+from dismech_newton import SolverDiSMech, add_rod, flatten_state, suspended_tape
 from dismech_newton.builder import vec5f, vec10f
 from dismech_newton.rod import Rod, rod_dofs, rod_jacobian, vec11f
 
@@ -95,10 +95,10 @@ def build(rods: int, ratios: np.ndarray | None = None, admm: bool = False):
     for r in range(rods):
         rod = newton.Rod.create_straight((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), LENGTH, segment_count=SEGMENTS,
                                          radius=RADIUS)
-        add_rod(builder, rod, stretch_stiffness=TRUE["EA"], bend_stiffness=TRUE["EI"], twist_stiffness=TRUE["EI"],
+        add_rod(builder, rod=rod, stretch_stiffness=TRUE["EA"], bend_stiffness=TRUE["EI"], twist_stiffness=TRUE["EI"],
                 bend_damping=TRUE["c"], proxies=False)
-        DiSMechSolver.fix_segment(builder, edge=r * SEGMENTS)  # the clamp
-        DiSMechSolver.fix_segment(builder, edge=r * SEGMENTS + SEGMENTS - 1)  # the gripper
+        SolverDiSMech.fix_segment(builder, edge=r * SEGMENTS)  # the clamp
+        SolverDiSMech.fix_segment(builder, edge=r * SEGMENTS + SEGMENTS - 1)  # the gripper
     model = builder.finalize()
     d = model.dismech
     p = d.triplet_params.numpy().reshape(rods, NT, 10)
@@ -113,7 +113,7 @@ def build(rods: int, ratios: np.ndarray | None = None, admm: bool = False):
     d.triplet_params.assign(p.reshape(-1, 10))
     model.particle_mass.assign(model.particle_mass.numpy() * np.repeat(rho, NODES))
     d.edge_inertia.assign(d.edge_inertia.numpy() * np.repeat(rho, SEGMENTS))
-    solver = DiSMechSolver(model, iterations=50) if admm else DiSMechSolver(model, exact=True, iterations=20)
+    solver = SolverDiSMech(model, iterations=50) if admm else SolverDiSMech(model, exact=True, iterations=20)
     solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
 
@@ -614,7 +614,7 @@ class Example:
             for _ in self.trials:
                 rod = newton.Rod.create_straight((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), LENGTH, segment_count=SEGMENTS,
                                                  radius=RADIUS)
-                add_rod(builder, rod, bend_stiffness=1.0, color=color)
+                add_rod(builder, rod=rod, bend_stiffness=1.0, color=color)
         self.model = builder.finalize()
         self.state = self.model.state()
         self.k, self.frame, self.sim_time = 0, 0, 0.0

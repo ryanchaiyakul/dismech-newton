@@ -10,7 +10,7 @@ from newton.solvers.experimental.coupled import CouplingInterface
 from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
 from .collide import Offset
 from .contact import BarrierBlock, make_arm
-from .coupling import ProxyArm
+from .coupling import ProxyArm, ProxyPins
 from .element import ElementBlock
 from .linear import SymmetricCSR, sparse_solver
 from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_proxies_kernel, proxy_joints
@@ -41,7 +41,7 @@ FINISH = 3  # a step's last iterations, after its multipliers are updated whethe
 TOLERANCE = 0.01
 
 
-class DiSMechSolver(SolverBase, CouplingInterface):
+class SolverDiSMech(SolverBase, CouplingInterface):
     """Implicit discrete elastic rods and midedge shells with contact and friction: the elastic elements by
     strain-space ADMM, contact and friction as barrier energies in the same step objective.
 
@@ -145,11 +145,12 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
             arm.bind(self.contact.arm)
+        self.pins = ProxyPins(model, self.contact.arm, self.mass, self.fixed) if k else None  # rods on proxy bodies
         self._qw = wp.zeros(n, dtype=float, device=dev) if k else None  # the step's unknowns: the state's, the arms'
         self.cap = float(model.particle_radius.numpy().min()) if self.contact.count else 0.0
         self._tol = TOLERANCE * self.cap
         source.cap = self.cap
-        self.blocks = (*self.elements, self.contact)
+        self.blocks = (*self.elements, self.contact, *((self.pins,) if self.pins and self.pins.count else ()))
         self._adjoint = None  # StepAdjoint, built on the first vjp
         # float32 cuDSS: A is the step's chord matrix, an approximation the line search corrects (positive definite:
         # majorized elements and contacts, plus inertia)
@@ -201,8 +202,11 @@ class DiSMechSolver(SolverBase, CouplingInterface):
             if getattr(s, k).shape[0]:
                 yield getattr(s, k), getattr(p, k)
 
-    def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
-        """Advance ``state_in`` by ``dt``; under a ``wp.Tape`` the step is recorded as its adjoint (:meth:`vjp`)."""
+    def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float,
+             *, observables: SolverBase.Observables | None = None) -> None:
+        """Advance ``state_in`` by ``dt``; under a ``wp.Tape`` the step is recorded as its adjoint (:meth:`vjp`).
+        No solver observables are supported (the contact forces on bodies: :attr:`body_reaction`)."""
+        self.validate_observables(observables)
         dt = float(dt)
         with suspended_tape() as tape:
             self._step(state_in, state_out, dt)
@@ -259,6 +263,8 @@ class DiSMechSolver(SolverBase, CouplingInterface):
             if self.contact.count:
                 self.contact.source.reactions(q, self.contact.s, self.contact.arm, self.contact.slip,
                                               self.body_reaction)
+            if self.pins and self.pins.count:
+                self.pins.reactions(q, self.body_reaction)
         finally:
             state_in.body_q, state_in.body_qd = body_q, body_qd
         if self._proxy_arm is not None:
@@ -292,7 +298,8 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         self._carry(prev.particle_q, prev.dismech, state.particle_q, state.dismech)
         self.reset(state)
 
-    def reset(self, state: State, world_mask: wp.array | None = None, flags: int | None = None) -> None:
+    def reset(self, state: State, world_mask: wp.array[wp.bool] | None = None, flags: StateFlags | int | None = None
+              ) -> None:
         """Start the next step from ``state`` without the last step's warm start: for a step that does not continue
         the last one, such as a restart from data."""
         if world_mask is not None:
@@ -338,7 +345,9 @@ class DiSMechSolver(SolverBase, CouplingInterface):
             e.begin_step(state_in, dt, self.exact)
         if not self._started and not self.exact and not dev.is_capturing:
             self.reset(state_in)
-        self.contact.begin_step(state_in, dt, self.mass)
+        self.contact.begin_step(state_in, dt, self.mass, self._go)  # _go: the last step's end
+        if self.pins and self.pins.count:
+            self.pins.begin_step(state_in.body_q, dt)
         q0 = self._q0
         q0.zero_()
         wp.copy(q0, state_in.dismech.q, count=self.num_state_dofs)

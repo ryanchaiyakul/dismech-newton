@@ -106,8 +106,8 @@ def fix_segment(builder: ModelBuilder, body: int | None = None, *, edge: int | N
 
 def add_rod(
     builder: ModelBuilder,
-    rod: Rod,
     *,
+    rod: Rod,
     cfg: ModelBuilder.ShapeConfig | None = None,
     stretch_stiffness: float | None = None,
     stretch_damping: float | None = None,
@@ -115,15 +115,16 @@ def add_rod(
     bend_damping: float | None = None,
     twist_stiffness: float | None = None,
     twist_damping: float | None = None,
+    label: str | None = None,
+    color: Vec3 | None = None,
     dahl_eps_max: float = 0.0,
     dahl_tau: float = 0.0,
-    label: str | None = None,
     collide: bool = False,
     proxies: bool = True,
-    color: Vec3 | None = None,
-) -> list[int]:
-    """Add DER segments, an ordered chain or a graph (``rod.edges``: junctions); returns the proxy bodies (edge indices
-    without proxies).
+) -> tuple[list[int], list[int]]:
+    """:meth:`newton.ModelBuilder.add_rod`'s ``rod=`` form as DER segments, an ordered chain or a graph
+    (``rod.edges``: junctions); returns Newton's ``(body_indices, joint_indices)``: the segments' proxy bodies (none
+    without proxies; :func:`fix_segment` then takes the edge, counted over every rod added) and no joints.
 
     At a node of ``n`` segments, ``n - 1`` triplets couple its first segment to each of the others (Newton's choice;
     rest angles the initial ones): a 2-segment node is a chain's triplet, a junction a star around its first segment,
@@ -258,7 +259,7 @@ def add_rod(
                 _P + "triplet_ref_twist_q": 0.0,  # the first strain evaluation yields the reference twist itself
             }
         )
-    return bodies if proxies else list(range(edge0, edge0 + n_e))
+    return bodies, []
 
 
 # -- shells: Newton's cloth mesh --------------------------------------------------------------------------

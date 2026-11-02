@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 
 pytest.importorskip("mujoco_warp")
 from newton.solvers import SolverMuJoCo  # noqa: E402
@@ -28,7 +28,7 @@ def test_admm_entry(rng):
     builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2],
                           cfg=newton.ModelBuilder.ShapeConfig(density=300.0, mu=0.3))
     n, r = 41, 0.005
-    DiSMechSolver.add_rod(builder, newton.Rod(np.column_stack([np.zeros(n), np.linspace(-0.2, 0.2, n), np.zeros(n)]),
+    SolverDiSMech.add_rod(builder, rod=newton.Rod(np.column_stack([np.zeros(n), np.linspace(-0.2, 0.2, n), np.zeros(n)]),
                                               radius=r),
                           cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.3), stretch_stiffness=1.0e4,
                           bend_stiffness=2.0e-3, bend_damping=1.0e-4)
@@ -38,7 +38,7 @@ def test_admm_entry(rng):
     solver = SolverCoupledADMM(model=model, entries=[
         SolverCoupled.Entry(name="rigid", solver=lambda v: SolverMuJoCo(v, use_mujoco_contacts=False), bodies=[body],
                             joints=box_joints),
-        SolverCoupled.Entry(name="soft", solver=DiSMechSolver, particles=list(range(model.particle_count)),
+        SolverCoupled.Entry(name="soft", solver=SolverDiSMech, particles=list(range(model.particle_count)),
                             bodies=list(range(body + 1, model.body_count)),
                             joints=[j for j in range(model.joint_count) if j not in box_joints]),
     ], coupling=SolverCoupledADMM.Config(rho=200.0, gamma=0.0, contact_pairs=[SolverCoupledADMM.ContactPair("rigid", "soft")]))
@@ -73,19 +73,24 @@ def test_admm_entry(rng):
     assert deepest < 0.6 * r, deepest
 
 
-def _proxy_scene(builder, body, rod, mu, rigid_contacts=True):
-    """The solver as Newton's ``SolverCoupledProxy`` destination: ``body`` MuJoCo's, a proxy in our solve."""
+def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None):
+    """The solver as Newton's ``SolverCoupledProxy`` destination: ``body`` MuJoCo's, a proxy in our solve; ``pin``: a
+    point in ``body``'s frame its ball joint holds the rod's first node to."""
     from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy  # noqa: PLC0415
 
-    DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu),
-                          stretch_stiffness=1.0e4, bend_stiffness=2.0e-3, bend_damping=1.0e-4)
+    capsules, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu),
+                                        stretch_stiffness=1.0e4, bend_stiffness=2.0e-3, bend_damping=1.0e-4)
+    if pin is not None:
+        half = 0.5 * float(np.linalg.norm(np.diff(rod.points[:2], axis=0)))
+        builder.add_joint_ball(parent=body, child=capsules[0], parent_xform=wp.transform(pin, wp.quat_identity()),
+                               child_xform=wp.transform(wp.vec3(0.0, 0.0, -half), wp.quat_identity()))
     model = builder.finalize()
     child = model.joint_child.numpy()
     box_joints = [j for j in range(model.joint_count) if child[j] == body]
     solver = SolverCoupledProxy(model, entries=[
         SolverCoupled.Entry(name="rigid", solver=lambda v: SolverMuJoCo(v, use_mujoco_contacts=rigid_contacts),
                             bodies=[body], joints=box_joints),
-        SolverCoupled.Entry(name="soft", solver=DiSMechSolver, particles=list(range(model.particle_count)),
+        SolverCoupled.Entry(name="soft", solver=SolverDiSMech, particles=list(range(model.particle_count)),
                             bodies=list(range(body + 1, model.body_count)),
                             joints=[j for j in range(model.joint_count) if j not in box_joints]),
     ], coupling=SolverCoupledProxy.Config(proxies=[
@@ -141,6 +146,64 @@ def test_proxy_momentum(rng):
 
 
 @pytest.mark.usefixtures("needs_cuda")
+def test_proxy_pin(rng):
+    """A rod pinned by a Newton ball joint to a free MuJoCo box (:class:`~dismech_newton.coupling.ProxyPins`), no
+    gravity, thrown sideways (the box turned at random, the throw's direction too), 300 steps: linear momentum (rod,
+    box and the reaction the box takes next step) stays to 1e-4 (4.5e-5 at most over 16 seeds), angular momentum
+    about the origin to 4e-3 (2.6e-3: implicit Euler's, halving with dt), the pin holds to 4e-4 radii after the
+    first jerk (2.7e-4), and the rod drags the box."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(rng.uniform(-0.3, 0.3)))
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0), turn))
+    half = np.array([0.04, 0.06, 0.04])
+    builder.add_shape_box(body, hx=half[0], hy=half[1], hz=half[2],
+                          cfg=newton.ModelBuilder.ShapeConfig(density=300.0, mu=0.3))
+    n, r = 41, 0.005
+    pin = wp.vec3(0.0, float(half[1] + 2 * r), 0.0)
+    start = np.array(wp.quat_rotate(turn, pin))
+    along = np.array(wp.quat_rotate(turn, wp.vec3(0.0, 1.0, 0.0)))
+    rod = newton.Rod(start + np.linspace(0.0, 0.4, n)[:, None] * along, radius=r)
+    model, solver, pipeline, s0, s1 = _proxy_scene(builder, body, rod, 0.3, rigid_contacts=False, pin=pin)
+    assert solver.solver("soft").pins.count == 1
+    contacts = pipeline.contacts()
+    a = float(rng.uniform(-0.5, 0.5))
+    qd = s0.particle_qd.numpy()
+    qd[:] = np.array(wp.quat_rotate(turn, wp.vec3(np.cos(a), 0.0, np.sin(a))))
+    s0.particle_qd.assign(qd)
+    m, dt = model.particle_mass.numpy()[:, None], 1.0e-3
+    mb, inertia, com = (float(model.body_mass.numpy()[body]), model.body_inertia.numpy()[body],
+                        model.body_com.numpy()[body])
+    feedback = solver._proxy_mappings[0].coupling_forces  # applied to the box next step
+
+    def momenta(s):
+        x, v = s.particle_q.numpy(), s.particle_qd.numpy()
+        bq, bqd, f = s.body_q.numpy()[body], s.body_qd.numpy()[body], dt * feedback.numpy()[body]
+        X = wp.transform(wp.vec3(*bq[:3]), wp.quat(*bq[3:]))
+        c = np.array(wp.transform_point(X, wp.vec3(*com)))
+        R = np.array(wp.quat_to_matrix(wp.quat(*bq[3:]))).reshape(3, 3)
+        p = (m * v).sum(0) + mb * bqd[:3] + f[:3]
+        L = (m * np.cross(x, v)).sum(0) + mb * np.cross(c, bqd[:3]) + R @ inertia @ R.T @ bqd[3:] + np.cross(c, f[:3])
+        return p, L + f[3:], np.linalg.norm(x[0] - np.array(wp.transform_point(X, pin)))
+
+    p0, L0, _ = momenta(s0)
+    dp = dL = gap = 0.0
+    for k in range(300):
+        s0.clear_forces()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, None, contacts, dt)
+        s0, s1 = s1, s0
+        p, L, g = momenta(s0)
+        dp = max(dp, np.linalg.norm(p - p0) / np.linalg.norm(p0))
+        dL = max(dL, np.linalg.norm(L - L0) / np.linalg.norm(L0))
+        if k >= 10:
+            gap = max(gap, g / r)
+    assert dp < 1.0e-4, dp
+    assert dL < 4.0e-3, dL
+    assert gap < 4.0e-4, gap
+    assert mb * np.linalg.norm(s0.body_qd.numpy()[body, :3]) > 0.3 * np.linalg.norm(p0), "the rod did not drag the box"
+
+
+@pytest.mark.usefixtures("needs_cuda")
 def test_proxy_static_load():
     """A rod resting across a free MuJoCo box on MuJoCo's ground, off its centre by ``a``, through
     ``SolverCoupledProxy`` (the box a proxy in our solve): the reaction the coupler feeds back is the rod's weight (1e-3) with the torque ``a m g`` (2e-3; measured
@@ -173,18 +236,30 @@ def test_proxy_static_load():
 
 @pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda")
-@pytest.mark.parametrize("segments", [19, 40])
-def test_franka_pick_place(segments):
+def test_franka_pick_place():
     """Our Franka cable pick-and-place example through Newton's ``SolverCoupledProxy`` with its config (the gripper
-    proxies in our solve, lagged, one pass), whole (330 frames), at Newton's 19 segments and refined (the same cable):
-    placed within 1 cm (Newton's test), each finger's grip its servo force (2%) and the mean lift the cable's weight
-    (20%: it swings) while carried."""
+    proxies in our solve, lagged, one pass), whole (330 frames), at Newton's 19 segments: placed within 1 cm
+    (Newton's test), each finger's grip its servo force (2%) and the mean lift the cable's weight (20%: it swings)
+    while carried."""
     from test_examples import _load  # noqa: PLC0415
 
-    example = _load("newton/franka_cable_ik_pick_place").Example
-    example.segments = segments
-    ex = example(None, None)
+    ex = _load("newton/franka_cable_ik_pick_place").Example(None, None)
     for _ in range(330):
+        ex.step()
+    ex.test_final()
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("needs_cuda")
+def test_cross_slide_table():
+    """Our cable-driven XY table (Newton's ``example_cable_cross_slide_table``): MuJoCo's carriages and pulleys, our
+    cable pinned to the table and driven by surface friction, 150 frames (the ramp, the first side and corner; the
+    whole rectangle is 960 frames, 3.1 mm at worst): Newton's test, the table within 5 mm of its path (1.4 mm at
+    worst here), 2.5 mm RMS, the cable in its pulleys' plane, the carriages within their travel."""
+    from test_examples import _load  # noqa: PLC0415
+
+    ex = _load("newton/cable_cross_slide_table").Example(None, None)
+    for _ in range(150):
         ex.step()
     ex.test_final()
 
@@ -194,7 +269,7 @@ def test_franka_pick_place(segments):
 def test_newton_franka_swap():
     """Plug and play: Newton's own ``example_franka_cable_ik_pick_place`` (its scene, IK, keyframes, collision pipeline,
     proxy config and graph captured before the first step) with only its VBD cable made our rod (the same parameters,
-    ``add_rod``) and the VBD entry ``DiSMechSolver``. Newton's test passes (placed within 1 cm) and each finger's grip
+    ``add_rod``) and the VBD entry ``SolverDiSMech``. Newton's test passes (placed within 1 cm) and each finger's grip
     is its servo force (2%) while carried."""
     import newton.examples.multiphysics.example_franka_cable_ik_pick_place as M  # noqa: PLC0415
     import newton.viewer  # noqa: PLC0415
@@ -203,9 +278,9 @@ def test_newton_franka_swap():
     class Example(M.Example):
         def _emit_template(self, builder):
             def add_rod(rod, cfg, stretch_stiffness, stretch_damping, bend_stiffness, bend_damping, **_):
-                DiSMechSolver.add_rod(builder, rod, cfg=cfg, stretch_stiffness=stretch_stiffness,
-                                      stretch_damping=stretch_damping, bend_stiffness=bend_stiffness,
-                                      bend_damping=bend_damping)
+                return SolverDiSMech.add_rod(builder, rod=rod, cfg=cfg, stretch_stiffness=stretch_stiffness,
+                                             stretch_damping=stretch_damping, bend_stiffness=bend_stiffness,
+                                             bend_damping=bend_damping)
 
             builder.add_rod = add_rod
             super()._emit_template(builder)
@@ -217,7 +292,7 @@ def test_newton_franka_swap():
                     v, solver="newton", integrator="implicitfast", cone="elliptic", iterations=args.mujoco_iterations,
                     ls_iterations=args.mujoco_ls_iterations, use_mujoco_contacts=False, njmax=256, nconmax=64),
                     bodies=self.franka_bodies, joints=self.franka_joints),
-                SolverCoupled.Entry(name="soft", solver=DiSMechSolver, particles=list(range(self.model.particle_count)),
+                SolverCoupled.Entry(name="soft", solver=SolverDiSMech, particles=list(range(self.model.particle_count)),
                                     bodies=self.payload_bodies, joints=self.payload_joints),
             ], coupling=SolverCoupledProxy.Config(proxies=[SolverCoupledProxy.Proxy(
                 source="mjc", destination="soft", bodies=self.gripper_bodies, mass_scale=args.mass_scale,

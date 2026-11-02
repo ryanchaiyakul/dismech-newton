@@ -8,7 +8,7 @@ from fd import assert_close, derivative
 from scipy.spatial.transform import Rotation
 from utils.splat import SH_C0, Splats, edge_gaussians, export_usd, skin, tube
 
-from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
+from dismech_newton import SolverDiSMech, add_rod, fix_segment, flatten_state
 from dismech_newton.state import dof_constants
 
 RADIUS, SIGMA = 0.02, (0.003, 0.008, 0.01)
@@ -65,11 +65,11 @@ def bent(proxies: bool = False):
     rods = (((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), True), ((0.0, -0.3, 0.7), (0.6, 0.0, 0.8), False))
     for start, direction, clamped in rods:
         rod = newton.Rod.create_straight(start, direction, 0.5, segment_count=6, radius=RADIUS)
-        ids = add_rod(builder, rod, stretch_stiffness=1.0e4, bend_stiffness=8.0, twist_stiffness=8.0, proxies=proxies)
+        bodies, _ = add_rod(builder, rod=rod, stretch_stiffness=1.0e4, bend_stiffness=8.0, twist_stiffness=8.0, proxies=proxies)
         if clamped:
-            fix_segment(builder, **({"body": ids[0]} if proxies else {"edge": ids[0]}))
+            fix_segment(builder, **({"body": bodies[0]} if proxies else {"edge": 0}))
     model = builder.finalize()
-    solver = DiSMechSolver(model)
+    solver = SolverDiSMech(model)
     a, b = model.state(), model.state()
     flatten_state(a)
     flatten_state(b)

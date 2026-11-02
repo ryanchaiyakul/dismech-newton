@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import THEORY, CableExample, Drive, default_frames, inset, inset_scale
 
-from dismech_newton import DiSMechSolver
+from dismech_newton import SolverDiSMech
 
 
 @wp.kernel
@@ -114,8 +114,8 @@ class Example(CableExample):
 
     def __init__(self, viewer, args=None):
         vertices, indices = self.mesh()
-        builder = newton.ModelBuilder(gravity=0.0)
-        self.ids = DiSMechSolver.add_cloth_mesh(builder, pos=(0.0, 0.0, 0.0), rot=wp.quat_from_axis_angle(
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        self.ids = SolverDiSMech.add_cloth_mesh(builder, pos=(0.0, 0.0, 0.0), rot=wp.quat_from_axis_angle(
             wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi), scale=0.01, vertices=[wp.vec3(v) for v in vertices],
             indices=indices, particle_radius=self.radius, **self.material)
         n = self.cols
@@ -125,7 +125,7 @@ class Example(CableExample):
         model = builder.finalize()
         model.particle_mu = self.mu
         # its compressed steps end on their budget either way: one factorization a step
-        self.start(viewer, model, DiSMechSolver(model, refactor=False, iterations=10))
+        self.start(viewer, model, SolverDiSMech(model, refactor=False, iterations=10))
         self.rest = model.particle_q.numpy().astype(np.float64)
         self.ends = np.concatenate(ends)
         self.axis = np.repeat([1.0, -1.0], n)  # about +y at y = -0.75, -y at +0.75 (Newton's rot_axes)

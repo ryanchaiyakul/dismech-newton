@@ -8,7 +8,7 @@ import pytest
 import warp as wp
 from fd import assert_close
 
-from dismech_newton import DiSMechSolver, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton.builder import vec5f
 from dismech_newton.rod import Rod, mat5x11f, rod_jacobian, rod_strain, vec5i, vec11f
 
@@ -94,9 +94,9 @@ def test_cantilever_converges_to_beam_theory():
         h = length / n
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         rod = newton.Rod.create_straight((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), length, segment_count=n, radius=r)
-        bodies = DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=rho),
+        bodies, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=rho),
                                        stretch_stiffness=E * area, bend_stiffness=EI / h, twist_stiffness=EI / h)
-        DiSMechSolver.fix_segment(builder, bodies[0])
+        SolverDiSMech.fix_segment(builder, bodies[0])
         tip = 1.0 - _run(builder, 200, 0.02)[-1][-1, 2]  # implicit Euler's damping settles it
         ratios.append(tip / (rho * area * 9.81 * (length - h) ** 4 / (8.0 * EI)))
     assert 1.0 < ratios[1] < ratios[0] < 1.1, ratios
@@ -106,11 +106,11 @@ def _dahl_triplet(eps_max: float, tau: float):
     """One triplet of stiffness ``K = 1`` (edges 0.1 m), its first edge clamped, the tip node nearly massless."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.2, segment_count=2, radius=0.01)
-    DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), bend_stiffness=1.0,
+    SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), bend_stiffness=1.0,
                           collide=False, proxies=False, dahl_eps_max=eps_max, dahl_tau=tau)
-    DiSMechSolver.fix_segment(builder, edge=0)
+    SolverDiSMech.fix_segment(builder, edge=0)
     model = builder.finalize()
-    return model, DiSMechSolver(model, self_contact=False)
+    return model, SolverDiSMech(model, self_contact=False)
 
 
 @wp.kernel
@@ -198,7 +198,7 @@ def test_dahl_off_is_elastic():
 def _run(builder, steps: int, dt: float) -> list:
     """The node positions after each step."""
     model = builder.finalize()
-    solver = DiSMechSolver(model, self_contact=False)
+    solver = SolverDiSMech(model, self_contact=False)
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
     flatten_state(s1)
@@ -226,10 +226,10 @@ def test_y_junction_arms_are_cantilevers():
             -1, 3) + [0.0, 0.0, 1.0]])
         edges = [(0 if i == 0 else 1 + b * n + i - 1, 1 + b * n + i) for b in range(3) for i in range(n)]
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        DiSMechSolver.add_rod(builder, newton.Rod(points, edges=edges, radius=r),
+        SolverDiSMech.add_rod(builder, rod=newton.Rod(points, edges=edges, radius=r),
                               cfg=newton.ModelBuilder.ShapeConfig(density=rho), stretch_stiffness=E * area,
                               bend_stiffness=EI / h, twist_stiffness=EI / h)
-        DiSMechSolver.fix_segment(builder, edge=0)  # the stem's segment at the junction
+        SolverDiSMech.fix_segment(builder, edge=0)  # the stem's segment at the junction
         x = _run(builder, 50, 0.1)[-1]  # settled
         tips = 1.0 - x[[2 * n, 3 * n], 2]
         assert abs(tips[0] - tips[1]) < 1.0e-4 * tips[0], tips  # the arms share the load
@@ -257,9 +257,9 @@ def test_reversed_edges_reproduce_the_chain():
     paths = []
     for rod in (chain, graph):
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
-        DiSMechSolver.add_rod(builder, rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0),
+        SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0),
                               stretch_stiffness=1.0e5, bend_stiffness=2.0, twist_stiffness=1.5)
-        DiSMechSolver.fix_segment(builder, edge=0)
+        SolverDiSMech.fix_segment(builder, edge=0)
         paths.append(np.array(_run(builder, 100, 0.01)))
     assert np.abs(paths[0] - paths[0][0]).max() > 1.0
     np.testing.assert_allclose(paths[1], paths[0], atol=1.0e-5)

@@ -2,7 +2,7 @@
 
 Each example is one file, runnable on its own; `--viewer null --test` runs it headless and checks it.
 Read them in this order: each adds one thing to the last. [`newton/`](newton) holds Newton's own cable and cloth
-examples run on `DiSMechSolver`; start there with `newton/cable_twist.py` for the basics.
+examples run on `SolverDiSMech`; start there with `newton/cable_twist.py` for the basics.
 
 | Example | What it adds |
 | --- | --- |
@@ -33,11 +33,11 @@ Most examples subclass `CableExample` ([`utils/common.py`](utils/common.py)), Ne
 
 ```python
 builder = newton.ModelBuilder()
-bodies = DiSMechSolver.add_rod(builder, newton.Rod(points, radius=r), bend_stiffness=k)  # colliding
-DiSMechSolver.fix_segment(builder, bodies[0])               # clamp the first segment
+bodies, _ = SolverDiSMech.add_rod(builder, rod=newton.Rod(points, radius=r), bend_stiffness=k)  # colliding
+SolverDiSMech.fix_segment(builder, bodies[0])               # clamp the first segment
 model = builder.finalize()
 model.shape_material_mu.fill_(0.5)  # Coulomb mu: Newton's materials
-self.start(viewer, model, DiSMechSolver(model))  # states; the solver finds its own contacts
+self.start(viewer, model, SolverDiSMech(model))  # states; the solver finds its own contacts
 self.spin = Drive(model, segment_dofs(model, bodies[0], twist_only=True))
 self.drives = (self.spin,)                                   # prescribed every substep
 ```

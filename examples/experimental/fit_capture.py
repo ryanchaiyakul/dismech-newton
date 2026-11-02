@@ -28,7 +28,7 @@ twist stiffness. Everything else it reads off the data:
    recovered pose, rendered over the clean plate and compared pixel by pixel; from the best of a coarse scan over
    1/30-30x the truth (its basin is narrow in EI: a rod that swings at another rate barely overlaps the recorded
    one), the frames blurred by 4, then 2, then 0 px. The fit
-   simulates with :class:`~dismech_newton.DiSMechSolver` (ADMM, 50 iterations a step), restarted for every
+   simulates with :class:`~dismech_newton.SolverDiSMech` (ADMM, 50 iterations a step), restarted for every
    rollout, and takes the gradient through its steps; the video is simulated with Newton.
 
 The start pose limits the fit: a node off by a millimetre on 5 cm edges is a kink as curved as the rod, the released
@@ -65,7 +65,7 @@ from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale
 from utils.gaussians import DEVICE, Camera, backprop, to_uint8, view
 from utils.splat import Splats, skin
 
-from dismech_newton import DiSMechSolver, add_rod, fix_segment, flatten_state
+from dismech_newton import SolverDiSMech, add_rod, fix_segment, flatten_state
 
 # -- the rod and the truth -----------------------------------------------------------------
 LENGTH, SEGMENTS, RADIUS = 0.5, 10, 0.02
@@ -134,15 +134,15 @@ def build(length=LENGTH, radius=RADIUS, mass=None, admm: bool = False):
     default density's). ``admm``: ADMM at 50 iterations a step (else Gauss-Newton to convergence)."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     rod = newton.Rod.create_straight(tuple(CLAMP), (1.0, 0.0, 0.0), length, segment_count=SEGMENTS, radius=radius)
-    ids = add_rod(builder, rod, stretch_stiffness=EA, bend_stiffness=TRUE["EI"], twist_stiffness=GJ,
-                  bend_damping=TRUE["c"], proxies=False)
-    fix_segment(builder, edge=ids[0])
+    add_rod(builder, rod=rod, stretch_stiffness=EA, bend_stiffness=TRUE["EI"], twist_stiffness=GJ,
+            bend_damping=TRUE["c"], proxies=False)
+    fix_segment(builder, edge=0)
     model = builder.finalize(device=DEVICE)
     if mass is not None:
         m = model.particle_mass
         assert m is not None
         m.assign(m.numpy() * (mass / m.numpy().sum()))
-    solver = DiSMechSolver(model, iterations=50) if admm else DiSMechSolver(model, exact=True, iterations=20)
+    solver = SolverDiSMech(model, iterations=50) if admm else SolverDiSMech(model, exact=True, iterations=20)
     solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
     return model, solver
 
@@ -880,7 +880,7 @@ class Example:
         for color in (GREY, GREEN):
             rod = newton.Rod.create_straight(tuple(CLAMP), (1.0, 0.0, 0.0), LENGTH, segment_count=SEGMENTS,
                                              radius=RADIUS)
-            add_rod(builder, rod, bend_stiffness=1.0, color=color)
+            add_rod(builder, rod=rod, bend_stiffness=1.0, color=color)
         self.model = builder.finalize()
         self.state = self.model.state()
         assert self.state.body_q is not None

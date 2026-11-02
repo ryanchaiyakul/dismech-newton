@@ -1,13 +1,10 @@
-"""The direct solves against dense ones: symmetric (upper CSR) and general; SciPy on the CPU, cuDSS (float64 and
-float32) on CUDA."""
+"""The direct solves against dense ones (upper CSR); SciPy on the CPU, cuDSS (float64 and float32) on CUDA."""
 
 import numpy as np
-import pytest
-import scipy.sparse as sp
 import warp as wp
 from fd import assert_close
 
-from dismech_newton.linear import CudssSolver, GeneralCSR, ScipySolver, SymmetricCSR, cudss
+from dismech_newton.linear import CudssSolver, ScipySolver, SymmetricCSR, cudss
 
 
 def _system(rng, device, n: int = 40):
@@ -31,12 +28,8 @@ def _solvers(A, device):
     return {"cudss": (CudssSolver(A), 1.0e-6), "cudss float32": (CudssSolver(A, single=True), 1.0e-5)}
 
 
-@pytest.mark.parametrize("general", [False, True], ids=["symmetric", "general"])
-def test_solvers_match_dense(device, rng, general):
+def test_solvers_match_dense(device, rng):
     A, full = _system(rng, device)
-    if general:  # make it nonsymmetric
-        full = full + np.triu(rng.normal(size=full.shape), 1) * (full != 0)
-        A = GeneralCSR(sp.csr_matrix(full), device)
     b = rng.normal(size=full.shape[0])
     expected = np.linalg.solve(full, b)
     for name, (solver, rtol) in _solvers(A, device).items():

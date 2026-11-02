@@ -225,6 +225,7 @@ class StepAdjoint:
                           outputs=[self.residual], device=dev)
         return tape
 
+
 def _detached(a):
     """An alias of an array, or of a ``wp.struct``'s arrays, without adjoints (``a`` must outlive it)."""
     if hasattr(a, "_cls"):
@@ -390,7 +391,6 @@ def _contact_residual_kernel(
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)
-
 
 
 @wp.func

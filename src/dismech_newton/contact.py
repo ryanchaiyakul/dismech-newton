@@ -55,10 +55,10 @@ class Slots:
 @wp.struct
 class Arm:
     """Bodies that yield to the contacts within the step (:class:`~.coupling.ProxyArm`): ``k`` DOFs ``z`` per world,
-    from DOF ``start``, their moves over the step (their anchors are at its start). Body ``b``'s DOFs start at
-    ``base[b]`` (-1: it does not yield) and move its point ``x`` by ``sum_m z_m (v_m + w_m x (x - com[b]))``,
-    ``J[b, m] = (v_m, w_m)``; their inertia is ``(z - pred)^T M[w] (z - pred) / 2 h^2``, ``pred`` their own step's
-    moves. A shape pair's body is ``shape_body[shape_of(key, key0)]``."""
+    from DOF ``start``, their moves over the step (their anchors are at its start). Body ``b``'s 6 DOFs start at
+    ``base[b]`` (-1: it does not yield), its centre of mass's move ``dx`` and a small rotation ``dth``, moving its
+    point ``x`` by ``dx + dth x (x - com[b])``; their inertia is ``(z - pred)^T M[w] (z - pred) / 2 h^2``, ``pred``
+    their own step's moves. A shape pair's body is ``shape_body[shape_of(key, key0)]``."""
 
     k: int
     start: int
@@ -66,7 +66,6 @@ class Arm:
     inv_h2: float
     shape_body: wp.array[wp.int32]
     base: wp.array[wp.int32]
-    J: wp.array2d[wp.spatial_vector]
     com: wp.array[wp.vec3]
     M: wp.array3d[float]
     Minv: wp.array3d[float]
@@ -78,7 +77,6 @@ def make_arm(model: Model, key0: int, start: int, k: int) -> Arm:
     a.k, a.start, a.key0, a.inv_h2 = k, start, key0, 0.0
     a.shape_body = model.shape_body if model.shape_count else wp.zeros(1, dtype=wp.int32, device=dev)
     a.base = wp.full(nb, -1, dtype=wp.int32, device=dev)
-    a.J = wp.zeros((nb, max(k, 1)), dtype=wp.spatial_vector, device=dev)
     a.com = wp.zeros(nb, dtype=wp.vec3, device=dev)
     a.M = wp.zeros((max(model.world_count, 1), max(k, 1), max(k, 1)), dtype=float, device=dev)
     a.Minv = wp.zeros_like(a.M)
@@ -156,10 +154,48 @@ def arm_body(arm: Arm, s: Slots, i: int) -> int:
 
 
 @wp.func
-def arm_jacobian(arm: Arm, b: int, m: int, r: wp.vec3) -> wp.vec3:
-    """The move of body ``b``'s point ``com + r`` per unit of its DOF ``m``."""
-    v = arm.J[b, m]
-    return wp.spatial_top(v) + wp.cross(wp.spatial_bottom(v), r)
+def arm_jacobian(m: int, r: wp.vec3) -> wp.vec3:
+    """The move of a body's point ``com + r`` per unit of its DOF ``m``: ``dx`` (``m < 3``), then ``dth``."""
+    e = wp.vec3(0.0)
+    e[m % 3] = 1.0
+    return wp.where(m < 3, e, wp.cross(e, r))
+
+
+@wp.func
+def arm_move(q: wp.array[float], arm: Arm, b: int, r: wp.vec3) -> wp.vec3:
+    """Body ``b``'s point ``com + r`` moved by its DOFs in ``q``."""
+    i = arm.base[b]
+    return wp.vec3(q[i], q[i + 1], q[i + 2]) + wp.cross(wp.vec3(q[i + 3], q[i + 4], q[i + 5]), r)
+
+
+@wp.func
+def arm_scatter(b: wp.array[wp.float64], arm: Arm, body: int, r: wp.vec3, g: wp.vec3):
+    """``b -= P^T g``: a force ``g`` on the body's point ``com + r`` (``P`` its :func:`arm_move`), into its DOFs."""
+    i = arm.base[body]
+    t = wp.cross(r, g)
+    for c in range(3):
+        wp.atomic_add(b, i + c, wp.float64(-g[c]))
+        wp.atomic_add(b, i + 3 + c, wp.float64(-t[c]))
+
+
+@wp.func
+def arm_assemble(vals: wp.array[wp.float64], indptr: wp.array[wp.int32], indices: wp.array[wp.int32],
+                 fixed: wp.array[wp.int32], arm: Arm, body: int, r: wp.vec3, H: wp.mat33, n: int, Jn: wp.mat33):
+    """Into the upper CSR (all in the pattern: a node and its world's arm), the Hessian blocks of an energy with
+    Hessian ``H`` in a gap ``Jn x_n - P z`` (``P`` the body's :func:`arm_move` at ``r``): node ``n``'s ``-Jn^T H P``,
+    then, with ``n < 0``, the body's ``P^T H P``."""
+    for m in range(6):
+        HP = H * arm_jacobian(m, r)
+        zm = arm.base[body] + m
+        if n >= 0:
+            v = wp.transpose(Jn) * HP
+            for c in range(3):
+                if fixed[3 * n + c] == 0:
+                    wp.atomic_add(vals, row_slot(indptr, indices, 3 * n + c, zm), wp.float64(-v[c]))
+        else:
+            for m2 in range(m, 6):
+                wp.atomic_add(vals, row_slot(indptr, indices, zm, arm.base[body] + m2),
+                              wp.float64(wp.dot(arm_jacobian(m2, r), HP)))
 
 
 @wp.func
@@ -169,12 +205,13 @@ def arm_flexibility(arm: Arm, s: Slots, i: int) -> float:
     if b < 0:
         return 0.0
     w = (arm.base[b] - arm.start) // arm.k
+    o = arm.base[b] - arm.start - w * arm.k  # the body's DOFs in its world's
     r = s.anchor[i] - arm.com[b]
     flex = float(0.0)
-    for m in range(arm.k):
-        pm = wp.dot(s.normal[i], arm_jacobian(arm, b, m, r))
-        for m2 in range(arm.k):
-            flex += pm * arm.Minv[w, m, m2] * wp.dot(s.normal[i], arm_jacobian(arm, b, m2, r))
+    for m in range(6):
+        pm = wp.dot(s.normal[i], arm_jacobian(m, r))
+        for m2 in range(6):
+            flex += pm * arm.Minv[w, o + m, o + m2] * wp.dot(s.normal[i], arm_jacobian(m2, r))
     return flex
 
 
@@ -185,9 +222,7 @@ def pair_point(q: wp.array[float], s: Slots, i: int, arm: Arm, anchor: wp.vec3) 
     c = contact_point(q, s.pair[i], s.w[i], anchor) + slot_roll(q, s, i)
     b = arm_body(arm, s, i)
     if b >= 0:
-        r = s.anchor[i] - arm.com[b]
-        for m in range(arm.k):
-            c -= q[arm.base[b] + m] * arm_jacobian(arm, b, m, r)
+        c -= arm_move(q, arm, b, s.anchor[i] - arm.com[b])
     return c
 
 
@@ -269,9 +304,9 @@ class BarrierBlock:
     its detection: :func:`barrier` (infinite at ``d = 0``: the line search never takes a candidate through a
     contact), and lagged smoothed Coulomb friction (IPC), ``mu lam f0(|slip|)`` with the normal force ``lam`` at the
     step's start and ``f0`` smoothed over :data:`SLIP_SPEED` ``dt``. Each pair's ``k`` is :data:`STIFFNESS` times its
-    inertia ``1 / (dt^2 C M^-1 C^T)`` (a light sheet vertex and a rod node alike: Newton sees the contact coming), times
-    its nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction); the solver
-    caps each node's move per detection so no pair beyond it can close."""
+    inertia ``1 / (dt^2 C M^-1 C^T)`` (a light sheet vertex and a rod node alike: Newton sees the contact coming),
+    times its nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction);
+    the solver caps each node's move per detection so no pair beyond it can close."""
 
     def __init__(self, model: Model, fixed: wp.array, source):
         self.fixed, self.device, self.source = fixed, wp.get_device(model.device), source
@@ -543,9 +578,7 @@ def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fix
             scatter_node(b, fixed, s.pair[i][j], wp.transpose(slot_map(s, i, j)) * g)
     body = arm_body(arm, s, i)
     if body >= 0:
-        r = s.anchor[i] - arm.com[body]
-        for m in range(arm.k):
-            wp.atomic_add(b, arm.base[body] + m, wp.float64(-wp.dot(g, arm_jacobian(arm, body, m, r))))
+        arm_scatter(b, arm, body, s.anchor[i] - arm.com[body], g)
 
 
 @wp.kernel
@@ -586,21 +619,12 @@ def _barrier_assemble_kernel(
                             if slot >= 0:
                                 wp.atomic_add(vals, slot, wp.float64(B[c, c2]))
     body = arm_body(arm, s, i)
-    if body >= 0:  # the anchor's DOFs: -P^T H C and P^T H P (exact: all in the pattern)
+    if body >= 0:  # the anchor's DOFs
         r = s.anchor[i] - arm.com[body]
-        for m in range(arm.k):
-            HP = H * arm_jacobian(arm, body, m, r)
-            zm = arm.base[body] + m
-            for a in range(4):
-                na = pair[a]
-                if na >= 0:
-                    JHP = wp.transpose(slot_map(s, i, a)) * HP
-                    for c in range(3):
-                        if fixed[3 * na + c] == 0:
-                            wp.atomic_add(vals, row_slot(indptr, indices, 3 * na + c, zm), wp.float64(-JHP[c]))
-            for m2 in range(m, arm.k):
-                wp.atomic_add(vals, row_slot(indptr, indices, zm, arm.base[body] + m2),
-                              wp.float64(wp.dot(arm_jacobian(arm, body, m2, r), HP)))
+        for a in range(4):
+            if pair[a] >= 0:
+                arm_assemble(vals, indptr, indices, fixed, arm, body, r, H, pair[a], slot_map(s, i, a))
+        arm_assemble(vals, indptr, indices, fixed, arm, body, r, H, -1, H)
 
 
 @wp.kernel
@@ -668,8 +692,7 @@ def _carry_kernel(block: int, lam: wp.array[float], lam_key: wp.array[wp.int32],
 
 @wp.kernel
 def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, tol: float, lam: wp.array[float],
-                  lam_key: wp.array[wp.int32],
-                  moved: wp.array[wp.int32]):
+                  lam_key: wp.array[wp.int32], moved: wp.array[wp.int32]):
     """``lam <- max(0, lam + k (th - d))`` into the store: the quadratic's force at ``q`` less the ``k dl / 2`` its
     barrier alone holds at the thickness (the ramp's middle), so the pair holds it there (the augmented Lagrangian's
     update); the log's force below ``th / 2`` is not taken (at an unconverged iterate it diverges, and through the

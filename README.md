@@ -5,17 +5,10 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![CUDA 13](https://img.shields.io/badge/CUDA-13-76B900)
 
-Implicit discrete elastic rods and shells inpsired by [Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/) for [NVIDIA Newton](https://github.com/newton-physics/newton).
+Discrete elastic rods and midedge shells for [NVIDIA Newton](https://github.com/newton-physics/newton), inspired by
+[Daviet (2023)](https://research.nvidia.com/labs/prl/admm_hair/).
 
-## Newton Examples
-
-> TODO: put some pngs of these examples like newton
-
-## Theory (Not sure best title but only like compared against theory)
-
-top is rods only cantilever, knot, twist
-
-bottom is shell cantilver, contact eyelet not sure last
+## Examples
 
 <table>
   <tr>
@@ -56,10 +49,43 @@ bottom is shell cantilver, contact eyelet not sure last
   </tr>
 </table>
 
+Newton's own cable and cloth examples (pile, plectoneme, Y junction, hysteresis, cross slide table, Franka pick and
+place, hanging and draped cloth, ...) run on `SolverDiSMech` in [`examples/newton/`](examples/newton). See
+[`examples/`](examples) for what each example adds.
+
 ## Install
 
-Requires Python 3.10+. Runs on an NVIDIA GPU with CUDA 13 or on the CPU.
+Requires Python 3.10+. Runs on an NVIDIA GPU with CUDA 13 (cuDSS through the `gpu` extra) or on the CPU (SciPy).
 
 ```bash
-pip install "dismech-newton[gpu]"
+pip install "dismech-newton[gpu]"           # add `mujoco` for the coupled examples, `viewer` for the viewer
+```
+
+## Usage
+
+```python
+import newton
+import numpy as np
+from dismech_newton import SolverDiSMech
+
+builder = newton.ModelBuilder()
+points = np.linspace([0.0, 0.0, 1.0], [1.0, 0.0, 1.0], 21)  # a 1 m rod, 20 segments
+bodies, _ = SolverDiSMech.add_rod(builder, rod=newton.Rod(points, radius=0.01), bend_stiffness=1.0e-2)
+SolverDiSMech.fix_segment(builder, bodies[0])  # clamp the first segment
+model = builder.finalize()
+solver = SolverDiSMech(model)
+state_0, state_1 = model.state(), model.state()
+for _ in range(100):
+    solver.step(state_0, state_1, None, None, 1.0e-2)  # finds its own contacts
+    state_0, state_1 = state_1, state_0
+```
+
+Shells come from `SolverDiSMech.add_cloth_mesh` with Newton's `add_cloth_mesh` arguments.
+
+## Development
+
+```bash
+uv sync --extra gpu --extra mujoco --group dev
+uv run pytest            # physical checks against theory and finite differences
+uv run pytest -m slow    # the examples
 ```

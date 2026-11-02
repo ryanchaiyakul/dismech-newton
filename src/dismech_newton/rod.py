@@ -46,7 +46,8 @@ class Rods:
         node0, node1 = d.edge_node0.numpy(), d.edge_node1.numpy()
         shared = np.where((node0[e] == node0[f]) | (node0[e] == node1[f]), node0[e], node1[e])
         se, sf = np.where(node1[e] == shared, 1.0, -1.0), np.where(node0[f] == shared, 1.0, -1.0)
-        conn = np.column_stack((e, f, np.where(se > 0, node0[e], node1[e]), shared, np.where(sf > 0, node1[f], node0[f])))
+        conn = np.column_stack((e, f, np.where(se > 0, node0[e], node1[e]), shared,
+                                np.where(sf > 0, node1[f], node0[f])))
         self.conn = wp.array(conn.astype(np.int32).reshape(-1, 5), dtype=vec5i, device=dev)
         self.sign = wp.array(np.column_stack((se, sf)).reshape(-1, 2), dtype=wp.vec2, device=dev)
         self.kernels = element_kernels(Rod, rod_strain, rod_jacobian, rod_dofs, 5, 11)

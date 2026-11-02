@@ -19,20 +19,8 @@ except ImportError:
 _CUDA_R_32F, _CUDA_R_64F, _CUDA_R_32I = 0, 1, 10  # cudaDataType codes
 
 
-class _CSR:
-    """``n``, ``indptr``, ``indices`` and float64 ``vals`` on the device."""
-
-    @property
-    def nnz(self) -> int:
-        return self.vals.shape[0]
-
-    def to_scipy(self) -> sp.csr_matrix:
-        """The stored entries on the host."""
-        return sp.csr_matrix((self.vals.numpy(), self.indices.numpy(), self.indptr.numpy()), shape=(self.n, self.n))
-
-
-class SymmetricCSR(_CSR):
-    """Upper-triangle float64 CSR; the pattern is the diagonal and every DOF pair within a row of each
+class SymmetricCSR:
+    """Upper-triangle float64 CSR on the device; the pattern is the diagonal and every DOF pair within a row of each
     ``(count, width)`` DOF array of ``stencils``."""
 
     def __init__(self, n: int, stencils: tuple[np.ndarray, ...], device) -> None:
@@ -40,7 +28,7 @@ class SymmetricCSR(_CSR):
         keys = np.unique(np.concatenate(keys))
         indptr = np.zeros(n + 1, dtype=np.int32)
         np.cumsum(np.bincount(keys // n, minlength=n), out=indptr[1:])
-        self.n = n
+        self.n, self.nnz = n, len(keys)
         self.pattern = (indptr, (keys % n).astype(np.int32))  # host copy
         self.indptr = wp.array(indptr, dtype=wp.int32, device=device)
         self.indices = wp.array(self.pattern[1], dtype=wp.int32, device=device)
@@ -53,31 +41,10 @@ class SymmetricCSR(_CSR):
         slot = np.searchsorted(self._keys, _pairs(d, self.n)).T.astype(np.int32)
         return wp.array(np.ascontiguousarray(slot), dtype=wp.int32, device=self.vals.device)
 
-    def entries(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Host ``(rows, cols, slot)`` of the full matrix's entries: the upper triangle mirrored."""
-        indptr, indices = self.pattern
-        rows = np.repeat(np.arange(self.n), np.diff(indptr))
-        off = indices != rows
-        return (np.concatenate([rows, indices[off]]), np.concatenate([indices, rows[off]]),
-                np.concatenate([np.arange(len(indices)), np.flatnonzero(off)]))
-
     def to_scipy(self) -> sp.csr_matrix:
         """The full symmetric matrix on the host."""
-        upper = super().to_scipy()
+        upper = sp.csr_matrix((self.vals.numpy(), self.pattern[1], self.pattern[0]), shape=(self.n, self.n))
         return (upper + upper.T - sp.diags(upper.diagonal())).tocsr()
-
-
-class GeneralCSR(_CSR):
-    """CSR of a general float64 matrix (the pattern of ``A``, its values on the device)."""
-
-    def __init__(self, A: sp.spmatrix, device) -> None:
-        A = sp.csr_matrix(A)
-        A.sum_duplicates()
-        A.sort_indices()
-        self.n = A.shape[0]
-        self.indptr = wp.array(A.indptr.astype(np.int32), dtype=wp.int32, device=device)
-        self.indices = wp.array(A.indices.astype(np.int32), dtype=wp.int32, device=device)
-        self.vals = wp.array(A.data.astype(np.float64), dtype=wp.float64, device=device)
 
 
 def _pairs(d: np.ndarray, n: int) -> np.ndarray:
@@ -94,23 +61,30 @@ def triu_slot(a: int, c: int, D: int) -> int:
 
 @wp.func
 def row_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], a: int, b: int) -> int:
-    """The slot of ``(a, b)`` in either order, by searching its row; ``-1`` outside the pattern."""
+    """The slot of ``(a, b)`` in either order, by bisecting its (sorted) row; ``-1`` outside the pattern."""
     r = wp.min(a, b)
     c = wp.max(a, b)
-    for s in range(indptr[r], indptr[r + 1]):
-        if indices[s] == c:
-            return s
+    lo = indptr[r]
+    hi = indptr[r + 1]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if indices[mid] < c:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < indptr[r + 1] and indices[lo] == c:
+        return lo
     return -1
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`; Cholesky if ``spd``: 15% faster), analysed when built
+    """``A x = b`` by cuDSS LDL^T (Cholesky if ``spd``: 15% faster), analysed when built
     and factorised on the first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a
     GeForce's float64, for an ``A`` that only has to be approximate). Graph-capturable."""
 
     graph_capturable = True
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR, single: bool = False, spd: bool = False) -> None:
+    def __init__(self, A: SymmetricCSR, single: bool = False, spd: bool = False) -> None:
         self.A, self.device, self.spd = A, A.vals.device, spd
         dtype = wp.float32 if single else wp.float64
         self._type = _CUDA_R_32F if single else _CUDA_R_64F
@@ -128,18 +102,15 @@ class CudssSolver:
         self._handle = cudss.create()
         self._config = cudss.config_create()
         self._data = cudss.data_create(self._handle)
-        if isinstance(A, GeneralCSR):
-            kind = cudss.MatrixType.GENERAL, cudss.MatrixViewType.FULL
-        else:
-            kind = cudss.MatrixType.SPD if self.spd else cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
+        kind = cudss.MatrixType.SPD if self.spd else cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.UPPER
         self._A = cudss.matrix_create_csr(A.n, A.n, A.nnz, A.indptr.ptr, 0, A.indices.ptr, self._vals.ptr,
                                           _CUDA_R_32I, _CUDA_R_32I, self._type, *kind, cudss.IndexBase.ZERO)
         self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, self._type, cudss.Layout.COL_MAJOR)
         self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, self._type, cudss.Layout.COL_MAJOR)
         self._execute(cudss.Phase.ANALYSIS)
         # its buffers allocated now, not inside a caller's first capture: an identity on the pattern, factorised
-        ptr = A.indptr.numpy()
-        unit = (A.indices.numpy() == np.repeat(np.arange(A.n), np.diff(ptr))).astype(wp.dtype_to_numpy(self._vals.dtype))
+        ptr, cols = A.pattern
+        unit = (cols == np.repeat(np.arange(A.n), np.diff(ptr))).astype(wp.dtype_to_numpy(self._vals.dtype))
         vals = wp.clone(self._vals)
         self._vals.assign(unit)
         cudss.set_stream(self._handle, self.device.stream.cuda_stream)
@@ -215,7 +186,7 @@ class ScipySolver:
 
     graph_capturable = False
 
-    def __init__(self, A: SymmetricCSR | GeneralCSR) -> None:
+    def __init__(self, A: SymmetricCSR) -> None:
         self.A = A
         self._lu = None
         if A.vals.device.is_cuda:
@@ -241,8 +212,7 @@ class ScipySolver:
         x.assign(self._lu.solve(b.numpy().astype(np.float64)).astype(wp.dtype_to_numpy(x.dtype)))
 
 
-def sparse_solver(A: SymmetricCSR | GeneralCSR, single: bool = False,
-                  spd: bool = False) -> CudssSolver | ScipySolver:
+def sparse_solver(A: SymmetricCSR, single: bool = False, spd: bool = False) -> CudssSolver | ScipySolver:
     """cuDSS for a CUDA ``A`` (with nvmath installed), else SciPy; ``single``: cuDSS in float32; ``spd``: ``A`` is
     positive definite."""
     if A.vals.device.is_cuda and cudss is not None:

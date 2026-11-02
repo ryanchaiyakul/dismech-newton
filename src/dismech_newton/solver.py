@@ -39,6 +39,7 @@ FINISH = 3  # a step's last iterations, after its multipliers are updated whethe
 # the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
 # force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
 TOLERANCE = 0.01
+CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q")  # state a step carries beyond the DOFs (and strains)
 
 
 class SolverDiSMech(SolverBase, CouplingInterface):
@@ -198,7 +199,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         if s.q.shape[0] > nd:
             for k in ("q", "qd"):
                 yield getattr(s, k)[nd:], getattr(p, k)[nd:]
-        for k in ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q", *(e.stored for e in self.elements)):
+        for k in (*CARRIED, *(e.stored for e in self.elements)):
             if getattr(s, k).shape[0]:
                 yield getattr(s, k), getattr(p, k)
 
@@ -228,7 +229,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
 
     def _record(self, tape: wp.Tape, state_in: State, state_out: State, dt: float) -> None:
         s_in, s_out = state_in.dismech, state_out.dismech
-        names = ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q", *(e.stored for e in self.elements))
+        names = ("q", "qd", *CARRIED, *(e.stored for e in self.elements))
         outputs = [getattr(s_out, k) for k in names]
         if not any(a.requires_grad for a in outputs):
             return

@@ -5,7 +5,7 @@ import numpy as np
 import warp as wp
 from newton import BodyFlags, JointType, Model, State
 
-from .contact import STIFFNESS, Arm, arm_jacobian
+from .contact import STIFFNESS, Arm, arm_assemble, arm_move, arm_scatter
 from .linear import row_slot
 from .state import block_sum, node, padded, scatter_node
 
@@ -35,7 +35,6 @@ class ProxyArm:
         self._world, self._slot = world, slot
         nb = max(model.body_count, 1)
         self._body = wp.array(proxy, dtype=wp.int32, device=self.device)
-        self._slot_wp = wp.array(slot, dtype=wp.int32, device=self.device)
         self._q = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the step's body poses: the proxies' own
         self._qd = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)
         self._last = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the last step left
@@ -48,12 +47,8 @@ class ProxyArm:
     def bind(self, arm: Arm) -> None:
         self._arm = arm
         base = np.full(arm.base.shape[0], -1, dtype=np.int32)
-        base[self._body.numpy()] = arm.start + self._world * self.k  # the world's DOFs; the body's at 6 slot
+        base[self._body.numpy()] = arm.start + self._world * self.k + 6 * self._slot  # its 6 in its world's
         arm.base.assign(base)
-        J = np.zeros((arm.J.shape[0], self.k, 6), dtype=np.float32)
-        for b, j in zip(self._body.numpy(), self._slot, strict=True):
-            J[b, 6 * j: 6 * j + 6] = np.eye(6)
-        arm.J.assign(J)
         eye = np.broadcast_to(np.eye(self.k, dtype=np.float32), arm.M.shape)  # the worlds' unused DOFs: still
         arm.M.assign(eye)
         arm.Minv.assign(eye)
@@ -69,7 +64,7 @@ class ProxyArm:
         wp.copy(self._q, state.body_q)
         wp.copy(self._qd, state.body_qd)
         wp.launch(_proxy_update_kernel, dim=self._body.shape[0],
-                  inputs=[self._body, self._slot_wp, a.base, a.start, self.k, m.body_world, m.body_mass, m.body_inertia, m.body_com,
+                  inputs=[self._body, a.base, a.start, self.k, m.body_world, m.body_mass, m.body_inertia, m.body_com,
                           m.gravity, state.body_q, state.body_qd, state.body_f, self._last, self._valid,
                           int(self.restart), h],
                   outputs=[a.M, a.Minv, a.pred, a.com, self._q, self._qd, self._offset, self._start],
@@ -85,7 +80,7 @@ class ProxyArm:
                       inputs=[self._free, m.body_world, m.body_mass, m.gravity, state_in.body_q, state_in.body_qd,
                               state_in.body_f, dt], outputs=[state_out.body_q, state_out.body_qd], device=self.device)
         wp.launch(_proxy_finish_kernel, dim=self._body.shape[0],
-                  inputs=[self._body, self._slot_wp, a.base, z, a.com, m.body_com, self._q, self._offset, dt, h],
+                  inputs=[self._body, a.base, z, a.com, m.body_com, self._q, self._offset, dt, h],
                   outputs=[state_out.body_q, state_out.body_qd, self._last], device=self.device)
         self._valid.fill_(1)
 
@@ -112,8 +107,7 @@ def _turn(v: wp.vec3, q: wp.quat) -> wp.quat:
 
 
 @wp.kernel
-def _proxy_update_kernel(body: wp.array[wp.int32], slot: wp.array[wp.int32], base: wp.array[wp.int32], start: int,
-                         k: int,
+def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: int, k: int,
                          body_world: wp.array[wp.int32], mass: wp.array[float], inertia: wp.array[wp.mat33],
                          body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
                          body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
@@ -123,9 +117,9 @@ def _proxy_update_kernel(body: wp.array[wp.int32], slot: wp.array[wp.int32], bas
                          offset: wp.array[wp.spatial_vector], start_q: wp.array[wp.transform]):
     p = wp.tid()
     b = body[p]
-    w = (base[b] - start) // k
-    i0 = 6 * slot[p]
-    i = w * k + i0
+    i = base[b] - start
+    w = i // k
+    i0 = i - w * k
     synced = body_q[b]
     q0 = synced
     if restart != 0:
@@ -162,14 +156,13 @@ def _proxy_update_kernel(body: wp.array[wp.int32], slot: wp.array[wp.int32], bas
 
 
 @wp.kernel
-def _proxy_finish_kernel(body: wp.array[wp.int32], slot: wp.array[wp.int32], base: wp.array[wp.int32],
-                         z: wp.array[float],
+def _proxy_finish_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], z: wp.array[float],
                          com: wp.array[wp.vec3], body_com: wp.array[wp.vec3], q_step: wp.array[wp.transform],
                          offset: wp.array[wp.spatial_vector], dt: float, h: float, q_out: wp.array[wp.transform],
                          qd_out: wp.array[wp.spatial_vector], last: wp.array[wp.transform]):
     p = wp.tid()
     b = body[p]
-    i = base[b] + 6 * slot[p]
+    i = base[b]
     dx = wp.vec3(z[i], z[i + 1], z[i + 2])
     dth = wp.vec3(z[i + 3], z[i + 4], z[i + 5])
     s = dt / h
@@ -191,10 +184,7 @@ def _proxy_free_kernel(body: wp.array[wp.int32], body_world: wp.array[wp.int32],
     if mass[b] > 0.0:
         v += dt * wp.spatial_top(body_f[b]) / mass[b]
     om = wp.spatial_bottom(body_qd[b])
-    rot = wp.transform_get_rotation(body_q[b])
-    angle = wp.length(om) * dt
-    if angle > 0.0:
-        rot = wp.normalize(wp.quat_from_axis_angle(wp.normalize(om), angle) * rot)
+    rot = _turn(dt * om, wp.transform_get_rotation(body_q[b]))
     q_out[b] = wp.transform(wp.transform_get_translation(body_q[b]) + dt * v, rot)
     qd_out[b] = wp.spatial_vector(v, om)
 
@@ -278,11 +268,7 @@ class ProxyPins:
 def _pin_gap(q: wp.array[float], p: Pins, i: int, arm: Arm) -> wp.vec3:
     """``x - p - P z``."""
     b = p.body[i]
-    r = p.point[i] - arm.com[b]
-    c = node(q, p.node[i]) - p.point[i]
-    for m in range(arm.k):
-        c -= q[arm.base[b] + m] * arm_jacobian(arm, b, m, r)
-    return c
+    return node(q, p.node[i]) - p.point[i] - arm_move(q, arm, b, p.point[i] - arm.com[b])
 
 
 @wp.kernel
@@ -297,10 +283,7 @@ def _pin_grad_kernel(q: wp.array[float], p: Pins, arm: Arm, fixed: wp.array[wp.i
     i = wp.tid()
     g = p.k[i] * _pin_gap(q, p, i, arm)
     scatter_node(b, fixed, p.node[i], g)
-    body = p.body[i]
-    r = p.point[i] - arm.com[body]
-    for m in range(arm.k):
-        wp.atomic_add(b, arm.base[body] + m, wp.float64(-wp.dot(g, arm_jacobian(arm, body, m, r))))
+    arm_scatter(b, arm, p.body[i], p.point[i] - arm.com[p.body[i]], g)
 
 
 @wp.kernel
@@ -323,15 +306,9 @@ def _pin_assemble_kernel(p: Pins, arm: Arm, fixed: wp.array[wp.int32], indptr: w
     for c in range(3):
         if fixed[3 * n + c] == 0:
             wp.atomic_add(vals, row_slot(indptr, indices, 3 * n + c, 3 * n + c), wp.float64(k))
-    for m in range(arm.k):
-        Pm = arm_jacobian(arm, body, m, r)
-        zm = arm.base[body] + m
-        for c in range(3):
-            if fixed[3 * n + c] == 0:
-                wp.atomic_add(vals, row_slot(indptr, indices, 3 * n + c, zm), wp.float64(-k * Pm[c]))
-        for m2 in range(m, arm.k):
-            wp.atomic_add(vals, row_slot(indptr, indices, zm, arm.base[body] + m2),
-                          wp.float64(k * wp.dot(Pm, arm_jacobian(arm, body, m2, r))))
+    eye = wp.identity(3, float)
+    arm_assemble(vals, indptr, indices, fixed, arm, body, r, k * eye, n, eye)
+    arm_assemble(vals, indptr, indices, fixed, arm, body, r, k * eye, -1, eye)
 
 
 @wp.kernel

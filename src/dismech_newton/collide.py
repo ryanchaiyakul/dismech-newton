@@ -172,7 +172,7 @@ class Offset:
         self.cap = 0.0  # set by the solver
 
     def slots(self) -> int:
-        """None where no pair can touch (recording a step for its adjoint then reads no count)."""
+        """The slot count, 0 where no pair can touch (recording a step for its adjoint then reads no count)."""
         on = self.mesh.edge_on.numpy()
         rods, shells = bool(on[: self.num_rod_edges].any()), self.num_faces > 0
         if (rods or shells) and (self.self_contact or self.bodies.shapes.shape[0] or (rods and shells)):
@@ -200,8 +200,8 @@ class Offset:
     def reactions(self, q: wp.array, s: Slots, arm: Arm, eps: float, body_f: wp.array) -> None:
         """Add to ``body_f`` each shape pair's force at ``q`` on its body (equal and opposite to the nodes'), with its
         torque about the body's centre of mass at the step's end: world frame, Newton's ``body_f`` layout."""
-        wp.launch(_reaction_kernel, dim=s.active.shape[0], inputs=[q, s, arm, eps, self.shape_key0, self.bodies, body_f],
-                  device=self.fixed.device)
+        wp.launch(_reaction_kernel, dim=s.active.shape[0],
+                  inputs=[q, s, arm, eps, self.shape_key0, self.bodies, body_f], device=self.fixed.device)
 
 
 @wp.struct
@@ -351,7 +351,8 @@ def _in_node_region(q: wp.array[float], m: Mesh, v: int, x: wp.vec3, tol: float 
 
 
 @wp.func
-def _edge_holds(q: wp.array[float], m: Mesh, b: Bodies, k: int, X: wp.transform, i: int, n: wp.vec3, far: float) -> bool:
+def _edge_holds(q: wp.array[float], m: Mesh, b: Bodies, k: int, X: wp.transform, i: int, n: wp.vec3,
+                far: float) -> bool:
     """Rod node ``i``'s pair with shape ``k`` (normal ``n`` at ``i``) is a rod edge's: the shape's point lies past ``i``
     toward a neighbour, and that edge's contact (:func:`_edge_scan`, as :func:`_edge_contacts` finds it) is inside it
     and does not reach ``i``. Else the node does, a local minimum along its rod or not."""
@@ -527,9 +528,9 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
         if s.key[j] < 0:
             slot = j
             break
-        if wp.dot(s.normal[j], s.c0[j]) - s.thickness[j] > gap:
-            if far < 0 or wp.dot(s.normal[j], s.c0[j]) - s.thickness[j] > wp.dot(s.normal[far], s.c0[far]) - s.thickness[far]:
-                far = j
+        gj = wp.dot(s.normal[j], s.c0[j]) - s.thickness[j]
+        if gj > gap and (far < 0 or gj > wp.dot(s.normal[far], s.c0[far]) - s.thickness[far]):
+            far = j
     if slot < 0:
         wp.atomic_add(sc.overflow, 0, 1)
         if far < 0:
@@ -595,8 +596,8 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
         X = _shape_pose(b, k)
         th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
         reach = REACH * th
-        ya, da = _anchor(b, k, xa)
-        yb, db = _anchor(b, k, xb)
+        _ya, da = _anchor(b, k, xa)
+        _yb, db = _anchor(b, k, xb)
         reach += wp.max(wp.length(da), wp.length(db))  # the body's motion over the step
         c = wp.transform_get_translation(X)
         t = wp.clamp(_ahead(c, xa, xb) / wp.length_sq(xb - xa), 0.0, 1.0)
@@ -616,7 +617,8 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
             x = wp.lerp(xa, xb, u)
             d, n = _shape_gap(b, k, X, x, far)
             if d <= reach:
-                _keep_shape(sc, base, k, side, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n, n, th)
+                _keep_shape(sc, base, k, side, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n, n,
+                            th)
     query = wp.bvh_query_aabb(bvh, lo, hi)
     f = int(0)
     while wp.bvh_query_next(query, f):

@@ -18,10 +18,10 @@ Discrete elastic rods and midedge shells for [NVIDIA Newton](https://github.com/
     <th width="25%">Flagella Bundling</th>
   </tr>
   <tr>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_cantilever.webp" alt="Cantilever" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_knot.webp" alt="Overhand knot" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_plectoneme.webp" alt="Plectoneme" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_flagella.webp" alt="Flagella bundling" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/cantilever.webp" alt="Cantilever" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/knot.webp" alt="Overhand knot" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/plectoneme.webp" alt="Plectoneme" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/flagella.webp" alt="Flagella bundling" width="200"></td>
   </tr>
   <tr>
     <td valign="top">DER (top) and Newton's VBD (bottom) against Euler-Bernoulli.<br><code>uv run examples/cantilever.py</code></td>
@@ -33,19 +33,19 @@ Discrete elastic rods and midedge shells for [NVIDIA Newton](https://github.com/
     <th width="25%">Shell Cantilever</th>
     <th width="25%">Shell Fold</th>
     <th width="25%">Cloth Twist</th>
-    <th width="25%">System Identification</th>
+    <th width="25%">Franka Pick and Place</th>
   </tr>
   <tr>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_shell_cantilever.webp" alt="Shell cantilever" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_shell_fold.webp" alt="A cloth strip folding onto itself" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/admm_cloth_twist.webp" alt="A cloth sheet wrung into a coiling rope" width="200"></td>
-    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/fit_buckling.webp" alt="Fitting stiffness, density and damping to buckling recordings" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/shell_cantilever.webp" alt="Shell cantilever" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/shell_fold.webp" alt="A cloth strip folding onto itself" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/cloth_twist.webp" alt="A cloth sheet wrung into a coiling rope" width="200"></td>
+    <td><img src="https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton/master/docs/franka.webp" alt="A Franka arm picking up a cable" width="200"></td>
   </tr>
   <tr>
     <td valign="top">Midedge shells beside Newton's VBD cloth against plate theory.<br><code>uv run examples/shell_cantilever.py</code></td>
     <td valign="top">A cloth strip folds onto itself with self-contact friction.<br><code>uv run examples/shell_fold.py</code></td>
     <td valign="top">A sheet wrung into a coiling rope by self-contact with friction.<br><code>uv run examples/newton/cloth_twist.py</code></td>
-    <td valign="top">L-BFGS fits parameters from positions and a gripper force sensor.<br><code>uv run examples/experimental/fit_buckling.py</code></td>
+    <td valign="top">A MuJoCo Franka picks up a cable.<br><code>uv run --extra mujoco examples/newton/franka_cable_ik_pick_place.py</code></td>
   </tr>
 </table>
 

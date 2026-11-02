@@ -19,13 +19,10 @@ its docstring says how and why.
 | [`cloth_style3d.py`](cloth_style3d.py) | `cloth_style3d` | Style3D's sweatshirt (24.5k vertices, its panels as the material axes) draped on the avatar mesh. Rest shape the garment as loaded (within ~2% of its panels), eager (cuDSS allocates when factorising this size, so no CUDA graph), ~1.4 s per frame. Needs GitPython for the asset. |
 | [`cloth_twist.py`](cloth_twist.py) | `cloth_twist` | The sheet self-contact stress test: a square held along two edges, spun until it wrings into a coiling rope; the helicoid before contact against its symmetry. Compressed cloth: its steps end on the iteration budget (`solver.counts`). |
 
-Not yet: [`cloth_rollers.py`](cloth_rollers.py) (Newton's `cloth_rollers`, rollers as kinematic cylinders
-turning the cloth by friction) runs ~0.6 s, then its steps stop converging once the tail is pulled round roller 2;
-it is not in the tests.
-
-Not ported: `cloth_poker_cards` (dynamic rigid bodies pushed by the cloth), `cloth_franka` (a kinematic robot,
-one-way, in Newton), `cloth_h1` (Style3D's jacket on a humanoid driven by IK: the cloth is supported, the IK-driven
-kinematic robot is not ported).
+Not ported: `cloth_rollers` (rollers turning the cloth by friction: its steps stop converging once the tail is
+pulled round the second roller), `cloth_poker_cards` (dynamic rigid bodies pushed by the cloth), `cloth_franka` (a
+kinematic robot, one-way, in Newton), `cloth_h1` (Style3D's jacket on a humanoid driven by IK: the cloth is
+supported, the IK-driven kinematic robot is not ported).
 
 ```bash
 uv run examples/newton/cable_twist.py

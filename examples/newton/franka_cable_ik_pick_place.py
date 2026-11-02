@@ -36,7 +36,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import CableExample
+from utils.common import SIM, THEORY, CableExample, inset
 
 from dismech_newton import SolverDiSMech
 
@@ -55,6 +55,7 @@ def add_franka(builder: newton.ModelBuilder, base_z: float) -> None:
 
 class Example(CableExample):
     substeps = 10  # Newton's: 60 fps x 10
+    plot_time = 5.5  # the plot's time axis: the default run's 330 frames
     radius, segments = 0.005, 19
 
     def __init__(self, viewer, args=None):
@@ -181,6 +182,31 @@ class Example(CableExample):
         super().step()
         f = self.soft.body_reaction.numpy()[self.fingers, :3]  # the last substep's, (force, torque) rows; our view's
         self.history.append((self.sim_time, float(np.mean(np.abs(f[:, 1]))), float(-f[:, 2].sum())))
+
+    def image(self, size: tuple[int, int] = (800, 400)) -> np.ndarray:
+        """Each finger's grip against its servo force, and the lift (faint: each frame's last substep; solid: its
+        0.1 s running mean, the cable swings) against the cable's weight, over time (the hold shaded), as an RGBA
+        image (see :func:`utils.common.inset`)."""
+        h = np.array(self.history) if self.history else np.zeros((1, 3))
+        n = max(1, round(0.1 * self.fps))
+        mean = np.convolve(np.pad(h[:, 2], (n // 2, n - 1 - n // 2), mode="edge"), np.ones(n) / n, mode="valid")
+        servo = GRIP_STIFFNESS * (self.radius - GRIP_HOLD)
+        rows = ((1, servo, r"$F_n$ (N)", "servo"), (2, self.weight, r"$F_z$ (N)", r"$mg$"))
+
+        def draw(axes):
+            for ax, (k, exact, label, name) in zip(axes, rows):
+                ax.axvspan(3.25, 4.75, color=THEORY, alpha=0.06, lw=0)
+                ax.axhline(exact, color=THEORY, ls="--", lw=1.0, label=name)
+                if k == 2:
+                    ax.plot(h[:, 0], h[:, k], color=SIM, alpha=0.3, lw=0.8)
+                ax.plot(h[:, 0], h[:, k] if k == 1 else mean, color=SIM, label="simulation")
+                ax.set(xlim=(0.0, self.plot_time), ylim=(0.0, 2.0 * exact))
+                ax.set_xlabel(r"$t$ (s)")
+                ax.set_ylabel(label)
+                ax.locator_params(nbins=4)
+                ax.legend(loc="upper left")
+
+        return inset(draw, size, ncols=2)
 
     def test_final(self):
         x = self.state_0.particle_q.numpy()

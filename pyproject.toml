@@ -1,6 +1,6 @@
 [project]
 name = "dismech-newton"
-version = "0.1.0.post4"
+version = "0.1.0.post5"
 description = "Discrete elastic rods and midedge shells for NVIDIA Newton."
 readme = "README.md"
 license = "GPL-3.0-or-later"

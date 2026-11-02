@@ -1,8 +1,8 @@
 """A Franka FR3 picks a cable off a table at its middle, carries it and puts it down (Newton's
 ``example_franka_cable_ik_pick_place``): the same arm, gains, gravity compensation, cable, keyframes and test. The
-arm is MuJoCo's, its joint targets from Newton's IK on the keyframed hand pose; the cable is a DER rod coupled two-way
-through contact (:class:`~dismech_newton.coupling.CoupledSolver`): the fingers squeeze it with their servo force and
-friction lifts it.
+arm is MuJoCo's, its joint targets from Newton's IK on the keyframed hand pose; the cable is a DER rod in place of
+Newton's VBD cable, coupled two-way through Newton's ``SolverCoupledProxy`` with Newton's config (the gripper bodies
+proxies in our solve, lagged, one pass): the fingers squeeze it with their servo force and friction lifts it.
 
 Shows: a pinch through two-way coupling with an articulated MuJoCo arm. Newton's test (the cable's middle placed
 within 1 cm of the target) and our own: while held, each finger's grip is its servo force and the lift the cable's
@@ -32,13 +32,13 @@ from newton.examples.multiphysics.example_franka_cable_ik_pick_place import (
     GRIPPER_DOWN,
 )
 from newton.solvers import SolverMuJoCo
+from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import CableExample
 
 from dismech_newton import DiSMechSolver
-from dismech_newton.coupling import CoupledSolver
 
 TCP = 0.107  # hand origin to the point between the fingertips [m]
 
@@ -73,7 +73,6 @@ class Example(CableExample):
         builder.joint_armature[:7] = [1.0e-3] * 7
         builder.joint_armature[7:9] = [0.0] * 2
         builder.custom_attributes["mujoco:gravcomp"].values = dict.fromkeys(range(builder.body_count), 1.0)
-        self.fingers = [b for b, label in enumerate(builder.body_label) if "finger" in label]
         n = self.segments + 1
         x = float(CABLE_CENTER[0]) + (np.linspace(0.0, 1.0, n) - 0.5) * CABLE_LENGTH
         points = np.column_stack((x, np.full(n, float(CABLE_CENTER[1])), np.full(n, float(CABLE_CENTER[2]))))
@@ -85,11 +84,14 @@ class Example(CableExample):
         builder.add_ground_plane(height=self.surface, cfg=newton.ModelBuilder.ShapeConfig(mu=1.0))
         model = builder.finalize()
         self.control = model.control()
-        rigid = CoupledSolver(model, lambda m: SolverMuJoCo(
-            m, solver="newton", integrator="implicitfast", cone="elliptic", iterations=100, ls_iterations=20,
-            use_mujoco_contacts=True, njmax=256, nconmax=64))
-        self.soft = rigid.soft
-        self.start(viewer, model, rigid)
+        def mujoco(m):
+            return SolverMuJoCo(m, solver="newton", integrator="implicitfast", cone="elliptic", iterations=100,
+                                ls_iterations=20, use_mujoco_contacts=True, njmax=256, nconmax=64)
+
+        solver = self._proxy(model, mujoco)
+        self.soft = solver.solver("soft")
+        self.fingers = [b for b, label in enumerate(solver.view("soft").body_label) if "finger" in label]
+        self.start(viewer, model, solver)
         newton.eval_fk(model, model.joint_q, model.joint_qd, self.state_0)
         newton.eval_fk(model, model.joint_q, model.joint_qd, self.state_1)
         self._build_ik(model)
@@ -99,6 +101,22 @@ class Example(CableExample):
         self.history = []  # (time, grip per finger, lift)
         if viewer is not None and hasattr(viewer, "set_camera"):
             viewer.set_camera(pos=wp.vec3(0.9, -1.4, 0.9), pitch=-22.0, yaw=120.0)
+
+    @staticmethod
+    def _proxy(model, mujoco):
+        """Newton's SolverCoupledProxy: MuJoCo's arm, our rod (its capsule bodies and their joints), the gripper's
+        bodies proxies in our solve."""
+        capsules = sorted({int(b) for b in model.dismech.edge_body.numpy() if b >= 0})
+        franka = [b for b in range(model.body_count) if b not in capsules]
+        child = model.joint_child.numpy()
+        joints = [j for j in range(model.joint_count) if child[j] in franka]
+        gripper = [b for b in franka if "hand" in model.body_label[b] or "finger" in model.body_label[b]]
+        return SolverCoupledProxy(model, entries=[
+            SolverCoupled.Entry(name="mjc", solver=mujoco, bodies=franka, joints=joints),
+            SolverCoupled.Entry(name="soft", solver=DiSMechSolver, particles=list(range(model.particle_count)),
+                                bodies=capsules, joints=[j for j in range(model.joint_count) if j not in joints]),
+        ], coupling=SolverCoupledProxy.Config(proxies=[
+            SolverCoupledProxy.Proxy(source="mjc", destination="soft", bodies=gripper)]))
 
     def _build_ik(self, model):
         """Newton's IK on a Franka-only model; the Franka's coordinates lead the model's."""
@@ -160,7 +178,7 @@ class Example(CableExample):
 
     def step(self):
         super().step()
-        f = self.soft.body_reaction.numpy()[self.fingers, :3]  # the last substep's, (force, torque) rows
+        f = self.soft.body_reaction.numpy()[self.fingers, :3]  # the last substep's, (force, torque) rows; our view's
         self.history.append((self.sim_time, float(np.mean(np.abs(f[:, 1]))), float(-f[:, 2].sum())))
 
     def test_final(self):

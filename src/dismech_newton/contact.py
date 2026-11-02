@@ -49,8 +49,8 @@ class Slots:
 
 @wp.struct
 class Arm:
-    """Bodies that yield to the contacts within the step (:mod:`.coupling`): ``k`` DOFs ``z`` per world, from DOF
-    ``start``, their joints' moves over the step (their anchors are at its start). Body ``b``'s DOFs start at
+    """Bodies that yield to the contacts within the step (:class:`~.coupling.ProxyArm`): ``k`` DOFs ``z`` per world,
+    from DOF ``start``, their moves over the step (their anchors are at its start). Body ``b``'s DOFs start at
     ``base[b]`` (-1: it does not yield) and move its point ``x`` by ``sum_m z_m (v_m + w_m x (x - com[b]))``,
     ``J[b, m] = (v_m, w_m)``; their inertia is ``(z - pred)^T M[w] (z - pred) / 2 h^2``, ``pred`` their own step's
     moves. A shape pair's body is ``shape_body[shape_of(key, key0)]``."""

@@ -1,14 +1,16 @@
 from functools import partial
+from typing import Any
 
 import numpy as np
 import warp as wp
-from newton import Contacts, Control, Model, ModelFlags, State, StateFlags
+from newton import BodyFlags, Contacts, Control, Model, ModelFlags, State, StateFlags
 from newton.solvers import SolverBase
 from newton.solvers.experimental.coupled import CouplingInterface
 
 from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
 from .collide import Offset
 from .contact import BarrierBlock, make_arm
+from .coupling import ProxyArm
 from .element import ElementBlock
 from .linear import SymmetricCSR, sparse_solver
 from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_proxies_kernel, proxy_joints
@@ -61,15 +63,15 @@ class DiSMechSolver(SolverBase, CouplingInterface):
             once per step, at the prediction. Rods converge better with it (their factorizations are cheap); sheets,
             whose factorizations dominate a step, are as accurate without it given 10-20 iterations and 1.5-3.5x
             faster (shell_fold, cloth_twist).
-        arm_dofs: DOFs per world of bodies that yield to the contacts within the step (``contact.arm``, set by
-            :class:`~.coupling.CoupledSolver`), after the state's DOFs in the step's unknowns. No adjoint.
 
     An entry of Newton's ``SolverCoupled`` (node masses, forces through ``particle_f``; the coupler carries only
     nodes, so a step's input takes its twists, frames and stored strains from the last output), with the rods' proxy
     bodies in its entry and ``SolverCoupledADMM``'s ``gamma = 0`` (its proximal term on the massless proxies breaks
     momentum). The contacts with another entry's bodies are then the coupler's, by node spheres: for rods and sheets
-    struck by or resting on bodies, not pinches (no ``rho`` holds a servoed finger against far lighter nodes); for
-    those, :class:`~.coupling.CoupledSolver`.
+    struck by or resting on bodies, not pinches (no ``rho`` holds a servoed finger against far lighter nodes). As
+    ``SolverCoupledProxy``'s destination (as VBD's), the view's ``BodyFlags.PROXY`` bodies with shapes yield to the
+    contacts within the step, their DOFs after the state's in the step's unknowns (:class:`~.coupling.ProxyArm`; no
+    adjoint): a pinch holds.
 
     Contacts are barriers (:class:`~.contact.BarrierBlock`): no candidate passes through one, and each node moves at
     most the smallest particle radius per detection (the pairs are found again when a node has moved half of it).
@@ -96,7 +98,6 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
-        arm_dofs: int = 0,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
@@ -108,7 +109,9 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         self.der = d = model.dismech
         self.mass, self.fixed = dof_constants(model)
         self.num_state_dofs = n0 = self.mass.shape[0]
-        k = int(arm_dofs)
+        proxies = model.body_count and (model.body_flags.numpy() & int(BodyFlags.PROXY)).any()
+        self._proxy_arm = arm = ProxyArm(model) if proxies else None
+        k = arm.k if arm is not None else 0
         if k:  # the arms' DOFs: no diagonal mass, free
             self.mass = wp.array(np.concatenate([self.mass.numpy(), np.zeros(k * model.world_count)]), dtype=float,
                                  device=dev)
@@ -130,8 +133,8 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         stencils = [edge_dofs, *(t.dofs() for t in types)]  # an edge's nodes: its contacts
         if k:  # a node and its world's arm: its contacts on the arm's bodies
             p = np.arange(model.particle_count)
-            arm = n0 + k * np.maximum(model.particle_world.numpy(), 0)[:, None] + np.arange(k)
-            stencils.append(np.column_stack([3 * p, 3 * p + 1, 3 * p + 2, arm]).astype(np.int64))
+            dofs = n0 + k * np.maximum(model.particle_world.numpy(), 0)[:, None] + np.arange(k)
+            stencils.append(np.column_stack([3 * p, 3 * p + 1, 3 * p + 2, dofs]).astype(np.int64))
         self.A = SymmetricCSR(n, tuple(stencils), dev)
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
@@ -141,6 +144,7 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         self.contact = BarrierBlock(model, self.fixed, source)
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
+            arm.bind(self.contact.arm)
         self._qw = wp.zeros(n, dtype=float, device=dev) if k else None  # the step's unknowns: the state's, the arms'
         self.cap = float(model.particle_radius.numpy().min()) if self.contact.count else 0.0
         self._tol = TOLERANCE * self.cap
@@ -167,22 +171,35 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         # the last step's contact forces on Newton's bodies (body_f layout): what a rigid solver couples back
         self.body_reaction = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_vector, device=dev)
         self._started = False
-        self._last_out = None  # the last step's output: what a coupler's next input carries on from (see below)
+        # a coupler's next input carries on from these (see below): the last step's output, once there is one
+        self._carried = model.state()
+        flatten_state(self._carried)
+        self._carry_valid = wp.zeros(1, dtype=wp.int32, device=dev)
+        if not self.exact:  # the warm start at the model's state (a capture may record the first step)
+            for e in self.elements:
+                e.reset(self._carried)
 
     def coupling_notify_input_state_update(self, state: State, flags, *, iteration_restart: bool = False, dt=0.0):
         """Newton's ``SolverCoupled`` hands a step only node, body and joint state: the new step's input takes the
         rest (twists, frames, reference twists, stored strains, Dahl stresses) from the last step's output."""
-        last = self._last_out
-        if last is None or last is state or iteration_restart or not int(flags) & int(StateFlags.PARTICLE_Q):
+        if iteration_restart and self._proxy_arm is not None:
+            self._proxy_arm.restart = True
+        if iteration_restart or not int(flags) & int(StateFlags.PARTICLE_Q):
             return
         flatten_state(state)
-        s, p, nd = state.dismech, last.dismech, 3 * self.model.particle_count
+        for dst, src in self._carry_pairs(state.dismech, self._carried.dismech):
+            wp.launch(_copy_if_kernel, dim=dst.shape[0], inputs=[self._carry_valid, src], outputs=[dst],
+                      device=self.device)
+
+    def _carry_pairs(self, s, p):
+        """The arrays a step's input takes from the last output (``s``'s, ``p``'s): all but the nodes."""
+        nd = 3 * self.model.particle_count
         if s.q.shape[0] > nd:
             for k in ("q", "qd"):
-                wp.copy(getattr(s, k), getattr(p, k), dest_offset=nd, src_offset=nd, count=s.q.shape[0] - nd)
+                yield getattr(s, k)[nd:], getattr(p, k)[nd:]
         for k in ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q", *(e.stored for e in self.elements)):
             if getattr(s, k).shape[0]:
-                wp.copy(getattr(s, k), getattr(p, k))
+                yield getattr(s, k), getattr(p, k)
 
     def step(self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float):
         """Advance ``state_in`` by ``dt``; under a ``wp.Tape`` the step is recorded as its adjoint (:meth:`vjp`)."""
@@ -198,7 +215,7 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         ``requires_grad``, the elements' params and rest strains, ``edge_length``, ``particle_mass`` and
         ``edge_inertia``."""
         if self._qw is not None:
-            raise NotImplementedError("no adjoint with yielding bodies (arm_dofs)")
+            raise NotImplementedError("no adjoint with proxy bodies (SolverCoupledProxy)")
         if self._adjoint is None:
             from .adjoint import StepAdjoint  # noqa: PLC0415 (imports this module's kernels)
 
@@ -229,19 +246,30 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         s_in, s_out, n = state_in.dismech, state_out.dismech, self.num_state_dofs
         h = self.theta * dt  # the implicit Euler step solved
         q = s_out.q if self._qw is None else self._qw
-        if self._qw is not None:  # the arms' guess: their own step
-            wp.copy(q, self.contact.arm.pred, dest_offset=n, count=self.num_dofs - n)
-        wp.launch(predict_kernel, dim=n, inputs=[self.fixed, s_in.q, s_in.qd, h], outputs=[self.q_pred, q],
-                  device=self.device)
-        self._solve(state_in, q, h)
-        self.body_reaction.zero_()
-        if self.contact.count:
-            self.contact.source.reactions(q, self.contact.s, self.contact.arm, self.contact.slip, self.body_reaction)
+        body_q, body_qd = state_in.body_q, state_in.body_qd
+        if self._proxy_arm is not None:  # the proxies yield from their own start: their moves are the arm's
+            state_in.body_q, state_in.body_qd = self._proxy_arm.update(state_in, h)
+        try:
+            if self._qw is not None:  # the arms' guess: their own step
+                wp.copy(q, self.contact.arm.pred, dest_offset=n, count=self.num_dofs - n)
+            wp.launch(predict_kernel, dim=n, inputs=[self.fixed, s_in.q, s_in.qd, h], outputs=[self.q_pred, q],
+                      device=self.device)
+            self._solve(state_in, q, h)
+            self.body_reaction.zero_()
+            if self.contact.count:
+                self.contact.source.reactions(q, self.contact.s, self.contact.arm, self.contact.slip,
+                                              self.body_reaction)
+        finally:
+            state_in.body_q, state_in.body_qd = body_q, body_qd
+        if self._proxy_arm is not None:
+            self._proxy_arm.finish(q, state_in, state_out, dt, h)
         wp.launch(end_kernel, dim=n, inputs=[self.fixed, s_in.q, s_in.qd, q, self.theta, dt],
                   outputs=[s_out.q, s_out.qd], device=self.device)
         self._carry(state_in.particle_q, state_in.dismech, state_out.particle_q, state_out.dismech)
         self.update_proxies(state_out)
-        self._last_out = state_out
+        for dst, src in self._carry_pairs(self._carried.dismech, state_out.dismech):
+            wp.copy(dst, src)
+        self._carry_valid.fill_(1)
 
     def _carry(self, prev_nodes: wp.array, p, nodes: wp.array, s) -> None:
         """``s``'s edge frames, reference twists, stored strains and Dahl stresses as a step from ``p`` leaves them
@@ -273,6 +301,8 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         for e in self.elements:
             e.reset(state)
         self.contact.reset()
+        if self._proxy_arm is not None:
+            self._proxy_arm.reset()
         self._started = True
 
     def refresh_mass(self) -> None:
@@ -306,7 +336,7 @@ class DiSMechSolver(SolverBase, CouplingInterface):
         f = bind_dofs(self.dofs, self.model, self.mass, self.fixed, self._no_force, state_in, dt)
         for e in self.elements:
             e.begin_step(state_in, dt, self.exact)
-        if not self._started and not self.exact:
+        if not self._started and not self.exact and not dev.is_capturing:
             self.reset(state_in)
         self.contact.begin_step(state_in, dt, self.mass)
         q0 = self._q0
@@ -416,6 +446,13 @@ def _step_length(k: int) -> float:
     if k == 0:
         return 0.0
     return wp.pow(0.5, float(k - 1))
+
+
+@wp.kernel
+def _copy_if_kernel(valid: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp.array(dtype=Any)):
+    i = wp.tid()
+    if valid[0] != 0:
+        dst[i] = src[i]
 
 
 @wp.func

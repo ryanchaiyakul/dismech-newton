@@ -104,8 +104,8 @@ def row_slot(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], a: int, b:
 
 
 class CudssSolver:
-    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`; Cholesky if ``spd``: 15% faster), analysed on the first
-    solve and factorised on the first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a
+    """``A x = b`` by cuDSS LDL^T (LU for :class:`GeneralCSR`; Cholesky if ``spd``: 15% faster), analysed when built
+    and factorised on the first solve after :meth:`invalidate`; ``single``: in float32 (2.5x faster on a
     GeForce's float64, for an ``A`` that only has to be approximate). Graph-capturable."""
 
     graph_capturable = True
@@ -120,6 +120,8 @@ class CudssSolver:
         self._factored = False
         self._sources = wp.zeros((8, 16), dtype=wp.uint8, device="cpu", pinned=self.device.is_cuda)  # _pin_sources
         self._source_bytes = []
+        with wp.ScopedDevice(self.device):  # analysed now (its pattern is fixed): not inside a caller's first capture
+            self._setup()
 
     def _setup(self) -> None:
         A = self.A
@@ -135,6 +137,14 @@ class CudssSolver:
         self._bm = cudss.matrix_create_dn(A.n, 1, A.n, self._b.ptr, self._type, cudss.Layout.COL_MAJOR)
         self._xm = cudss.matrix_create_dn(A.n, 1, A.n, self._x.ptr, self._type, cudss.Layout.COL_MAJOR)
         self._execute(cudss.Phase.ANALYSIS)
+        # its buffers allocated now, not inside a caller's first capture: an identity on the pattern, factorised
+        ptr = A.indptr.numpy()
+        unit = (A.indices.numpy() == np.repeat(np.arange(A.n), np.diff(ptr))).astype(wp.dtype_to_numpy(self._vals.dtype))
+        vals = wp.clone(self._vals)
+        self._vals.assign(unit)
+        cudss.set_stream(self._handle, self.device.stream.cuda_stream)
+        cudss.execute(self._handle, cudss.Phase.FACTORIZATION, self._config, self._data, self._A, self._xm, self._bm)
+        wp.copy(self._vals, vals)
         weakref.finalize(self, _destroy, self._handle, self._config, self._data, (self._xm, self._bm, self._A))
 
     def _execute(self, phase) -> None:
@@ -150,8 +160,6 @@ class CudssSolver:
     def factor(self) -> None:
         """Factorise ``A`` now (inside a graph's conditional branch, say)."""
         with wp.ScopedDevice(self.device):
-            if self._handle is None:
-                self._setup()
             self._execute(cudss.Phase.FACTORIZATION)
             self._factored = True
 

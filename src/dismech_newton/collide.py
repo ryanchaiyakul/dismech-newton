@@ -12,9 +12,11 @@ a rod's node only if its edges lead away from the body, else the edge meets it a
 """
 
 import numpy as np
+import scipy.sparse as sp
 import warp as wp
 from newton import GeoType, Model, ShapeFlags, State
 from newton._src.geometry import kernels as G  # its shape SDFs; triangle_...: exact zeros off the closest feature
+from scipy.sparse.csgraph import maximum_bipartite_matching
 
 from .builder import _P
 from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
@@ -27,13 +29,17 @@ EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod
 OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
 PARALLEL = 1.0e-3  # edges with sin^2 of their angle below this: no edge-edge pair (their nodes' pairs hold it, IPC)
 BISECT = 20  # bisections for a rod edge's closest point to a shape
+FACE_PASSES = 8  # alternating closest points for a triangle's point nearest a shape
+INSIDE = 0.01  # its weights at least this (else on its edges, theirs)
+NEARER = 0.01  # an edge's or triangle's shape pair: closer than its nodes by this many thicknesses (else theirs)
 FLAT = 0.015  # 1 - cos 10 deg: normals along an edge within this of its closest point's are its face's (a line contact)
 
 
 @wp.struct
 class Mesh:
     """What collides: per edge (the rods', then the shells') its nodes, whether it collides and (a shell's) its faces'
-    opposite nodes (-1); per triangle its nodes and edges (edge ``k`` opposite node ``k``); per node its neighbours
+    opposite nodes (-1) and the triangle whose shape pairs its slots hold (-1; each triangle one edge's); per
+    triangle its nodes and edges (edge ``k`` opposite node ``k``); per node its neighbours
     along colliding edges (CSR), radius, ``mu``, rod (-1 off rods), arc length and rest position (flat, the model's
     initial state). A rod here is a branch: a chain between nodes of other than two rod edges (ends, junctions), or a
     loop; per rod edge its branch, its first node's arc and the arc's direction along it; per branch its end nodes
@@ -42,6 +48,7 @@ class Mesh:
     edges: wp.array[wp.vec2i]
     edge_on: wp.array[wp.int32]
     edge_opp: wp.array[wp.vec2i]
+    edge_face: wp.array[wp.int32]
     faces: wp.array[wp.vec3i]
     face_edge: wp.array[wp.vec3i]
     adj_ptr: wp.array[wp.int32]
@@ -109,6 +116,11 @@ def _mesh(model: Model, device) -> Mesh:
     last = len(inv) - 1 - np.unique(np.sort(ends, 1)[::-1], axis=0, return_index=True)[1]
     opp = np.stack([tris.ravel()[first], np.where(count > 1, tris.ravel()[last], -1)], 1)
     edges = np.concatenate([np.stack([n0, n1], 1), uniq]).astype(np.int32)
+    edge_face = np.full(len(edges), -1)  # a matching: each triangle into one of its edges (one exists: 3 edges a
+    if nf:  # triangle, at most 2 triangles an edge)
+        inc = sp.csr_matrix((np.ones(3 * nf), (np.repeat(np.arange(nf), 3), inv)), shape=(nf, len(uniq)))
+        match = maximum_bipartite_matching(inc, perm_type="column")
+        edge_face[len(n0) + match[match >= 0]] = np.flatnonzero(match >= 0)
     edge_on = np.concatenate([on, np.ones(len(uniq), dtype=bool)])
     a, b = edges[edge_on, 0], edges[edge_on, 1]
     src, dst = np.concatenate([a, b]), np.concatenate([b, a])
@@ -117,6 +129,7 @@ def _mesh(model: Model, device) -> Mesh:
         ("edges", edges, wp.vec2i),
         ("edge_on", edge_on.astype(np.int32), wp.int32),
         ("edge_opp", np.concatenate([np.full((len(n0), 2), -1), opp]), wp.vec2i),
+        ("edge_face", edge_face, wp.int32),
         ("faces", tris, wp.vec3i),
         ("face_edge", len(n0) + inv.reshape(-1, 3), wp.vec3i),
         ("adj_ptr", np.concatenate([[0], np.cumsum(np.bincount(src, minlength=n))]), wp.int32),
@@ -209,7 +222,8 @@ class Bodies:
     """Newton's shapes as nodes and rod edges meet them: per shape its geometry (type, scale, mesh, mesh properties),
     its frame in its body (-1: the world's), margin, ``mu`` and bounding radius; the shapes that take part (colliding
     with particles, not a rod's capsule); the bodies' poses, velocities and centres of mass at the step's start; the
-    step ``h``."""
+    step ``h``; ``sweep``: per body, how far a yielding one has moved since the step's start (an iterate's detection
+    sees it at its start pose: its pairs reach that much further)."""
 
     kind: wp.array[wp.int32]
     scale: wp.array[wp.vec3]
@@ -224,6 +238,7 @@ class Bodies:
     body_q: wp.array[wp.transform]
     body_qd: wp.array[wp.spatial_vector]
     body_com: wp.array[wp.vec3]
+    sweep: wp.array[float]
     h: float
 
 
@@ -246,6 +261,7 @@ def _bodies(model: Model, device) -> Bodies:
     b.body_q = model.body_q if model.body_count else wp.zeros(1, dtype=wp.transform, device=device)
     b.body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=device)
     b.body_com = model.body_com if model.body_count else wp.zeros(1, dtype=wp.vec3, device=device)
+    b.sweep = wp.zeros(max(model.body_count, 1), dtype=float, device=device)
     b.h = 0.0
     return b
 
@@ -300,6 +316,13 @@ def _shape_gap(b: Bodies, k: int, X: wp.transform, x: wp.vec3, reach: float):
     xl = wp.transform_point(wp.transform_inverse(X), x)
     d, n = _shape_distance(b.kind[k], b.scale[k], b.source[k], b.props[k], xl, reach)
     return d, wp.transform_vector(X, n)
+
+
+@wp.func
+def _sweep(b: Bodies, k: int) -> float:
+    """How far shape ``k``'s body has moved in the step so far (a yielding body at an iterate), else 0."""
+    j = b.body[k]
+    return wp.where(j >= 0, b.sweep[j], 0.0)
 
 
 @wp.func
@@ -496,12 +519,13 @@ def _drop(sc: Scene, pair: wp.vec4i, gap: float):
 
 @wp.func
 def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float,
-          mu: float):
+          mu: float, sweep: float):
     """Emit the contact into a free slot of the feature's from ``base``, unless it is there already (found through
     another triangle or edge) or farther than :data:`REACH` thicknesses; a full feature keeps its closest contacts.
     ``n``: the normal, or zero for ``C q``'s direction; ``xb``, ``db``: a body's point at the end of the step and its
-    motion over it. A shell-shell pair's thickness is at most half its rest distance, so none touches at rest (the
-    rods' rule is :func:`_excluded`)."""
+    motion over it; ``sweep``: how much further a yielding body's pair reaches (:attr:`Bodies.sweep`). A shell-shell
+    pair's thickness is at most half its rest distance, so none touches at rest (the rods' rule is
+    :func:`_excluded`)."""
     s, m = sc.s, sc.m
     d = contact_point(sc.q, pair, w, xb - db)
     if wp.length(n) == 0.0:
@@ -514,7 +538,7 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
     for k in range(4):
         if pair[k] >= 0:
             shells = shells and m.rod[pair[k]] < 0
-    if wp.dot(n, contact_point(sc.q, pair, w, xb)) > REACH * th:
+    if wp.dot(n, contact_point(sc.q, pair, w, xb)) > REACH * th + sweep:
         return
     if shells and (pair[1] >= 0 or pair[2] >= 0):  # no pair touches at rest
         th = wp.min(th, 0.5 * wp.length(contact_point(m.rest, pair, w, wp.vec3(0.0))))
@@ -550,7 +574,7 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
 @wp.func
 def _keep_pair(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, th: float, mu: float):
     """:func:`_keep` for two features of rods and shells: the normal along ``C q``, no anchor."""
-    _keep(sc, base, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu)
+    _keep(sc, base, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu, 0.0)
 
 
 @wp.func
@@ -560,7 +584,7 @@ def _keep_shape(sc: Scene, base: int, k: int, side: int, pair: wp.vec4i, w: wp.v
     which end of a rod edge's line contact (0 for a single point)."""
     xb, db = _anchor(sc.b, k, x)
     key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + 2 * k + side
-    _keep(sc, base, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]))
+    _keep(sc, base, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]), _sweep(sc.b, k))
 
 
 @wp.kernel
@@ -584,6 +608,91 @@ def _bounds_kernel(
 
 
 @wp.func
+def _shell_shapes(sc: Scene, e: int, base: int):
+    """Shell edge ``e``'s interior, and its triangle's (:attr:`Mesh.edge_face`), against shapes: the closest point
+    to a shape inside the edge (bisection, as a rod edge's) or the triangle (alternating closest points), kept where it
+    is closer than the feature's nodes (else theirs: a node's pair holds a flat face or a convex body's near point).
+    A curved body or a box's edge meets a sheet between its nodes. One gap per pass (one inlined copy each)."""
+    m, b, q = sc.m, sc.b, sc.q
+    a0 = m.edges[e][0]
+    a1 = m.edges[e][1]
+    xa = node(q, a0)
+    xb = node(q, a1)
+    f = m.edge_face[e]
+    tri = wp.vec3i(a0, a1, a0)
+    if f >= 0:
+        tri = m.faces[f]
+    x0 = node(q, tri[0])
+    x1 = node(q, tri[1])
+    x2 = node(q, tri[2])
+    for j in range(b.shapes.shape[0]):
+        k = b.shapes[j]
+        X = _shape_pose(b, k)
+        c = wp.transform_get_translation(X)
+        th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
+        reach = REACH * th + _sweep(b, k)
+        size = wp.max(wp.length(x0 - x1), wp.max(wp.length(x1 - x2), wp.length(x2 - x0)))
+        if wp.length(c - x0) > b.radius[k] + reach + size and wp.length(c - xa) > b.radius[k] + reach + size:
+            continue
+        # the edge: BISECT bisections of the gap's slope, then its point and both ends
+        t0 = float(0.0)
+        t1 = float(1.0)
+        d = float(0.0)
+        n = wp.vec3(0.0)
+        ends = float(1.0e30)
+        for it in range(BISECT + 3):
+            u = 0.5 * (t0 + t1)
+            if it == BISECT + 1:
+                u = 0.0
+            elif it == BISECT + 2:
+                u = 1.0
+            dj, nj = _shape_gap(b, k, X, wp.lerp(xa, xb, u), reach)
+            if it < BISECT:
+                if wp.dot(nj, xb - xa) < 0.0:
+                    t0 = u
+                else:
+                    t1 = u
+            elif it == BISECT:
+                d = dj
+                n = nj
+            else:
+                ends = wp.min(ends, dj)
+        t = 0.5 * (t0 + t1)
+        if t > OPEN and t < 1.0 - OPEN and d <= reach and d < ends - NEARER * th:
+            x = wp.lerp(xa, xb, t)
+            _keep_shape(sc, base, k, 0, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - t, t, 0.0, 0.0), x - d * n, n, th)
+        if f < 0:
+            continue
+        # the triangle: FACE_PASSES alternations from its centroid, then its point and its three nodes
+        thf = (m.radius[tri[0]] + m.radius[tri[1]] + m.radius[tri[2]]) / 3.0 + b.margin[k]
+        w = wp.vec3(1.0 / 3.0)
+        p = (x0 + x1 + x2) / 3.0
+        d = float(0.0)
+        n = wp.vec3(0.0)
+        ends = float(1.0e30)
+        for it in range(FACE_PASSES + 4):
+            if it == FACE_PASSES + 1:
+                p = x0
+            elif it == FACE_PASSES + 2:
+                p = x1
+            elif it == FACE_PASSES + 3:
+                p = x2
+            dj, nj = _shape_gap(b, k, X, p, reach)
+            if it < FACE_PASSES:
+                w = G.triangle_closest_point_barycentric(x0, x1, x2, p - dj * nj)
+                p = w[0] * x0 + w[1] * x1 + w[2] * x2
+            elif it == FACE_PASSES:
+                d = dj
+                n = nj
+            else:
+                ends = wp.min(ends, dj)
+        if wp.min(w) > INSIDE and d <= REACH * thf + _sweep(b, k) and d < ends - NEARER * thf:
+            pw = w[0] * x0 + w[1] * x1 + w[2] * x2
+            _keep_shape(sc, base, k, 1, wp.vec4i(tri[0], tri[1], tri[2], -1), wp.vec4(w[0], w[1], w[2], 0.0),
+                        pw - d * n, n, thf)
+
+
+@wp.func
 def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, base: int):
     """Edge ``e``'s contacts: a rod's interior against shapes, and against higher edges' interiors."""
     m, b, q = sc.m, sc.b, sc.q
@@ -598,7 +707,7 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
         reach = REACH * th
         _ya, da = _anchor(b, k, xa)
         _yb, db = _anchor(b, k, xb)
-        reach += wp.max(wp.length(da), wp.length(db))  # the body's motion over the step
+        reach += wp.max(wp.length(da), wp.length(db)) + _sweep(b, k)  # the body's motion over the step
         c = wp.transform_get_translation(X)
         t = wp.clamp(_ahead(c, xa, xb) / wp.length_sq(xb - xa), 0.0, 1.0)
         if wp.length(c - wp.lerp(xa, xb, t)) > b.radius[k] + reach:
@@ -686,7 +795,7 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
         X = _shape_pose(b, k)
         th = m.radius[i] + b.margin[k]
         y, dy = _anchor(b, k, xv)
-        reach = REACH * th + wp.length(dy)  # and the body's motion
+        reach = REACH * th + wp.length(dy) + _sweep(b, k)  # and the body's motion
         if wp.length(xv - wp.transform_get_translation(X)) > b.radius[k] + reach:
             continue
         d, n = _shape_gap(b, k, X, xv, reach)
@@ -743,5 +852,7 @@ def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], h
         e = i - sc.num_nodes
         if sc.m.edge_on[e] != 0:
             _edge_contacts(sc, bvh, lo[e], hi[e], e, base)
+            if sc.m.rod[sc.m.edges[e][0]] < 0 and sc.b.shapes.shape[0] > 0:  # a shell's: between its nodes
+                _shell_shapes(sc, e, base)
     elif sc.m.adj_ptr[i + 1] > sc.m.adj_ptr[i]:  # on a colliding rod or a shell
         _node_contacts(sc, bvh, face_bvh, i, base)

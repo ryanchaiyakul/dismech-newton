@@ -31,6 +31,16 @@ class ProxyArm:
         for w in np.unique(world):
             slot[world == w] = np.arange((world == w).sum())
         self.k = 6 * (int(slot.max()) + 1 if len(proxy) else 0)
+        # each body's reach from its centre of mass (its shapes' bounding spheres): its farthest point moves at most
+        # |dx| + |dth| radius, capped like a node's move (a body is detected like the nodes: at its start pose)
+        radius = np.zeros(max(max(model.world_count, 1) * self.k // 6, 1), dtype=np.float32)
+        sb, st, sr, com = (a.numpy() for a in (model.shape_body, model.shape_transform, model.shape_collision_radius,
+                                               model.body_com))
+        for b, w, s in zip(proxy, world, slot, strict=True):
+            for j in np.flatnonzero(sb == b):
+                i = w * self.k // 6 + s
+                radius[i] = max(radius[i], np.linalg.norm(st[j, :3] - com[b]) + sr[j])
+        self.radius = wp.array(radius, dtype=float, device=model.device)
         self.model, self.device = model, model.device
         self._world, self._slot = world, slot
         nb = max(model.body_count, 1)

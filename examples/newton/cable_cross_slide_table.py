@@ -79,12 +79,13 @@ def input_angle(t: float, side: int, radius: float) -> float:
 
 @wp.kernel
 def _drive_kernel(time: wp.array[float], bodies: wp.array[wp.int32], base: wp.array[wp.transform], radius: float,
-                  dt: float, target: wp.array[wp.vec2], q0: wp.array[wp.transform], q1: wp.array[wp.transform],
-                  qd0: wp.array[wp.spatial_vector], qd1: wp.array[wp.spatial_vector]):
+                  dt: float, target: wp.array[wp.vec2], angle: wp.array[float], q0: wp.array[wp.transform],
+                  q1: wp.array[wp.transform], qd0: wp.array[wp.spatial_vector], qd1: wp.array[wp.spatial_vector]):
     """The inputs at the substep's start and their spin over it (their friction drives the cable)."""
     i = wp.tid()
     t = time[0]
     a = input_angle(t, i, radius)
+    angle[i] = a
     w = (input_angle(t + dt, i, radius) - a) / dt
     x = wp.transform(wp.transform_get_translation(base[i]),
                      wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), a) * wp.transform_get_rotation(base[i]))
@@ -151,10 +152,9 @@ class Example(CableExample):
                                      label=f"xy_table_{i + 1}")
             if joint is None:
                 self.inputs.append(body)
-            else:  # VBD ignores axle friction and armature: MuJoCo's would hold these pulleys
-                d = builder.joint_qd_start[joint]
-                builder.joint_friction[d] = 0.0
-                builder.joint_armature[d] = 0.0
+            else:  # VBD ignores axle friction (MuJoCo's would hold these pulleys); Newton's armature kept: without
+                # it the pulleys (~1e-6 kg m^2) ring against the cable's friction, spinning 10x its rolling rate
+                builder.joint_friction[builder.joint_qd_start[joint]] = 0.0
                 self.passive.append(body)
                 rigid_joints.append(joint)
         builder.add_articulation(rigid_joints, label="xy_table")
@@ -192,6 +192,7 @@ class Example(CableExample):
         self.input_base = wp.array([wp.transform(*q[b]) for b in self.inputs], dtype=wp.transform, device=dev)
         self.time = wp.zeros(1, dtype=float, device=dev)
         self.target = wp.zeros(1, dtype=wp.vec2, device=dev)
+        self.angle = wp.zeros(2, dtype=float, device=dev)
         self.errors, self.worst = [], {}
         if viewer is not None and hasattr(viewer, "set_camera"):
             viewer.set_camera(pos=wp.vec3(0.0, 0.0, 0.8), pitch=-90.0, yaw=90.0)
@@ -211,7 +212,7 @@ class Example(CableExample):
     def simulate(self):
         for _ in range(self.substeps):
             wp.launch(_drive_kernel, dim=2, inputs=[self.time, self.input_body, self.input_base, self.drive_radius,
-                      self.sim_dt], outputs=[self.target, self.state_0.body_q, self.state_1.body_q,
+                      self.sim_dt], outputs=[self.target, self.angle, self.state_0.body_q, self.state_1.body_q,
                                              self.state_0.body_qd, self.state_1.body_qd], device=self.model.device)
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
@@ -229,6 +230,12 @@ class Example(CableExample):
                         ("slide z", abs(q[self.slide, 2] - self.slide_z)),
                         ("table z", abs(q[self.table, 2] - self.table_z)), ("error", err)):
             self.worst[name] = max(self.worst.get(name, 0.0), float(v))
+        if self.viewer is not None:  # Newton's diagrams
+            left, right = self.angle.numpy()
+            for name, v in (("Blue left input rotation [rad]", left), ("Blue right input rotation [rad]", right),
+                            ("Beige table X position [m]", q[self.table, 0]),
+                            ("Beige table Y position [m]", q[self.table, 1]), ("Beige table tracking error [m]", err)):
+                self.viewer.log_scalar(name, float(v))
 
     def test_final(self):
         assert np.isfinite(self.state_0.particle_q.numpy()).all(), "non-finite cable"

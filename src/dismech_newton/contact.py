@@ -350,7 +350,7 @@ class BarrierBlock:
             self.source.fill(state_in, self.dt, q, self.s)
         self._launch(_rebase_kernel, [q, state_in.dismech.q, self.s])
         self._launch(_carry_kernel, [self.block, self.lam, self.lam_key, self.s])
-        self._launch(_lift_kernel, [q, lift, self.s])
+        self._launch(_lift_kernel, [q, lift, self.s, self.arm])
         self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.mass, self.fixed, self.scale,
                                    int(start), self.unsettled, self.s, self.arm])
 
@@ -468,15 +468,20 @@ def _rebase_kernel(q: wp.array[float], q0: wp.array[float], s: Slots):
 
 
 @wp.kernel
-def _lift_kernel(q: wp.array[float], lift: float, s: Slots):
+def _lift_kernel(q: wp.array[float], lift: float, s: Slots, arm: Arm):
     """A shape's pair (all weights positive: against its anchor) starting closer than ``lift`` thicknesses, or
     inside (a node in a body, or a body moving onto it over the step): its anchor sinks along the normal so the
-    barrier starts that close (finite), and the body pushes it out over the next steps."""
+    barrier starts that close (finite), and the body pushes it out over the next steps. At an iterate a yielding body
+    has moved by its DOFs in ``q`` (detection sees it at the step's start): the gap is to the moved body."""
     i = wp.tid()
     if s.active[i] == 0 or wp.min(s.w[i]) < 0.0:
         return
     n = s.normal[i]
-    o = wp.dot(n, contact_point(q, s.pair[i], s.w[i], s.anchor[i])) - lift * s.thickness[i]
+    c = contact_point(q, s.pair[i], s.w[i], s.anchor[i])
+    b = arm_body(arm, s, i)
+    if b >= 0 and q.shape[0] > arm.start:  # (the step's start: the state's DOFs only, the bodies not yet moved)
+        c -= arm_move(q, arm, b, s.anchor[i] - arm.com[b])
+    o = wp.dot(n, c) - lift * s.thickness[i]
     if o < 0.0:
         s.anchor[i] = s.anchor[i] + o * n
         s.c0[i] = s.c0[i] - o * n

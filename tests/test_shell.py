@@ -445,8 +445,9 @@ SHAPES = ["sphere", "box", "mesh"]
 
 @pytest.mark.parametrize("shape", SHAPES)
 def test_sheet_on_shape(shape):
-    """A sheet dropped on a shape (no collision pipeline): no vertex comes inside its offset surface, and the vertices
-    over the top rest on it at their thickness."""
+    """A sheet dropped on a shape (no collision pipeline): no vertex, nor any point of a triangle, comes inside its
+    offset surface, and the sheet rests on the top at its thickness (its lowest vertex there: the facets crossing a
+    box's rims are held a thickness off the rim, so the taut sheet spans the top slightly above it)."""
     r, h = 0.004, 0.08
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     add_shape(builder, shape, h, z=h)
@@ -466,8 +467,13 @@ def test_sheet_on_shape(shape):
     # 0.80-0.93 r over 40 runs (2026-10-27, mesh and box alike): the rim sliding down the side; [mesh] once < 0 (once
     # in ~14 full runs, not reproduced since), so say where.
     assert gaps[k, v] > 0.7 * r, f"vertex {v} at step {4 * k}: gap {gaps[k, v] / r:.2f} r at {frames[k][ids[v]]}"
-    gap = np.abs(sdf(x[top], shape, h, h) - r)
-    assert (gap.min() if shape == "sphere" else gap.max()) < 0.15 * r  # a sphere's top touches at one vertex
+    u = np.linspace(0.0, 1.0, 7)  # 28 points per triangle: a rim or a curved top meets a sheet between its vertices
+    w = np.array([(a, b, 1.0 - a - b) for a in u for b in u if a + b <= 1.0 + 1.0e-9])
+    inner = min(sdf(np.einsum("sk,tkc->tsc", w, y[ids][f]).reshape(-1, 3), shape, h, h).min() for y in frames)
+    assert inner > 0.9 * r, f"a triangle at {inner / r:.2f} r"  # 0.996-0.997 r over 12 runs (2026-11-02)
+    # resting on the top: its lowest vertex 0.06-0.16 r off over 12 runs on a box or mesh (the rims hold it up), a
+    # sphere 0.04-0.05 r
+    assert np.abs(sdf(x[top], shape, h, h) - r).min() < 0.25 * r
 
 
 @pytest.mark.parametrize("shape", SHAPES)

@@ -14,7 +14,7 @@ EXAMPLES = ["cantilever", "flagella", "overhand_knot", "plectoneme", "shell_cant
             "newton/cable_bundle_hysteresis", "newton/cable_pile",
             "newton/cable_cross_slide_table", "newton/cable_plectoneme", "newton/cable_twist",
             "newton/cable_y_junction",
-            "newton/cloth_bending", "newton/cloth_hanging", "newton/cloth_twist"]
+            "newton/cloth_bending", "newton/cloth_hanging", "newton/cloth_rigid_trampoline", "newton/cloth_twist"]
 ROOT = Path(__file__).resolve().parents[1] / "examples"
 
 

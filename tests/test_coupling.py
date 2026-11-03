@@ -251,6 +251,19 @@ def test_franka_pick_place():
 
 @pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda")
+def test_franka_napkin_fold():
+    """Our Franka napkin fold, whole (720 frames): while pinched, each finger's grip its servo force (10%), the hem's
+    corner laid within 2 cm of the napkin's far corner, the flap flat on the other half, no crossings."""
+    from test_examples import _load  # noqa: PLC0415
+
+    ex = _load("newton/cloth_franka_fold").Example(None, None)
+    for _ in range(720):
+        ex.step()
+    ex.test_final()
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("needs_cuda")
 def test_cross_slide_table():
     """Our cable-driven XY table (Newton's ``example_cable_cross_slide_table``): MuJoCo's carriages and pulleys, our
     cable pinned to the table and driven by surface friction, 150 frames (the ramp, the first side and corner; the

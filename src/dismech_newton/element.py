@@ -18,7 +18,7 @@ import warp as wp
 from newton import State
 
 from .linear import SymmetricCSR, triu_slot
-from .state import block_sum, flatten_state, padded
+from .state import Worlds, flatten_state, padded, world_sum
 
 BETA = 1.0  # the strain penalty over the energy's stiffness K + C/dt
 
@@ -48,14 +48,19 @@ class ElementBlock:
         self.device, vec = fixed.device, elem.kernels.vec
         self.P, self.z, self.u, self.eps_prev = (wp.zeros(self.count, dtype=vec, device=self.device) for _ in range(4))
         self.eps_cand = wp.zeros((num_candidates, self.count), dtype=vec, device=self.device)
+        self.worlds = None  # Worlds, the solver's
 
     def _launch(self, kernel, inputs, outputs, dim=None):
         wp.launch(kernel, dim=dim or self.count, inputs=inputs, outputs=outputs, device=self.device)
 
-    def reset(self, state: State) -> None:
-        """``z = eps(q)``, ``u = 0`` at ``state``."""
-        self._launch(self.k.measure, [state.dismech.q, self.bind(state.dismech)], [self.z])
-        self.u.zero_()
+    def reset(self, state: State, mask: wp.array | None = None) -> None:
+        """``z = eps(q)``, ``u = 0`` at ``state`` (in the worlds of ``mask``, else all)."""
+        if mask is None:
+            self._launch(self.k.measure, [state.dismech.q, self.bind(state.dismech)], [self.z])
+            self.u.zero_()
+        else:
+            self._launch(self.k.warm, [state.dismech.q, self.bind(state.dismech), self.worlds.of, mask],
+                         [self.z, self.u])
 
     def begin_step(self, state_in: State, dt: float, exact: bool) -> None:
         """Bind ``state_in``, take its stored strains as the previous ones, set the penalties."""
@@ -78,11 +83,11 @@ class ElementBlock:
         self._launch(self.k.grad, [q, self.view, self.P, self.z, self.u, self.fixed], [b])
 
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
-        self._launch(self.k.energy, [q_cand, self.view, self.P, self.z, self.u], [self.eps_cand, energy],
+        self._launch(self.k.energy, [q_cand, self.view, self.P, self.z, self.u, self.worlds], [self.eps_cand, energy],
                      dim=(q_cand.shape[0], padded(self.count)))
 
     def commit(self, q: wp.array, pick: wp.array, b: wp.array) -> None:
-        self._launch(self.k.commit, [q, self.view, pick, self.eps_cand, self.params_step, self.rest_step, self.eps_prev,
+        self._launch(self.k.commit, [q, self.view, pick, self.worlds, self.eps_cand, self.params_step, self.rest_step, self.eps_prev,
                                      self.P, self.dt, self.exact, self.fixed], [self.z, self.u, b])
 
 
@@ -131,6 +136,14 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
     def measure(q: wp.array[float], v: View, out: wp.array[vec]):
         i = wp.tid()
         out[i] = strain(local(q, v, i), v, i)
+
+    @wp.kernel(module="unique", module_options=unrolled)
+    def warm(q: wp.array[float], v: View, of: wp.array[wp.int32], mask: wp.array[wp.bool], z: wp.array[vec],
+             u: wp.array[vec]):
+        i = wp.tid()
+        if mask[of[dofs(v, i)[0]]]:
+            z[i] = strain(local(q, v, i), v, i)
+            u[i] = vec()
 
     @wp.kernel(module="unique", module_options=unrolled)
     def previous(stored: wp.array[vec], q: wp.array[float], v: View, out: wp.array[vec]):
@@ -218,23 +231,27 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         P: wp.array[vec],
         z: wp.array[vec],
         u: wp.array[vec],
+        wd: Worlds,
         eps_cand: wp.array2d[vec],
         energy: wp.array[wp.float64],
     ):
         k, i = wp.tid()
         e = wp.float64(0.0)
+        w = int(-1)
         if i < z.shape[0]:
+            w = wd.of[dofs(v, i)[0]]
             eps = strain(local(q_cand[k], v, i), v, i)
             eps_cand[k, i] = eps
             r = eps - z[i] + u[i]
             e = wp.float64(0.5 * wp.dot(wp.cw_mul(P[i], r), r))
-        block_sum(energy, k, e)
+        world_sum(energy, w, k, wd.stride, e)
 
     @wp.kernel(module="unique")
     def commit(
         q: wp.array[float],
         v: View,
         pick: wp.array[wp.int32],
+        wd: Worlds,
         eps_cand: wp.array2d[vec],
         params: wp.array[params_vec],
         rest: wp.array[vec],
@@ -248,12 +265,15 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         b: wp.array[wp.float64],
     ):
         """The closed-form prox and dual step from the picked candidate's strains (not with ``exact``), then the
-        gradient at the new ``q``."""
+        gradient at the new ``q``; nothing in a world not iterating."""
         i = wp.tid()
+        w = wd.of[dofs(v, i)[0]]
+        if wd.active[w] == 0:
+            return
         zi = z[i]
         ui = u[i]
         if exact == 0:
-            d = eps_cand[pick[0], i] + ui
+            d = eps_cand[pick[w], i] + ui
             zi = prox(params[i], rest[i], eps_prev[i], P[i], d, dt)
             ui = d - zi
             z[i] = zi
@@ -315,6 +335,6 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             if fixed[d[c]] == 0 and hi[c] != 0.0:
                 wp.atomic_add(vals, slots[triu_slot(row, c, D), i], wp.float64(hi[c]))
 
-    return SimpleNamespace(vec=vec, xvec=xvec, D=D, measure=measure, previous=previous, penalty=penalty,
+    return SimpleNamespace(vec=vec, xvec=xvec, D=D, measure=measure, warm=warm, previous=previous, penalty=penalty,
                            assemble=assemble, grad=grad, energy=energy, commit=commit, gather=gather, forces=forces,
                            scatter=scatter, hessian_row=hessian_row)

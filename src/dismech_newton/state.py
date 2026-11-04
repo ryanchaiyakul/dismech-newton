@@ -88,11 +88,52 @@ def scatter_node(b: wp.array(dtype=Any), fixed: wp.array[wp.int32], n: int, v: w
             wp.atomic_add(b, 3 * n + k, b.dtype(v[k]))
 
 
+@wp.struct
+class Worlds:
+    """Each world's step is its own solve (one line search, convergence and failure per world): ``of`` per DOF its
+    world; ``active``: the worlds iterating this iteration; per-world sums are ``a[w * stride + k]``."""
+
+    of: wp.array[wp.int32]
+    active: wp.array[wp.int32]
+    count: int
+    stride: int
+
+
+def dof_worlds(model: Model, n: int, stencils) -> np.ndarray:
+    """Per DOF of ``n`` its world: a node's (global nodes: world 0, and one world if there are any), an element's
+    DOFs their first node's (``stencils``: rows of DOFs, each within a world, the first a node's; -1s unused)."""
+    nodes = np.maximum(model.particle_world.numpy(), 0) if model.particle_count else np.zeros(0, np.int64)
+    if (model.particle_world.numpy() < 0).any() and model.world_count > 1:
+        return np.zeros(n, np.int32)
+    out = np.zeros(n, np.int64)
+    out[: 3 * len(nodes)] = np.repeat(nodes, 3)
+    for rows in stencils:
+        rows = np.asarray(rows)
+        if rows.size:
+            w = np.broadcast_to(out[rows[:, :1]], rows.shape)
+            out[rows[rows >= 0]] = w[rows >= 0]
+    return out.astype(np.int32)
+
+
+@wp.kernel
+def masked_copy_kernel(start: int, world: wp.array[wp.int32], mask: wp.array[wp.bool], src: wp.array(dtype=Any),
+                       dst: wp.array(dtype=Any)):
+    """``dst[i] = src[i]`` for the rows ``i`` (from ``start``) whose world ``mask`` selects."""
+    i = start + wp.tid()
+    if mask[world[i]]:
+        dst[i] = src[i]
+
+
 @wp.func
-def block_sum(a: wp.array[wp.float64], k: int, v: wp.float64):
-    """``a[k] += v`` summed over the block first (one atomic per block, not per thread); every thread of the block
-    calls it with the same ``k``."""
-    wp.tile_atomic_add(a, wp.tile_sum(wp.tile(v)), offset=k)
+def world_sum(a: wp.array[wp.float64], w: int, k: int, stride: int, v: wp.float64):
+    """``a[w stride + k] += v`` (``w < 0``: a padding thread, nothing): summed over the block first when its threads
+    share ``w`` (all of a single world's), else per thread; every thread of the block calls it with the same ``k``."""
+    lo = wp.tile_extract(wp.tile_min(wp.tile(wp.where(w >= 0, w, 1 << 30))), 0)
+    hi = wp.tile_extract(wp.tile_max(wp.tile(w)), 0)
+    if lo == hi:
+        wp.tile_atomic_add(a, wp.tile_sum(wp.tile(v)), offset=lo * stride + k)
+    elif w >= 0:
+        wp.atomic_add(a, w * stride + k, v)
 
 
 @wp.struct

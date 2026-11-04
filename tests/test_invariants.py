@@ -65,3 +65,94 @@ def test_devices_agree(rng):
             r.simulate(run)
             out.append(np.concatenate([s.dismech.q.numpy() for s in run.states[1:]]))
     assert np.abs(out[0] - out[1]).max() < 1.0e-5 * np.abs(out[1]).max()
+
+
+def _helices():
+    """Two worlds, a damped helical rod each (different stiffness), dropped 1 cm onto the ground."""
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    t = np.linspace(0.0, 3.0 * np.pi, 25)
+    pts = np.column_stack([0.05 * np.cos(t), 0.05 * np.sin(t), 0.012 + 0.002 * t])
+    for ei in (2.0e-3, 5.0e-3):
+        w = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        SolverDiSMech.add_rod(w, rod=newton.Rod(pts, radius=0.004), stretch_stiffness=1.0e3, bend_stiffness=ei,
+                              twist_stiffness=ei, bend_damping=0.1 * ei, stretch_damping=1.0,
+                              cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.5))
+        b.add_world(w)
+    b.add_ground_plane()
+    return b.finalize()
+
+
+def _rollout(model, steps, reset_at=None, worlds=()):
+    solver = SolverDiSMech(model, iterations=30)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    world = model.particle_world.numpy()
+    sel = np.isin(world, worlds)
+    mask = wp.array([w in worlds for w in range(model.world_count + 1)], dtype=wp.bool)
+    for i in range(steps):
+        if i == reset_at:  # the worlds' nodes back to the model's, at rest; the solver resets the rest
+            x, v = s0.particle_q.numpy(), s0.particle_qd.numpy()
+            x[sel], v[sel] = model.particle_q.numpy()[sel], 0.0
+            s0.particle_q.assign(x)
+            s0.particle_qd.assign(v)
+            solver.reset(s0, mask)
+        solver.step(s0, s1, None, None, 0.005)
+        s0, s1 = s1, s0
+    return s0.dismech.q.numpy(), world
+
+
+def test_masked_reset_replays_a_fresh_start():
+    """Helices dropped on the ground for 40 steps (world 1 moves 1.9 cm, its twist 0.08 rad), then reset by
+    ``world_mask``, then 40 more steps. Both worlds reset: the same as 40 steps from the start to round-off (5e-8 m,
+    as two fresh runs differ). World 1 alone: it replays the fresh start and world 0 goes on unaffected, both within
+    a few of the solve's tolerance (0.01 radii: 4e-5 m; 5e-5 and 1.5e-5 on 2026-11-03): contacts are still found and
+    the matrix refactorized for all worlds at once, so another world's iterates reach a world's."""
+    model = _helices()
+    fresh, world = _rollout(model, 40)
+    plain, _ = _rollout(model, 80)
+    both, _ = _rollout(model, 80, reset_at=40, worlds=(0, 1))
+    assert np.abs(both - fresh).max() < 1.0e-6
+    one, _ = _rollout(model, 80, reset_at=40, worlds=(1,))
+    nodes = np.repeat(world, 3)
+    nd = nodes.size
+    assert np.abs(one[:nd][nodes == 1] - fresh[:nd][nodes == 1]).max() < 2.0e-4
+    assert np.abs(one[:nd][nodes == 0] - plain[:nd][nodes == 0]).max() < 2.0e-4
+
+
+def test_friction_follows_the_model():
+    """Two worlds of a straight rod sliding sideways on the ground at 1 m/s, world 1's rod ``mu`` lowered after the
+    solver is built (``notify_model_changed``): each stops where Coulomb's ``v0^2 / (2 mu g)`` says, ``mu`` the mean
+    of the rod's and the ground's (+0.9%, +0.6% on 2026-11-04): per-world friction, randomizable at a reset."""
+    g, v0, dt, mu_ground = 9.81, 1.0, 0.002, 0.5
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
+    for _ in range(2):
+        w = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
+        pts = np.column_stack([np.linspace(-0.1, 0.1, 11), np.zeros(11), np.full(11, 0.005)])
+        SolverDiSMech.add_rod(w, rod=newton.Rod(pts, radius=0.005), stretch_stiffness=1e3, bend_stiffness=1e-2,
+                              twist_stiffness=1e-2, cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.5))
+        b.add_world(w)
+    b.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu_ground))
+    model = b.finalize()
+    solver = SolverDiSMech(model)
+    sb, body_world = model.shape_body.numpy(), model.body_world.numpy()
+    mu = model.shape_material_mu.numpy()
+    mu[(sb >= 0) & (body_world[np.maximum(sb, 0)] == 1)] = 0.1
+    model.shape_material_mu.assign(mu)
+    solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    for i in range(20 + int(0.5 / dt)):  # settle onto the ground, then slide
+        if i == 20:
+            v = np.zeros((model.particle_count, 3))
+            v[:, 1] = v0
+            s0.particle_qd.assign(v)
+            y0 = s0.particle_q.numpy()[:, 1].copy()
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+    slid = s0.particle_q.numpy()[:, 1] - y0
+    world = model.particle_world.numpy()
+    for w, mu_rod in ((0, 0.5), (1, 0.1)):
+        exact = v0**2 / (2.0 * 0.5 * (mu_rod + mu_ground) * g)
+        assert abs(slid[world == w].mean() / exact - 1.0) < 0.03

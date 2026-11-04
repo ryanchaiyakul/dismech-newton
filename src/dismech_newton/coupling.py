@@ -7,7 +7,7 @@ from newton import BodyFlags, JointType, Model, State
 
 from .contact import STIFFNESS, Arm, arm_assemble, arm_move, arm_scatter
 from .linear import row_slot
-from .state import block_sum, node, padded, scatter_node
+from .state import node, padded, scatter_node, world_sum
 
 
 class ProxyArm:
@@ -50,7 +50,7 @@ class ProxyArm:
         self._last = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the last step left
         self._offset = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)  # synced pose - start
         self._start = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the step began at
-        self._valid = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._valid = wp.zeros(nb, dtype=wp.int32, device=self.device)  # per body: it has a last pose
         self.restart = False  # the next step repeats the last (a coupler's iteration restart): from its start
         self._arm: Arm | None = None
 
@@ -63,9 +63,13 @@ class ProxyArm:
         arm.M.assign(eye)
         arm.Minv.assign(eye)
 
-    def reset(self) -> None:
-        """Start the proxies from their synced poses next step."""
-        self._valid.zero_()
+    def reset(self, mask: wp.array | None = None) -> None:
+        """Start the proxies from their synced poses next step (those of the worlds of ``mask``, else all)."""
+        if mask is None:
+            self._valid.zero_()
+        elif self._body.shape[0]:
+            wp.launch(_proxy_reset_kernel, dim=self._body.shape[0], inputs=[self._body, self.model.body_world, mask],
+                      outputs=[self._valid], device=self.device)
 
     def update(self, state: State, h: float) -> tuple[wp.array, wp.array]:
         """The arm at the step from ``state`` (step ``h``); returns the body poses and velocities for the step: the
@@ -134,7 +138,7 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     q0 = synced
     if restart != 0:
         q0 = start_q[b]
-    elif valid[0] != 0:
+    elif valid[b] != 0:
         q0 = last[b]
     start_q[b] = q0
     R = wp.quat_to_matrix(wp.transform_get_rotation(q0))
@@ -163,6 +167,15 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     q_step[b] = q0
     qd_step[b] = wp.spatial_vector()
     offset[b] = wp.spatial_vector(dc, dr)
+
+
+@wp.kernel
+def _proxy_reset_kernel(body: wp.array[wp.int32], body_world: wp.array[wp.int32], mask: wp.array[wp.bool],
+                        valid: wp.array[wp.int32]):
+    b = body[wp.tid()]
+    w = body_world[b]
+    if mask[wp.where(w >= 0, w, mask.shape[0] - 1)]:
+        valid[b] = 0
 
 
 @wp.kernel
@@ -263,7 +276,7 @@ class ProxyPins:
         self.grad(q, b)
 
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
-        self._launch(_pin_energy_kernel, [q_cand, self.p, self.arm, self.count, energy],
+        self._launch(_pin_energy_kernel, [q_cand, self.p, self.arm, self.count, self.world, self.stride, energy],
                      dim=(q_cand.shape[0], padded(self.count)))
 
     def assemble(self, q: wp.array, A) -> None:
@@ -297,13 +310,16 @@ def _pin_grad_kernel(q: wp.array[float], p: Pins, arm: Arm, fixed: wp.array[wp.i
 
 
 @wp.kernel
-def _pin_energy_kernel(q_cand: wp.array2d[float], p: Pins, arm: Arm, count: int, energy: wp.array[wp.float64]):
+def _pin_energy_kernel(q_cand: wp.array2d[float], p: Pins, arm: Arm, count: int, world: wp.array[wp.int32],
+                       stride: int, energy: wp.array[wp.float64]):
     j, i = wp.tid()
     e = wp.float64(0.0)
+    w = int(-1)
     if i < count:
+        w = world[3 * p.node[i]]
         c = _pin_gap(q_cand[j], p, i, arm)
         e = wp.float64(0.5 * p.k[i] * wp.dot(c, c))
-    block_sum(energy, j, e)
+    world_sum(energy, w, j, stride, e)
 
 
 @wp.kernel

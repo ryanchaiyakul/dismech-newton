@@ -1,3 +1,5 @@
+import logging
+import re
 from functools import partial
 from typing import Any
 
@@ -17,19 +19,22 @@ from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_pro
 from .shell import Shells
 from .state import (
     Dofs,
+    Worlds,
     bind_dofs,
-    block_sum,
     diagonal_kernel,
     dof_constants,
     dof_mass,
+    dof_worlds,
     end_kernel,
     flatten_state,
     inertia_energy,
     inertia_grad,
+    masked_copy_kernel,
     node,
     padded,
     predict_kernel,
     suspended_tape,
+    world_sum,
 )
 
 _C1 = 1.0e-4  # Armijo's sufficient decrease
@@ -40,6 +45,20 @@ FINISH = 3  # a step's last iterations, after its multipliers are updated whethe
 # force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
 TOLERANCE = 0.01
 CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q")  # state a step carries beyond the DOFs (and strains)
+
+
+class _OwnResetState(logging.Filter):
+    """Newton's ``SolverCoupled`` warns that its reset skips the ``dismech:*`` state attributes (custom frequencies):
+    :meth:`SolverDiSMech.reset` resets them itself, so only a warning naming others passes."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "reset reconciliation skips STATE attributes" not in message:
+            return True
+        return not all(name.startswith("dismech:") for name in re.findall(r"'([^']+)' \(", message))
+
+
+logging.getLogger("newton._src.solvers.coupled.solver_coupled").addFilter(_OwnResetState())
 
 
 class SolverDiSMech(SolverBase, CouplingInterface):
@@ -79,7 +98,10 @@ class SolverDiSMech(SolverBase, CouplingInterface):
     With contacts the step iterates until its Newton step moves no node (nor a pair's force, nor a midedge angle's
     offset midpoint) more than :data:`TOLERANCE` radii, or the line search stalls, at most ``iterations`` times.
 
-    ``counts`` (device ``int32[3]``) sums the contact steps that spent their ``iterations`` unconverged, those
+    Each world's step is its own solve: its line search, convergence and failure (a world that has converged takes
+    no step while others iterate on).
+
+    ``counts`` (device ``int32[3]``) sums the worlds' contact steps that spent their ``iterations`` unconverged, those
     that stalled, and those whose Newton step was not finite (it is taken: the state goes non-finite, loudly). A step is a fixed budget, not a solve to tolerance: compressed cloth (a buckling membrane, whose
     step objective is nonconvex) often ends unconverged, and its :meth:`vjp` (exact at a solution) is then
     approximate.
@@ -137,17 +159,32 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             dofs = n0 + k * np.maximum(model.particle_world.numpy(), 0)[:, None] + np.arange(k)
             stencils.append(np.column_stack([3 * p, 3 * p + 1, 3 * p + 2, dofs]).astype(np.int64))
         self.A = SymmetricCSR(n, tuple(stencils), dev)
+        of = dof_worlds(model, n, stencils)
+        self.num_worlds = W = int(of.max(initial=0)) + 1
+        self.worlds = wd = Worlds()
+        wd.of, wd.active = wp.array(of, dtype=wp.int32, device=dev), wp.ones(W, dtype=wp.int32, device=dev)
+        wd.count, wd.stride = W, nc
+        rows = {"edge_d1_q": of[3 * node0]}  # a masked reset's rows: per attribute, its rows' worlds
+        for t in types:  # an element's: its first node's (a rod's carry its triplets' reference twists, Dahl)
+            for name in (t.stored, *(CARRIED[1:] if t is self.triplets else ())):
+                rows[name] = of[t.dofs()[:, 0]] if t.count else []
+        self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
+        self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
         )
+        for e in self.elements:
+            e.worlds = wd
         # every pair within twice its thickness; a node moves at most its smallest radius per detection
         source = Offset(model, self.fixed, self_contact=self_contact)
-        self.contact = BarrierBlock(model, self.fixed, source)
+        self.contact = BarrierBlock(model, self.fixed, source, of, nc)
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
             arm.bind(self.contact.arm)
         self._arm_radius = arm.radius if k else wp.zeros(0, dtype=float, device=dev)  # per proxy body, its 6 DOFs
         self.pins = ProxyPins(model, self.contact.arm, self.mass, self.fixed) if k else None  # rods on proxy bodies
+        if self.pins:
+            self.pins.world, self.pins.stride = wd.of, nc
         self._qw = wp.zeros(n, dtype=float, device=dev) if k else None  # the step's unknowns: the state's, the arms'
         self.cap = float(model.particle_radius.numpy().min()) if self.contact.count else 0.0
         self._tol = TOLERANCE * self.cap
@@ -160,17 +197,20 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._b = wp.zeros(n, dtype=wp.float64, device=dev)  # the objective's gradient
         self._dq = wp.zeros(n, dtype=float, device=dev)
         self._q0 = wp.zeros(n, dtype=float, device=dev)  # the move cap's anchor: the start, or the last detection
-        self._moved = wp.zeros(1, dtype=wp.int32, device=dev)  # a node moved half its cap since: detect again
+        # per world (a flag's [W]: in any world): a node moved half its cap since: detect again
+        self._moved = wp.zeros(W + 1, dtype=wp.int32, device=dev)
         self._q_cand = wp.zeros((nc, n), dtype=float, device=dev)
-        self._energy = wp.zeros(nc, dtype=wp.float64, device=dev)
-        self._slope = wp.zeros(1, dtype=wp.float64, device=dev)
-        self._pick = wp.zeros(1, dtype=wp.int32, device=dev)
-        self._go = wp.zeros(1, dtype=wp.int32, device=dev)  # the barrier's step iterates on: not converged
+        self._energy = wp.zeros(W * nc, dtype=wp.float64, device=dev)  # [w * nc + candidate]
+        self._slope = wp.zeros(W, dtype=wp.float64, device=dev)
+        self._pick = wp.zeros(W, dtype=wp.int32, device=dev)
+        self._go = wp.zeros(W + 1, dtype=wp.int32, device=dev)  # the barrier's step iterates on: not converged
+        self._settle = wp.zeros(W + 1, dtype=wp.int32, device=dev)  # converged at this iterate: its multipliers
+        self._all = wp.ones(W, dtype=wp.int32, device=dev)
         self._refresh = wp.zeros(1, dtype=wp.int32, device=dev)  # A anew at this iterate
-        self._dq_max = wp.zeros(1, dtype=float, device=dev)
-        self._impact = wp.ones(1, dtype=float, device=dev)  # the line search's longest step: the first impact
-        self._stalled = wp.zeros(1, dtype=wp.int32, device=dev)
-        self._failed = wp.zeros(1, dtype=wp.int32, device=dev)  # the step's Newton step was not finite
+        self._dq_max = wp.zeros(W, dtype=float, device=dev)
+        self._impact = wp.ones(W, dtype=float, device=dev)  # the line search's longest step: the first impact
+        self._stalled = wp.zeros(W, dtype=wp.int32, device=dev)
+        self._failed = wp.zeros(W, dtype=wp.int32, device=dev)  # the step's Newton step was not finite
         self.counts = wp.zeros(3, dtype=wp.int32, device=dev)  # steps ended unconverged (budget spent), stalled, failed
         # the last step's contact forces on Newton's bodies (body_f layout): what a rigid solver couples back
         self.body_reaction = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_vector, device=dev)
@@ -307,10 +347,16 @@ class SolverDiSMech(SolverBase, CouplingInterface):
     def reset(self, state: State, world_mask: wp.array[wp.bool] | None = None, flags: StateFlags | int | None = None
               ) -> None:
         """Start the next step from ``state`` without the last step's warm start: for a step that does not continue
-        the last one, such as a restart from data."""
-        if world_mask is not None:
-            raise NotImplementedError(f"{type(self).__name__}.reset resets every world")
+        the last one, such as a restart from data.
+
+        With ``world_mask`` (``bool[world_count + 1]``, Newton's): only those worlds, which start anew from their nodes
+        in ``state`` (an environment reset; graph-capturable): their twists, rates and midedge angles the model's,
+        their frames, reference twists, stored strains and Dahl stresses as a step from the model's state to these
+        nodes leaves them (:meth:`restart`), in ``state`` and in what a coupler's next input carries."""
         flatten_state(state)
+        if world_mask is not None:
+            self._reset_worlds(state, world_mask)
+            return
         for e in self.elements:
             e.reset(state)
         self.contact.reset()
@@ -318,14 +364,44 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self._proxy_arm.reset()
         self._started = True
 
+    def _reset_worlds(self, state: State, mask: wp.array) -> None:
+        if self.num_worlds != max(self.model.world_count, 1):
+            raise NotImplementedError("global nodes in a multi-world model: reset every world")
+        if self._rest is None:
+            self._rest, self._scratch = self.model.state(), self.model.state()
+            flatten_state(self._rest)
+            flatten_state(self._scratch)
+        r, t, of, dev = self._rest.dismech, self._scratch, self.worlds.of, self.device
+        wp.copy(t.dismech.q, r.q)
+        wp.copy(t.particle_q, state.particle_q)
+        self._carry(self._rest.particle_q, r, t.particle_q, t.dismech)
+        nd, n = self.num_node_dofs, self.num_state_dofs
+        for s in (state.dismech, self._carried.dismech):
+            for k, src in (("q", t.dismech.q), ("qd", r.qd)):
+                if n > nd:
+                    wp.launch(masked_copy_kernel, dim=n - nd, inputs=[nd, of, mask, src, getattr(s, k)], device=dev)
+            for k, world in self._rows.items():
+                wp.launch(masked_copy_kernel, dim=world.shape[0], inputs=[0, world, mask, getattr(t.dismech, k),
+                          getattr(s, k)], device=dev)
+        for e in self.elements:
+            e.reset(state, mask)
+        self.contact.reset(mask, of)
+        if self._proxy_arm is not None:
+            self._proxy_arm.reset(mask)
+
     def refresh_mass(self) -> None:
         """Re-read the masses and twist inertias after they changed."""
         dof_mass(self.model, self.mass[: self.num_state_dofs])
 
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
-        """``MODEL_PROPERTIES``: :meth:`refresh_mass`."""
+        """``MODEL_PROPERTIES``: :meth:`refresh_mass` and the rods' and sheets' friction (``shape_material_mu`` of
+        their capsules, ``particle_mu``). The elements' stiffness and damping (``dismech.triplet_params``,
+        ``face_params``) and the other side's friction (``shape_material_mu``) are read every step: changed in place,
+        they need no notice (per world at a reset: domain randomization)."""
         if flags & ModelFlags.MODEL_PROPERTIES:
             self.refresh_mass()
+            if self.contact.count:
+                self.contact.source.refresh_mu()
 
     @property
     def graph_capturable(self) -> bool:
@@ -345,7 +421,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                            state.joint_qd if joints else self._no_joint], device=self.device)
 
     def _solve(self, state_in: State, q: wp.array, dt: float) -> None:
-        dev, n = self.device, self.num_dofs
+        dev, n, W = self.device, self.num_dofs, self.num_worlds
         f = bind_dofs(self.dofs, self.model, self.mass, self.fixed, self._no_force, state_in, dt)
         for e in self.elements:
             e.begin_step(state_in, dt, self.exact)
@@ -366,7 +442,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._energy.zero_()  # the start instead if the prediction is through a contact or past an angle's barrier
         for blk in self.blocks:
             blk.energy(q.reshape((1, n)), self._energy)
-        wp.launch(_fallback_kernel, dim=n, inputs=[self._energy, q0], outputs=[q], device=dev)
+        wp.launch(_fallback_kernel, dim=n, inputs=[self._energy, self.worlds, q0], outputs=[q], device=dev)
         # b, the objective's gradient at q: the blocks' part comes from grad() here, then from commit() at each
         # picked candidate; _dof_kernel adds inertia and external force, _candidates_kernel spends it on the slope.
         self._regrad(q)
@@ -375,24 +451,26 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self._room = it < self.iterations - 2  # a multiplier update leaves the solve an iteration
             if self.contact.count and it == self.iterations - FINISH and it > 0:  # the multipliers updated,
                 # converged or not, if one moved: the last iterations solve from there
-                self.contact.update(q, self._tol, self._dq_max, self._pick, self._go, converged=False)
-                wp.capture_if(self.contact.moved, on_true=partial(self._regrad, q))
+                self.contact.update(q, self._tol, self._dq_max, self._pick, self._go, self._all, converged=False)
+                wp.capture_if(self.contact.any_moved, on_true=partial(self._regrad, q))
             if it == 0 or (self.exact and self.cap == 0.0):  # the chord matrix at the prediction (every iterate:
                 self._assemble(q, f)  # Gauss-Newton)
                 self._linear.invalidate()
             elif self.cap > 0.0 and self.refactor:  # the barrier's: at the iterate while a contact touches
-                wp.launch(_refresh_kernel, dim=1, inputs=[self._go, self.contact.touching, int(self.exact)],
+                wp.launch(_refresh_kernel, dim=1, inputs=[self._go[W:], self.contact.touching, int(self.exact)],
                           outputs=[self._refresh], device=dev)
                 wp.capture_if(self._refresh, on_true=partial(self._refactor, q, f))
             if self.cap > 0.0 and it > 0:  # converged: the rest of the step skipped
-                wp.capture_if(self._go, on_true=partial(self._iterate, state_in, q, f))
+                wp.capture_if(self._go[W:], on_true=partial(self._iterate, state_in, q, f))
             else:
                 self._iterate(state_in, q, f)
         self.contact.end_step()
         if self.cap > 0.0:
-            wp.launch(_count_kernel, dim=1, inputs=[self._go, self._stalled, self._failed, self.counts], device=dev)
+            wp.launch(_count_kernel, dim=W, inputs=[self._go, self._stalled, self._failed, self.counts], device=dev)
 
     def _iterate(self, state_in: State, q: wp.array, f) -> None:
+        wp.launch(_activate_kernel, dim=self.num_worlds, inputs=[self._go], outputs=[self.worlds.active],
+                  device=self.device)
         self._dof(q, f)
         self._linear.solve(self._b, self._dq)
         self._search(state_in, q, f)
@@ -411,45 +489,47 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             blk.grad(q, self._b)
 
     def _dof(self, q: wp.array, f) -> None:
-        wp.launch(_dof_kernel, dim=self.num_dofs, inputs=[q, self.q_pred, f],
+        wp.launch(_dof_kernel, dim=max(self.num_dofs, self._energy.shape[0]), inputs=[q, self.q_pred, f],
                   outputs=[self._b, self._energy, self._slope], device=self.device)
 
     def _search(self, state_in: State, q: wp.array, f) -> None:
         """The line search along the Newton step ``dq = A^-1 b``; with the barrier, the pairs found again if a node
-        moved half its cap, and ``_go`` cleared once converged."""
-        dev, n, b, q0 = self.device, self.num_dofs, self._b, self._q0
+        moved half its cap, and ``_go`` cleared once converged: per world, in the worlds iterating."""
+        dev, n, b, q0, wd, W = self.device, self.num_dofs, self._b, self._q0, self.worlds, self.num_worlds
         if self.cap > 0.0:  # the longest step stops short of the first pair's impact
             self._impact.fill_(1.0)
             self.contact.impact(q, self._dq, self._impact)
         wp.launch(_candidates_kernel, dim=(self.num_candidates, padded(n)),
                   inputs=[q, self._dq, self._impact, self.q_pred, f, q0, self.cap, self.contact.source.limit,
-                          self.num_state_dofs, self._arm_radius],
+                          self.num_state_dofs, self._arm_radius, wd],
                   outputs=[self._q_cand, b, self._energy, self._slope], device=dev)
         for blk in self.blocks:
             blk.energy(self._q_cand, self._energy)
-        wp.launch(_pick_kernel, dim=n, inputs=[self._energy, self._slope, self.num_candidates, self._q_cand],
+        wp.launch(_pick_kernel, dim=n, inputs=[self._energy, self._slope, wd, self._q_cand],
                   outputs=[q, self._pick], device=dev)
-        wp.launch(_nonfinite_kernel, dim=n, inputs=[self._dq], outputs=[q, self._failed], device=dev)
+        wp.launch(_nonfinite_kernel, dim=n, inputs=[self._dq, wd], outputs=[q, self._failed], device=dev)
         if self.cap > 0.0:
             self._moved.zero_()
             self._dq_max.zero_()
-            wp.launch(_moved_kernel, dim=self.model.particle_count, inputs=[q, q0, self._dq, 0.5 * self.cap],
+            wp.launch(_moved_kernel, dim=self.model.particle_count, inputs=[q, q0, self._dq, 0.5 * self.cap, wd],
                       outputs=[self._moved, self._dq_max], device=dev)
             if self._arm_radius.shape[0]:
                 wp.launch(_arm_moved_kernel, dim=self._arm_radius.shape[0],
-                          inputs=[q, q0, self.num_state_dofs, self._arm_radius, 0.5 * self.cap],
+                          inputs=[q, q0, self.num_state_dofs, self._arm_radius, 0.5 * self.cap, wd],
                           outputs=[self._moved], device=dev)
             h = self.der.hinge_thickness
             if h.shape[0]:
-                wp.launch(_hinge_size_kernel, dim=h.shape[0], inputs=[self._dq, self.shells.view.hinge_offset, h],
-                          outputs=[self._dq_max], device=dev)
+                wp.launch(_hinge_size_kernel, dim=h.shape[0],
+                          inputs=[self._dq, self.shells.view.hinge_offset, h, wd], outputs=[self._dq_max], device=dev)
             self.contact.newton_size(q, self._dq, self.cap, self._dq_max)
-            wp.capture_if(self._moved, on_true=partial(self._detect, state_in, q))
-            wp.launch(_go_kernel, dim=1, inputs=[self._dq_max, self._pick, self._moved, self._failed, self._tol],
-                      outputs=[self._go, self._stalled], device=dev)
+            wp.capture_if(self._moved[W:], on_true=partial(self._detect, state_in, q))
+            self._go[W:].zero_()
+            self._settle[W:].zero_()
+            wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._pick, self._moved, self._failed, self._tol, wd],
+                      outputs=[self._go, self._stalled, self._settle], device=dev)
             if self._room:  # converged: the multipliers updated, and on if one moved
-                wp.capture_if(self._go, on_false=partial(self.contact.update, q, self._tol, self._dq_max, self._pick,
-                                                         self._go))
+                wp.capture_if(self._settle[W:], on_true=partial(self.contact.update, q, self._tol, self._dq_max,
+                                                                self._pick, self._go, self._settle))
         for blk in self.blocks:
             blk.commit(q, self._pick, b)
 
@@ -493,22 +573,24 @@ def _copy_if_kernel(valid: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp
 
 
 @wp.func
-def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], num_candidates: int) -> int:
-    """Newton's full step if its expected decrease is below the objective's float32 rounding (no candidate can be
-    told apart). Else the longest step with sufficient decrease; else the candidate with the lowest objective if it
-    rises by no more than that rounding, or ``0``: no step (a stall)."""
-    f0 = energy[0]
-    s = slope[0]
+def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, num_candidates: int) -> int:
+    """World ``w``'s: Newton's full step if its expected decrease is below the objective's float32 rounding (no
+    candidate can be told apart). Else the longest step with sufficient decrease; else the candidate with the lowest
+    objective if it rises by no more than that rounding, or ``0``: no step (a stall)."""
+    o = w * num_candidates
+    f0 = energy[o]
+    s = slope[w]
     noise = wp.float64(_NOISE) * wp.abs(f0)
-    if s >= wp.float64(0.0) and wp.float64(0.5) * s <= noise and energy[1] <= f0 + noise and wp.isfinite(energy[1]):
+    if s >= wp.float64(0.0) and wp.float64(0.5) * s <= noise and energy[o + 1] <= f0 + noise and wp.isfinite(
+            energy[o + 1]):
         return 1  # the Newton step's decrease is below the objective's rounding: its full step is taken
     best = int(0)
     for k in range(1, num_candidates):
-        if wp.isfinite(energy[k]) and energy[k] <= f0 - wp.float64(_C1 * _step_length(k)) * s:
+        if wp.isfinite(energy[o + k]) and energy[o + k] <= f0 - wp.float64(_C1 * _step_length(k)) * s:
             return k
-        if wp.isfinite(energy[k]) and (best == 0 or energy[k] < energy[best]):
+        if wp.isfinite(energy[o + k]) and (best == 0 or energy[o + k] < energy[o + best]):
             best = k
-    if best > 0 and energy[best] <= f0 + wp.float64(_NOISE) * wp.abs(f0):
+    if best > 0 and energy[o + best] <= f0 + wp.float64(_NOISE) * wp.abs(f0):
         return best
     return 0
 
@@ -526,8 +608,10 @@ def _dof_kernel(
     i = wp.tid()
     if i < energy.shape[0]:
         energy[i] = wp.float64(0.0)
-    if i == 0:
-        slope[0] = wp.float64(0.0)
+    if i < slope.shape[0]:
+        slope[i] = wp.float64(0.0)
+    if i >= b.shape[0]:
+        return
     if f.fixed[i] != 0:
         b[i] = wp.float64(0.0)
     else:
@@ -546,6 +630,7 @@ def _candidates_kernel(
     limit: wp.array[float],
     arm_start: int,
     arm_radius: wp.array[float],
+    wd: Worlds,
     q_cand: wp.array2d[float],
     b: wp.array[wp.float64],
     energy: wp.array[wp.float64],
@@ -558,8 +643,11 @@ def _candidates_kernel(
     k, i = wp.tid()
     e = wp.float64(0.0)
     s = wp.float64(0.0)
+    w = int(-1)
     if i < q.shape[0]:
-        d = dq[i] * t[0]
+        w = wd.of[i]
+        tw = t[w]
+        d = dq[i] * tw
         qk = q[i]
         if k > 0:  # (candidate 0 the iterate itself, whatever dq is)
             qk = q[i] - _step_length(k) * d
@@ -569,7 +657,7 @@ def _candidates_kernel(
             move = wp.vec3(0.0)
             for c in range(3):
                 j = 3 * n + c
-                move[c] = q[j] - _step_length(k) * (dq[j] * t[0]) - q0[j]
+                move[c] = q[j] - _step_length(k) * (dq[j] * tw) - q0[j]
             length = wp.length(move)
             if length > cap:
                 qk = q0[i] + move[i - 3 * n] * (cap / length)
@@ -577,8 +665,8 @@ def _candidates_kernel(
             j0 = arm_start + 6 * ((i - arm_start) // 6)
             dx, dth = wp.vec3(0.0), wp.vec3(0.0)
             for c in range(3):
-                dx[c] = q[j0 + c] - _step_length(k) * (dq[j0 + c] * t[0]) - q0[j0 + c]
-                dth[c] = q[j0 + 3 + c] - _step_length(k) * (dq[j0 + 3 + c] * t[0]) - q0[j0 + 3 + c]
+                dx[c] = q[j0 + c] - _step_length(k) * (dq[j0 + c] * tw) - q0[j0 + c]
+                dth[c] = q[j0 + 3 + c] - _step_length(k) * (dq[j0 + 3 + c] * tw) - q0[j0 + 3 + c]
             sweep = wp.length(dx) + wp.length(dth) * arm_radius[(i - arm_start) // 6]
             if sweep > cap:
                 qk = q0[i] + (qk - q0[i]) * (cap / sweep)
@@ -588,17 +676,19 @@ def _candidates_kernel(
             if k == 0:
                 s = b[i] * wp.float64(d)
                 b[i] = wp.float64(0.0)
-    block_sum(energy, k, e)
-    block_sum(slope, 0, s)
+    world_sum(energy, w, k, wd.stride, e)
+    world_sum(slope, w, 0, 1, s)
 
 
 @wp.kernel
-def _moved_kernel(q: wp.array[float], q0: wp.array[float], dq: wp.array[float], limit: float,
+def _moved_kernel(q: wp.array[float], q0: wp.array[float], dq: wp.array[float], limit: float, wd: Worlds,
                   moved: wp.array[wp.int32], dq_max: wp.array[float]):
     n = wp.tid()
+    w = wd.of[3 * n]
     if wp.length(node(q, n) - node(q0, n)) > limit:
-        moved[0] = 1
-    wp.atomic_max(dq_max, 0, wp.length(node(dq, n)))
+        moved[w] = 1
+        moved[wd.count] = 1
+    wp.atomic_max(dq_max, w, wp.length(node(dq, n)))
 
 
 @wp.func
@@ -637,49 +727,75 @@ def _arm_sweep_kernel(q: wp.array[float], body: wp.array[wp.int32], base: wp.arr
 
 @wp.kernel
 def _arm_moved_kernel(q: wp.array[float], q0: wp.array[float], start: int, radius: wp.array[float], limit: float,
-                      moved: wp.array[wp.int32]):
+                      wd: Worlds, moved: wp.array[wp.int32]):
     """A proxy body moved more than ``limit`` since the pairs were found: find them again (as a node)."""
     b = wp.tid()
     if _arm_sweep(q, q0, start + 6 * b, radius[b]) > limit:
-        moved[0] = 1
+        moved[wd.of[start + 6 * b]] = 1
+        moved[wd.count] = 1
 
 
 @wp.kernel
-def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[float], dq_max: wp.array[float]):
+def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[float], wd: Worlds,
+                       dq_max: wp.array[float]):
     """A midedge angle's step as the move of its offset midpoint ``h/2 |d theta|`` (Chen et al. 2026, Sec. 7.3)."""
     h = wp.tid()
-    wp.atomic_max(dq_max, 0, 0.5 * thickness[h] * wp.abs(dq[offset + h]))
+    wp.atomic_max(dq_max, wd.of[offset + h], 0.5 * thickness[h] * wp.abs(dq[offset + h]))
 
 
 @wp.kernel
 def _go_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], moved: wp.array[wp.int32],
-               failed: wp.array[wp.int32], tol: float, go: wp.array[wp.int32], stalled: wp.array[wp.int32]):
-    """Iterate on while the Newton step moves a node more than ``tol`` and the line search took a step, or the pairs
-    were just found again (the objective changed); a step that finds no decrease short of that has stalled."""
-    go[0] = wp.where(dq_max[0] > tol and (pick[0] != 0 or moved[0] != 0) and failed[0] == 0, 1, 0)
-    if dq_max[0] > tol and pick[0] == 0 and moved[0] == 0:
-        stalled[0] = 1
+               failed: wp.array[wp.int32], tol: float, wd: Worlds, go: wp.array[wp.int32],
+               stalled: wp.array[wp.int32], settle: wp.array[wp.int32]):
+    """Per iterating world: iterate on while the Newton step moves a node more than ``tol`` and the line search took a
+    step, or the pairs were just found again (the objective changed); a step that finds no decrease short of that
+    has stalled. ``settle``: the worlds that stopped at this iterate (``[count]``: any; ``go[count]``: any goes; both
+    zeroed before)."""
+    w = wp.tid()
+    n = wd.count
+    settle[w] = 0
+    if wd.active[w] != 0:
+        go[w] = wp.where(dq_max[w] > tol and (pick[w] != 0 or moved[w] != 0) and failed[w] == 0, 1, 0)
+        if dq_max[w] > tol and pick[w] == 0 and moved[w] == 0:
+            stalled[w] = 1
+        if go[w] == 0:
+            settle[w] = 1
+            settle[n] = 1
+    if go[w] != 0:
+        go[n] = 1
 
 
 @wp.kernel
 def _count_kernel(go: wp.array[wp.int32], stalled: wp.array[wp.int32], failed: wp.array[wp.int32],
                   counts: wp.array[wp.int32]):
-    """The step's end: unconverged (its iterations spent) or stalled, counted."""
-    counts[0] += go[0]
-    counts[1] += stalled[0]
-    counts[2] += failed[0]
-    stalled[0] = 0
-    failed[0] = 0
+    """The step's end: the worlds unconverged (their iterations spent) or stalled, counted."""
+    w = wp.tid()
+    if go[w] != 0:
+        wp.atomic_add(counts, 0, 1)
+    if stalled[w] != 0:
+        wp.atomic_add(counts, 1, 1)
+    if failed[w] != 0:
+        wp.atomic_add(counts, 2, 1)
+    stalled[w] = 0
+    failed[w] = 0
 
 
 @wp.kernel
-def _nonfinite_kernel(dq: wp.array[float], q: wp.array[float], failed: wp.array[wp.int32]):
+def _activate_kernel(go: wp.array[wp.int32], active: wp.array[wp.int32]):
+    """The worlds that iterate: those not converged."""
+    w = wp.tid()
+    active[w] = go[w]
+
+
+@wp.kernel
+def _nonfinite_kernel(dq: wp.array[float], wd: Worlds, q: wp.array[float], failed: wp.array[wp.int32]):
     """A non-finite Newton step (a singular or overflowed solve) is taken, not skipped: the line search would pick no
-    candidate and the step read as converged, the state silently frozen."""
+    candidate and the step read as converged, the state silently frozen (its world's)."""
     i = wp.tid()
-    if not wp.isfinite(dq[i]):
+    w = wd.of[i]
+    if wd.active[w] != 0 and not wp.isfinite(dq[i]):
         q[i] = dq[i]
-        failed[0] = 1
+        failed[w] = 1
 
 
 @wp.kernel
@@ -700,9 +816,9 @@ def _guess_kernel(fixed: wp.array[wp.int32], q0: wp.array[float], limit: wp.arra
 
 
 @wp.kernel
-def _fallback_kernel(energy: wp.array[wp.float64], q0: wp.array[float], q: wp.array[float]):
+def _fallback_kernel(energy: wp.array[wp.float64], wd: Worlds, q0: wp.array[float], q: wp.array[float]):
     i = wp.tid()
-    if not wp.isfinite(energy[0]):
+    if not wp.isfinite(energy[wd.of[i] * wd.stride]):
         q[i] = q0[i]
 
 
@@ -710,13 +826,17 @@ def _fallback_kernel(energy: wp.array[wp.float64], q0: wp.array[float], q: wp.ar
 def _pick_kernel(
     energy: wp.array[wp.float64],
     slope: wp.array[wp.float64],
-    num_candidates: int,
+    wd: Worlds,
     q_cand: wp.array2d[float],
     q: wp.array[float],
     pick: wp.array[wp.int32],
 ):
+    """Each iterating world's candidate (``pick[w]``, written alike by its DOFs' threads); the others keep ``q``."""
     i = wp.tid()
-    k = _armijo(energy, slope, num_candidates)
-    if i == 0:
-        pick[0] = k
+    w = wd.of[i]
+    if wd.active[w] == 0:
+        pick[w] = 0
+        return
+    k = _armijo(energy, slope, w, wd.stride)
+    pick[w] = k
     q[i] = q_cand[k, i]

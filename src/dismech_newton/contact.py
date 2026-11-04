@@ -9,11 +9,12 @@ friction, each pair's stiffness); where contacts come from is :mod:`.collide`'s,
 
 from typing import Any
 
+import numpy as np
 import warp as wp
 from newton import Model, State
 
 from .linear import row_slot
-from .state import block_sum, node, padded, scatter_node
+from .state import node, padded, scatter_node, world_sum
 
 SMOOTH = wp.constant(0.02)  # the barrier's activation margin above the thickness (in thicknesses): a pair resting at
 # its thickness already has curvature, so A sees it
@@ -308,32 +309,48 @@ class BarrierBlock:
     times its nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction);
     the solver caps each node's move per detection so no pair beyond it can close."""
 
-    def __init__(self, model: Model, fixed: wp.array, source):
+    def __init__(self, model: Model, fixed: wp.array, source, dof_world: np.ndarray, stride: int):
         self.fixed, self.device, self.source = fixed, wp.get_device(model.device), source
         self.stiffness, self.slip_speed, self.slip = STIFFNESS, SLIP_SPEED, 0.0
         self.count = source.slots()
         size = max(self.count, 1)
         self.s = _slots(size, self.device)
+        nw, self.stride = int(dof_world.max(initial=0)) + 1, stride  # the worlds; per-world sums a[w stride + k]
+        self.num_worlds = nw
+        world = np.zeros(1, np.int32)
+        if self.count:  # per slot its world: its feature's (a node, an edge's first node)
+            nodes = np.concatenate([np.arange(source.num_nodes), source.mesh.edges.numpy()[:, 0]])
+            world = np.repeat(dof_world[3 * nodes], source.scene.slots)
+        self.world = wp.array(world, dtype=wp.int32, device=self.device)
         self.touching = wp.zeros(1, dtype=wp.int32, device=self.device)  # a pair has curvature at the last grad's q
         self.scale = wp.ones(max(model.particle_count, 1), dtype=float, device=self.device)  # nodes' load scales
         self.block = source.scene.slots if self.count else 1  # a feature's slots
         self.lam = wp.zeros(size, dtype=float, device=self.device)  # the last step's multipliers, by slot and key
         self.lam_key = wp.full(size, -1, dtype=wp.int32, device=self.device)
-        self.moved = wp.zeros(1, dtype=wp.int32, device=self.device)  # a multiplier moved the pair past tolerance
-        self.left = wp.zeros(1, dtype=wp.int32, device=self.device)  # the step's updates left
-        self.unsettled = wp.zeros(1, dtype=wp.int32, device=self.device)  # begin_step's
+        # per world: a multiplier moved its pair past tolerance; moved[nw]: in any world
+        self.moved = wp.zeros(nw + 1, dtype=wp.int32, device=self.device)
+        self.any_moved = self.moved[nw:]
+        self.left = wp.zeros(nw, dtype=wp.int32, device=self.device)  # per world, the step's updates left
+        self.unsettled = wp.zeros(nw, dtype=wp.int32, device=self.device)  # begin_step's
         self.arm = make_arm(model, getattr(source, "shape_key0", 0), 0, 0)  # no yielding bodies (the solver's to set)
 
     def _launch(self, kernel, inputs, dim=None):
         if self.count:
             wp.launch(kernel, dim=dim or self.count, inputs=inputs, device=self.device)
 
-    def reset(self) -> None:
-        self.lam_key.fill_(-1)
+    def reset(self, mask: wp.array | None = None, node_world: wp.array | None = None) -> None:
+        """No multipliers or load scales carried into the next step (in the worlds of ``mask``, ``node_world`` per
+        DOF: a node ``n``'s at ``3 n``)."""
+        if mask is None:
+            self.lam_key.fill_(-1)
+            self.scale.fill_(1.0)
+            return
+        self._launch(_forget_kernel, [self.world, mask, self.lam_key])
+        wp.launch(_unscale_kernel, dim=self.scale.shape[0], inputs=[node_world, mask, self.scale], device=self.device)
 
     def begin_step(self, state_in: State, dt: float, mass: wp.array, unsettled: wp.array) -> None:
-        """The pairs near the step's start and their lagged normal forces; ``unsettled[0]``: the last step ended
-        unconverged (its pairs' depths are its solve's error, not their load: no load scale grows)."""
+        """The pairs near the step's start and their lagged normal forces; ``unsettled[w]``: world ``w``'s last step
+        ended unconverged (its pairs' depths are its solve's error, not their load: no load scale grows)."""
         self.unsettled = unsettled
         self.slip = self.slip_speed * dt
         self.dt, self.mass = dt, mass
@@ -352,7 +369,7 @@ class BarrierBlock:
         self._launch(_carry_kernel, [self.block, self.lam, self.lam_key, self.s])
         self._launch(_lift_kernel, [q, lift, self.s, self.arm])
         self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.mass, self.fixed, self.scale,
-                                   int(start), self.unsettled, self.s, self.arm])
+                                   int(start), self.unsettled, self.world, self.s, self.arm])
 
     def snapshot(self) -> Slots | None:
         """This step's active pairs, gathered for its adjoint if any carries force at its end (one host read; two if
@@ -367,18 +384,19 @@ class BarrierBlock:
                       outputs=[getattr(out, name)], device=self.device)
         return out
 
-    def update(self, q: wp.array, tol: float, dq_max: wp.array, pick: wp.array, go: wp.array,
+    def update(self, q: wp.array, tol: float, dq_max: wp.array, pick: wp.array, go: wp.array, mask: wp.array,
                converged: bool = True) -> None:
         """At a converged ``q``: each pair's multiplier, the force its barrier holds there beyond what it holds at
         its thickness (kept by key for the next detection and step); if one moves its pair's rest by more than
         ``tol``, the solve converged (its last Newton step ``dq_max`` within ``tol`` and taken: not stalled) and the
         step has updates left, the pairs take them and ``go`` is set: the solve goes on. Not ``converged``: at the
-        step's end, whether its solve converged or not."""
+        step's end, whether its solve converged or not. Per world, in the worlds of ``mask``; ``go[num_worlds]``: any
+        world goes on."""
         self.moved.zero_()
-        self._launch(_uzawa_kernel, [q, self.s, self.arm, tol, self.lam, self.lam_key, self.moved])
-        wp.launch(_again_kernel, dim=1, inputs=[dq_max, pick, tol, int(converged), self.left, self.moved, go],
-                  device=self.device)
-        self._launch(_apply_kernel, [self.moved, self.lam, self.s])
+        self._launch(_uzawa_kernel, [q, self.s, self.arm, self.world, mask, tol, self.lam, self.lam_key, self.moved])
+        wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, pick, tol, int(converged), self.num_worlds,
+                  mask, self.left, self.moved, go], device=self.device)
+        self._launch(_apply_kernel, [self.moved, self.lam, self.world, self.s])
 
     def end_step(self) -> None:
         """The multipliers the step solved with, kept for the next (an update it did not solve with would kick)."""
@@ -396,15 +414,15 @@ class BarrierBlock:
         the frozen normal): :data:`IMPACT` of the length at which a touching pair's gap would reach the barrier's
         zero (IPC's filter), or the length at which an untouched pair reaches its barrier's full curvature (the Newton
         step, built without the pair's curvature, holds only that far)."""
-        self._launch(_impact_kernel, [q, dq, self.s, self.arm, t])
+        self._launch(_impact_kernel, [q, dq, self.s, self.arm, self.world, t])
 
     def newton_size(self, q: wp.array, dq: wp.array, cap: float, size: wp.array) -> None:
         """``size = max(size, e''(d) |n . C dq| h^2 / m)`` over the pairs: the Newton step's change of each pair's
         normal force as the move it would give the pair's mass ``m = 1 / (C M^-1 C^T)`` in a step (its force error,
         comparable to the nodes' moves: the stopping test), relative to ``cap`` plus the force the pair holds (as a
         move too): a loaded pair's force converges to a relative tolerance."""
-        self._launch(_newton_size_kernel, [q, dq, self.s, self.arm, self.mass, self.fixed, self.dt * self.dt, cap,
-                                           size])
+        self._launch(_newton_size_kernel, [q, dq, self.s, self.arm, self.world, self.mass, self.fixed,
+                                           self.dt * self.dt, cap, size])
 
     def grad(self, q: wp.array, b: wp.array) -> None:
         self.touching.zero_()
@@ -414,11 +432,11 @@ class BarrierBlock:
                       device=self.device)
 
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
-        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.slip, energy],
+        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.world, self.stride, self.slip, energy],
                      dim=(q_cand.shape[0], padded(self.count)))
         if self.arm.k:
             wp.launch(_arm_energy_kernel, dim=(q_cand.shape[0], padded(self.arm.M.shape[0])),
-                      inputs=[q_cand, self.arm, energy], device=self.device)
+                      inputs=[q_cand, self.arm, self.stride, energy], device=self.device)
 
     def commit(self, q: wp.array, pick: wp.array, b: wp.array) -> None:
         self.grad(q, b)
@@ -508,7 +526,7 @@ def _decay_kernel(scale: wp.array[float]):
 
 @wp.kernel
 def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scale: wp.array[float], grow: int,
-                unsettled: wp.array[wp.int32], s: Slots, arm: Arm):
+                unsettled: wp.array[wp.int32], world: wp.array[wp.int32], s: Slots, arm: Arm):
     """The pair's stiffness ``c / (C M^-1 C^T)`` (``c``: stiffness / dt^2) times its
     nodes' largest load scale, and its normal force at the step's start (in ``rho``): friction's ``lam``. At a step's
     start (``grow``), a pair compressed deeper than :data:`LOAD` thicknesses raises its nodes' scales (at most
@@ -522,7 +540,7 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
         k = c / wp.max(flexibility(s.pair[i], s.w[i], mass, fixed) + arm_flexibility(arm, s, i), 1.0e-30) * sc
         x = s.thickness[i] - wp.dot(s.normal[i], s.c0[i]) + s.lam[i] / k  # its compression at the step's start
         # (the multiplier's force as the barrier's compression)
-        if grow != 0 and unsettled[0] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs
+        if grow != 0 and unsettled[world[i]] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs
             up = wp.min(sc * wp.min(GROW, x / (LOAD * s.thickness[i])), MAX_SCALE)
             for j in range(4):
                 if s.pair[i][j] >= 0:
@@ -633,7 +651,8 @@ def _barrier_assemble_kernel(
 
 
 @wp.kernel
-def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, t: wp.array[float]):
+def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32],
+                   t: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
@@ -645,14 +664,15 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
         k = s.stiffness[i]
         if barrier(d, th, k, s.lam[i])[2] == 0.0:  # untouched: Newton did not see it, so its step holds only to
             # the ramp's end, where the barrier is at full curvature (th + lam / k: past it, the multiplier's force)
-            wp.atomic_min(t, 0, (d - th - s.lam[i] / k) / approach)
+            wp.atomic_min(t, world[i], (d - th - s.lam[i] / k) / approach)
         else:
-            wp.atomic_min(t, 0, IMPACT * d / approach)
+            wp.atomic_min(t, world[i], IMPACT * d / approach)
 
 
 @wp.kernel
-def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, mass: wp.array[float],
-                        fixed: wp.array[wp.int32], h2: float, cap: float, size: wp.array[float]):
+def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32],
+                        mass: wp.array[float], fixed: wp.array[wp.int32], h2: float, cap: float,
+                        size: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
@@ -666,20 +686,23 @@ def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: 
     # pair's mass in a step
     df = e[2] * wp.abs(wp.dot(n, pair_point(dq, s, i, arm, wp.vec3(0.0)))) * m
     f = -e[1] * m
-    wp.atomic_max(size, 0, df * cap / (cap + f))  # within tol of the inertial scale (cap) plus the force it holds
+    wp.atomic_max(size, world[i], df * cap / (cap + f))  # within tol of the inertial scale (cap) plus the force it holds
 
 
 @wp.kernel
-def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, eps: float,
-                           energy: wp.array[wp.float64]):
+def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, world: wp.array[wp.int32], stride: int,
+                           eps: float, energy: wp.array[wp.float64]):
     j, i = wp.tid()
     e = wp.float64(0.0)
+    w = int(-1)
+    if i < s.active.shape[0]:
+        w = world[i]
     if i < s.active.shape[0] and s.active[i] != 0:
         c = pair_point(q_cand[j], s, i, arm, s.anchor[i])
         n = s.normal[i]
         e = wp.float64(barrier(wp.dot(n, c), s.thickness[i], s.stiffness[i], s.lam[i])[0])
         e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(wp.length(_slip(c, s.c0[i], n)), eps)[0])
-    block_sum(energy, j, e)
+    world_sum(energy, w, j, stride, e)
 
 
 @wp.kernel
@@ -696,13 +719,16 @@ def _carry_kernel(block: int, lam: wp.array[float], lam_key: wp.array[wp.int32],
 
 
 @wp.kernel
-def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, tol: float, lam: wp.array[float],
-                  lam_key: wp.array[wp.int32], moved: wp.array[wp.int32]):
+def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32], mask: wp.array[wp.int32],
+                  tol: float, lam: wp.array[float], lam_key: wp.array[wp.int32], moved: wp.array[wp.int32]):
     """``lam <- max(0, lam + k (th - d))`` into the store: the quadratic's force at ``q`` less the ``k dl / 2`` its
     barrier alone holds at the thickness (the ramp's middle), so the pair holds it there (the augmented Lagrangian's
     update); the log's force below ``th / 2`` is not taken (at an unconverged iterate it diverges, and through the
-    load scale stiffens every later step). ``moved`` if that moves its rest by more than ``tol``."""
+    load scale stiffens every later step). ``moved`` (its world's) if that moves its rest by more than ``tol``. Only
+    in the worlds of ``mask``."""
     i = wp.tid()
+    if mask[world[i]] == 0:
+        return
     lam_key[i] = -1
     lam[i] = 0.0
     if s.active[i] == 0:
@@ -712,7 +738,21 @@ def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, tol: float, lam: wp.ar
     lam_key[i] = s.key[i]
     lam[i] = wp.max(0.0, s.lam[i] + k * (th - d))
     if wp.abs(lam[i] - s.lam[i]) > k * tol:
-        moved[0] = 1
+        moved[world[i]] = 1
+
+
+@wp.kernel
+def _forget_kernel(world: wp.array[wp.int32], mask: wp.array[wp.bool], lam_key: wp.array[wp.int32]):
+    i = wp.tid()
+    if mask[world[i]]:
+        lam_key[i] = -1
+
+
+@wp.kernel
+def _unscale_kernel(node_world: wp.array[wp.int32], mask: wp.array[wp.bool], scale: wp.array[float]):
+    n = wp.tid()
+    if 3 * n < node_world.shape[0] and mask[node_world[3 * n]]:
+        scale[n] = 1.0
 
 
 @wp.kernel
@@ -723,21 +763,25 @@ def _keep_kernel(s: Slots, lam: wp.array[float], lam_key: wp.array[wp.int32]):
 
 
 @wp.kernel
-def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float, converged: int,
-                  left: wp.array[wp.int32], moved: wp.array[wp.int32], go: wp.array[wp.int32]):
-    """``moved`` kept only if the solve converged (or need not) and the step has updates left (one spent); the solve
-    goes on if so."""
-    if moved[0] != 0 and (converged == 0 or (dq_max[0] <= tol and pick[0] != 0)) and left[0] > 0:
-        left[0] = left[0] - 1
-        go[0] = 1
+def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float, converged: int, count: int,
+                  mask: wp.array[wp.int32], left: wp.array[wp.int32], moved: wp.array[wp.int32],
+                  go: wp.array[wp.int32]):
+    """Per world of ``mask``: ``moved`` kept only if its solve converged (or need not) and its step has updates left
+    (one spent); its solve goes on if so. ``moved[count]`` (zero before), ``go[count]``: in any world."""
+    w = wp.tid()
+    if mask[w] != 0 and moved[w] != 0 and (converged == 0 or (dq_max[w] <= tol and pick[w] != 0)) and left[w] > 0:
+        left[w] = left[w] - 1
+        go[w] = 1
+        moved[count] = 1
+        go[count] = 1
     else:
-        moved[0] = 0
+        moved[w] = 0
 
 
 @wp.kernel
-def _apply_kernel(moved: wp.array[wp.int32], lam: wp.array[float], s: Slots):
+def _apply_kernel(moved: wp.array[wp.int32], lam: wp.array[float], world: wp.array[wp.int32], s: Slots):
     i = wp.tid()
-    if moved[0] != 0 and s.active[i] != 0:
+    if moved[world[i]] != 0 and s.active[i] != 0:
         s.lam[i] = lam[i]
 
 
@@ -767,14 +811,14 @@ def _arm_grad_kernel(q: wp.array[float], arm: Arm, b: wp.array[wp.float64]):
 
 
 @wp.kernel
-def _arm_energy_kernel(q_cand: wp.array2d[float], arm: Arm, energy: wp.array[wp.float64]):
+def _arm_energy_kernel(q_cand: wp.array2d[float], arm: Arm, stride: int, energy: wp.array[wp.float64]):
     j, w = wp.tid()
     e = float(0.0)
     if w < arm.M.shape[0]:
         for m in range(arm.k):
             i = w * arm.k + m
             e += 0.5 * (q_cand[j, arm.start + i] - arm.pred[i]) * _arm_inertia(q_cand[j], arm, w, m)
-    block_sum(energy, j, wp.float64(e))
+    world_sum(energy, wp.where(w < arm.M.shape[0], w, -1), j, stride, wp.float64(e))
 
 
 @wp.kernel

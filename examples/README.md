@@ -12,6 +12,7 @@ examples run on `SolverDiSMech`; start there with `newton/cable_twist.py` for th
 | [`flagella.py`](flagella.py) | External forces on the nodes (`state.particle_f`: fluid drag) and contact between rods. |
 | [`shell_cantilever.py`](shell_cantilever.py) | `cantilever.py` for midedge shells (`add_cloth_mesh`) beside VBD cloth from the same parameters, against plate theory; what Newton's `edge_ke` means as a plate stiffness. |
 | [`shell_fold.py`](shell_fold.py) | A cloth strip flopped over onto itself: it falls, lands on its own lower half and settles into an open fold (an eyelet), held by self-contact with friction, its fall calmed by air drag on the nodes (`state.particle_f`), against the frictionless heavy elastica (height `0.907 (D / rho g)^(1/3)`). |
+| [`midas_axial.py`](midas_axial.py) | Two-way coupling with a MuJoCo hand (the MIDAS hand, fetched on first run): its contact bodies proxies in our solve (`SolverCoupledProxy`); it grips a clamped rod and pushes it along its axis until the grip slides at Coulomb's mu sum(N), the push on MuJoCo's side equal to the rod's axial force on ours. Friction converged to the step's force balance (30 iterations). Needs `--extra mujoco`. |
 
 ```bash
 uv run examples/cantilever.py

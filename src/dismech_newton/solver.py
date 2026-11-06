@@ -20,6 +20,7 @@ from .shell import Shells
 from .state import (
     Dofs,
     Worlds,
+    _external,
     bind_dofs,
     diagonal_kernel,
     dof_constants,
@@ -44,6 +45,8 @@ FINISH = 3  # a step's last iterations, after its multipliers are updated whethe
 # the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
 # force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
 TOLERANCE = 0.01
+ULP = 1.0e-6  # float32's reach: a few of its epsilons of a coordinate (+ the cap): forces below it, in a
+# DOF's inertia, are not resolved (the force balance's floor)
 CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q")  # state a step carries beyond the DOFs (and strains)
 
 
@@ -208,6 +211,10 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._all = wp.ones(W, dtype=wp.int32, device=dev)
         self._refresh = wp.zeros(1, dtype=wp.int32, device=dev)  # A anew at this iterate
         self._dq_max = wp.zeros(W, dtype=float, device=dev)
+        self._unbalanced = wp.zeros(W, dtype=float, device=dev)  # per world, max |residual| / its tolerance
+        self._load = wp.zeros(n, dtype=float, device=dev)  # per DOF, the loads it carries (the tolerance's scale)
+        self._floor = wp.zeros(n, dtype=float, device=dev)
+        self._net = wp.zeros(5 * W, dtype=wp.float64, device=dev)  # per world: the nodes' net force, load, floor
         self._impact = wp.ones(W, dtype=float, device=dev)  # the line search's longest step: the first impact
         self._stalled = wp.zeros(W, dtype=wp.int32, device=dev)
         self._failed = wp.zeros(W, dtype=wp.int32, device=dev)  # the step's Newton step was not finite
@@ -475,6 +482,20 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         wp.launch(_activate_kernel, dim=self.num_worlds, inputs=[self._go], outputs=[self.worlds.active],
                   device=self.device)
         self._dof(q, f)
+        if self.cap > 0.0:  # the force balance at q: |b| within TOLERANCE of the loads, or below float32's reach
+            self._load.zero_()
+            self._net.zero_()
+            self._unbalanced.zero_()
+            self.contact.load(q, self._load, self._floor, ULP)
+            wp.launch(_unbalanced_kernel, dim=self.model.particle_count, inputs=[q, self.q_pred, f, self._b,
+                      self._load, self.worlds], outputs=[self._net], device=self.device)
+            a = self.contact.arm
+            if a.k:
+                wp.launch(_arm_unbalanced_kernel, dim=(a.M.shape[0], a.k // 6),
+                          inputs=[self._b, self._load, self._floor, a.start, a.k], outputs=[self._unbalanced],
+                          device=self.device)
+            wp.launch(_net_kernel, dim=self.num_worlds, inputs=[self._net], outputs=[self._unbalanced],
+                      device=self.device)
         self._linear.solve(self._b, self._dq)
         self._search(state_in, q, f)
 
@@ -528,7 +549,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             wp.capture_if(self._moved[W:], on_true=partial(self._detect, state_in, q))
             self._go[W:].zero_()
             self._settle[W:].zero_()
-            wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._pick, self._moved, self._failed, self._tol, wd],
+            wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._unbalanced, self._pick, self._moved, self._failed,
+                                                 self._tol, wd],
                       outputs=[self._go, self._stalled, self._settle], device=dev)
             if self._room:  # converged: the multipliers updated, and on if one moved
                 wp.capture_if(self._settle[W:], on_true=partial(self.contact.update, q, self._tol, self._dq_max,
@@ -747,8 +769,53 @@ def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[flo
 
 
 @wp.kernel
-def _go_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], moved: wp.array[wp.int32],
-               failed: wp.array[wp.int32], tol: float, wd: Worlds, go: wp.array[wp.int32],
+def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
+                       load: wp.array[float], wd: Worlds, net: wp.array[wp.float64]):
+    """The nodes' force balance at ``q``, summed per world into ``net`` (net force, its loads, float32's floor):
+    ``b``, the step's gradient, is the unbalanced force; the loads are magnitudes: its contacts' forces (``load``,
+    opposed pairs adding), its inertia and external force; the elastic forces are internal: they carry the load, they
+    are not it. Summed, not node by node: a stiff rod's nodes resolve their elastic forces only to its stiffness times
+    float32's resolution of a coordinate, but those cancel in the sum (each force is added once with each sign); the
+    net, the momentum's balance, does not. Midedge angles and twists: internal, left to the step test."""
+    n = wp.tid()
+    i = 3 * n
+    if f.fixed[i] != 0 and f.fixed[i + 1] != 0 and f.fixed[i + 2] != 0:
+        return
+    w = wd.of[i]
+    r = wp.vec3(q[i] - q_pred[i], q[i + 1] - q_pred[i + 1], q[i + 2] - q_pred[i + 2])
+    ext = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
+    k = f.mass[i] * f.inv_dt2
+    for c in range(3):
+        wp.atomic_add(net, 5 * w + c, b[i + c])
+    x = wp.vec3(q[i], q[i + 1], q[i + 2])
+    wp.atomic_add(net, 5 * w + 3, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
+    wp.atomic_add(net, 5 * w + 4, wp.float64(k * ULP * (wp.length(x) + wp.length(r))))
+
+
+@wp.kernel
+def _arm_unbalanced_kernel(b: wp.array[wp.float64], load: wp.array[float], floor: wp.array[float], start: int,
+                           k: int, unbalanced: wp.array[float]):
+    """A proxy body's force and torque balance: ``|b|`` within TOLERANCE of its contacts' and inertia's, or below
+    float32's reach."""
+    w, p = wp.tid()
+    i = start + w * k + 6 * p
+    for o in range(0, 6, 3):
+        u = wp.length(wp.vec3(float(b[i + o]), float(b[i + o + 1]), float(b[i + o + 2])))
+        wp.atomic_max(unbalanced, w, u / (TOLERANCE * load[i + o] + floor[i + o] + 1.0e-30))
+
+
+@wp.kernel
+def _net_kernel(net: wp.array[wp.float64], unbalanced: wp.array[float]):
+    """Per world, the nodes' net force against TOLERANCE of their loads (plus float32's floor)."""
+    w = wp.tid()
+    u = wp.sqrt(net[5 * w] * net[5 * w] + net[5 * w + 1] * net[5 * w + 1] + net[5 * w + 2] * net[5 * w + 2])
+    tol = wp.float64(TOLERANCE) * net[5 * w + 3] + net[5 * w + 4] + wp.float64(1.0e-30)
+    unbalanced[w] = wp.max(unbalanced[w], float(u / tol))
+
+
+@wp.kernel
+def _go_kernel(dq_max: wp.array[float], unbalanced: wp.array[float], pick: wp.array[wp.int32],
+               moved: wp.array[wp.int32], failed: wp.array[wp.int32], tol: float, wd: Worlds, go: wp.array[wp.int32],
                stalled: wp.array[wp.int32], settle: wp.array[wp.int32]):
     """Per iterating world: iterate on while the Newton step moves a node more than ``tol`` and the line search took a
     step, or the pairs were just found again (the objective changed); a step that finds no decrease short of that
@@ -758,8 +825,9 @@ def _go_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], moved: wp.arra
     n = wd.count
     settle[w] = 0
     if wd.active[w] != 0:
-        go[w] = wp.where(dq_max[w] > tol and (pick[w] != 0 or moved[w] != 0) and failed[w] == 0, 1, 0)
-        if dq_max[w] > tol and pick[w] == 0 and moved[w] == 0:
+        far = dq_max[w] > tol or unbalanced[w] > 1.0  # the step still moves, or the forces do not balance
+        go[w] = wp.where(far and (pick[w] != 0 or moved[w] != 0) and failed[w] == 0, 1, 0)
+        if far and pick[w] == 0 and moved[w] == 0:
             stalled[w] = 1
         if go[w] == 0:
             settle[w] = 1

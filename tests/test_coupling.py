@@ -251,6 +251,19 @@ def test_franka_pick_place():
 
 @pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda")
+def test_midas_axial_slip():
+    """Our MIDAS hand example, whole (162 frames): the hand grips the clamped rod and pushes it 3 cm along its axis;
+    sliding, the push is mu sum(N) (mean 2%, each frame 6%) and the rod's axial force the hand's push (1.5%)."""
+    from test_examples import _load  # noqa: PLC0415
+
+    ex = _load("midas_axial").Example(None, None)
+    for _ in range(162):
+        ex.step()
+    ex.test_final()
+
+
+@pytest.mark.slow
+@pytest.mark.usefixtures("needs_cuda")
 def test_franka_napkin_fold():
     """Our Franka napkin fold, whole (720 frames): while pinched, each finger's grip its servo force (10%), the hem's
     corner laid within 2 cm of the napkin's far corner, the flap flat on the other half, no crossings."""

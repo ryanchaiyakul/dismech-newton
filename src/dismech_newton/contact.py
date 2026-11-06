@@ -59,7 +59,8 @@ class Arm:
     from DOF ``start``, their moves over the step (their anchors are at its start). Body ``b``'s 6 DOFs start at
     ``base[b]`` (-1: it does not yield), its centre of mass's move ``dx`` and a small rotation ``dth``, moving its
     point ``x`` by ``dx + dth x (x - com[b])``; their inertia is ``(z - pred)^T M[w] (z - pred) / 2 h^2``, ``pred``
-    their own step's moves. A shape pair's body is ``shape_body[shape_of(key, key0)]``."""
+    their own step's moves, ``M`` block-diagonal by body (its 6 x 6; the kernels read only those blocks). A shape
+    pair's body is ``shape_body[shape_of(key, key0)]``."""
 
     k: int
     start: int
@@ -74,6 +75,8 @@ class Arm:
 
 
 def make_arm(model: Model, key0: int, start: int, k: int) -> Arm:
+    if k % 6:
+        raise ValueError(f"an arm's DOFs are whole bodies, 6 each (M block-diagonal by body), got {k}")
     a, dev, nb = Arm(), model.device, max(model.body_count, 1)
     a.k, a.start, a.key0, a.inv_h2 = k, start, key0, 0.0
     a.shape_body = model.shape_body if model.shape_count else wp.zeros(1, dtype=wp.int32, device=dev)
@@ -431,11 +434,22 @@ class BarrierBlock:
             wp.launch(_arm_grad_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[q, self.arm, b],
                       device=self.device)
 
+    def load(self, q: wp.array, load: wp.array, floor: wp.array, ulp: float) -> None:
+        """The loads the stopping test's force balance is relative to, as magnitudes (frame-invariant): each pair's
+        force (barrier and friction, at ``q``) added into ``load[3 n]`` on its nodes (opposed pairs add, as a
+        pinch's), and on a yielding body its force and torque into ``load[k]``, ``load[k + 3]`` (``k`` its first DOF),
+        with its inertia's; ``floor[k]``, ``floor[k + 3]``: the body's force and torque below float32's reach (``ulp``
+        of a move)."""
+        self._launch(_barrier_load_kernel, [q, self.s, self.arm, self.slip, load])
+        if self.arm.k:
+            wp.launch(_arm_load_kernel, dim=(self.arm.M.shape[0], self.arm.k // 6),
+                      inputs=[q, self.arm, ulp, load, floor], device=self.device)
+
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
         self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.world, self.stride, self.slip, energy],
                      dim=(q_cand.shape[0], padded(self.count)))
         if self.arm.k:
-            wp.launch(_arm_energy_kernel, dim=(q_cand.shape[0], padded(self.arm.M.shape[0])),
+            wp.launch(_arm_energy_kernel, dim=(q_cand.shape[0], padded(self.arm.M.shape[0] * self.arm.k)),
                       inputs=[q_cand, self.arm, self.stride, energy], device=self.device)
 
     def commit(self, q: wp.array, pick: wp.array, b: wp.array) -> None:
@@ -602,6 +616,23 @@ def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fix
     body = arm_body(arm, s, i)
     if body >= 0:
         arm_scatter(b, arm, body, s.anchor[i] - arm.com[body], g)
+
+
+@wp.kernel
+def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, load: wp.array[float]):
+    i = wp.tid()
+    if s.active[i] == 0:
+        return
+    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    for j in range(4):
+        n = s.pair[i][j]
+        if n >= 0:
+            wp.atomic_add(load, 3 * n, wp.length(wp.transpose(slot_map(s, i, j)) * g))
+    body = arm_body(arm, s, i)
+    if body >= 0:
+        k = arm.base[body]
+        wp.atomic_add(load, k, wp.length(g))
+        wp.atomic_add(load, k + 3, wp.length(wp.cross(s.anchor[i] - arm.com[body], g)))
 
 
 @wp.kernel
@@ -800,9 +831,9 @@ def _compact_kernel(
 
 @wp.func
 def _arm_inertia(q: wp.array[float], arm: Arm, w: int, m: int) -> float:
-    """``(M (z - pred))_m / h^2`` of world ``w``."""
+    """``(M (z - pred))_m / h^2`` of world ``w``: ``M`` block-diagonal, a body's 6 DOFs (:class:`.coupling.ProxyArm`)."""
     v = float(0.0)
-    for m2 in range(arm.k):
+    for m2 in range(6 * (m // 6), 6 * (m // 6) + 6):
         j = w * arm.k + m2
         v += arm.M[w, m, m2] * (q[arm.start + j] - arm.pred[j])
     return v * arm.inv_h2
@@ -815,13 +846,25 @@ def _arm_grad_kernel(q: wp.array[float], arm: Arm, b: wp.array[wp.float64]):
 
 
 @wp.kernel
+def _arm_load_kernel(q: wp.array[float], arm: Arm, ulp: float, load: wp.array[float], floor: wp.array[float]):
+    w, p = wp.tid()
+    m = 6 * p
+    i = arm.start + w * arm.k + m
+    f = wp.vec3(_arm_inertia(q, arm, w, m), _arm_inertia(q, arm, w, m + 1), _arm_inertia(q, arm, w, m + 2))
+    t = wp.vec3(_arm_inertia(q, arm, w, m + 3), _arm_inertia(q, arm, w, m + 4), _arm_inertia(q, arm, w, m + 5))
+    wp.atomic_add(load, i, wp.length(f))
+    wp.atomic_add(load, i + 3, wp.length(t))
+    floor[i] = arm.M[w, m, m] * arm.inv_h2 * ulp
+    floor[i + 3] = (arm.M[w, m + 3, m + 3] + arm.M[w, m + 4, m + 4] + arm.M[w, m + 5, m + 5]) / 3.0 * arm.inv_h2 * ulp
+
+
+@wp.kernel
 def _arm_energy_kernel(q_cand: wp.array2d[float], arm: Arm, stride: int, energy: wp.array[wp.float64]):
-    j, w = wp.tid()
+    j, i = wp.tid()  # a thread per arm DOF
+    w = i // wp.max(arm.k, 1)
     e = float(0.0)
     if w < arm.M.shape[0]:
-        for m in range(arm.k):
-            i = w * arm.k + m
-            e += 0.5 * (q_cand[j, arm.start + i] - arm.pred[i]) * _arm_inertia(q_cand[j], arm, w, m)
+        e = 0.5 * (q_cand[j, arm.start + i] - arm.pred[i]) * _arm_inertia(q_cand[j], arm, w, i - w * arm.k)
     world_sum(energy, wp.where(w < arm.M.shape[0], w, -1), j, stride, wp.float64(e))
 
 
@@ -830,5 +873,5 @@ def _arm_assemble_kernel(arm: Arm, indptr: wp.array[wp.int32], indices: wp.array
                          vals: wp.array[wp.float64]):
     w, m = wp.tid()
     zm = arm.start + w * arm.k
-    for m2 in range(m, arm.k):
+    for m2 in range(m, 6 * (m // 6) + 6):  # its body's block
         wp.atomic_add(vals, row_slot(indptr, indices, zm + m, zm + m2), wp.float64(arm.M[w, m, m2] * arm.inv_h2))

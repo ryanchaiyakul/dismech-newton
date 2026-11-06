@@ -287,6 +287,14 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         i = wp.tid()
         xs[i] = local(q, v, i)
 
+    @wp.func
+    def force(x: xvec, v: View, i: int, p: params_vec, rest: vec, eps_prev: vec, dt: float) -> xvec:
+        eps, J = jacobian(x, v, i)
+        sigma = vec()
+        for j in range(N):
+            sigma[j] = p[j] * (eps[j] - rest[j]) + p[N + j] / dt * (eps[j] - eps_prev[j])
+        return wp.transpose(J) * sigma
+
     @wp.kernel(module="unique", module_options=unrolled)
     def forces(
         xs: wp.array[xvec],
@@ -299,12 +307,22 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
     ):
         """``g = J^T (K (eps - rest) + C/dt (eps - eps_prev))`` in the element's DOFs ``xs``."""
         i = wp.tid()
-        eps, J = jacobian(xs[i], v, i)
-        p = params[i]
-        sigma = vec()
-        for j in range(N):
-            sigma[j] = p[j] * (eps[j] - rest[i][j]) + p[N + j] / dt * (eps[j] - eps_prev[i][j])
-        g[i] = wp.transpose(J) * sigma
+        g[i] = force(xs[i], v, i, params[i], rest[i], eps_prev[i], dt)
+
+    @wp.kernel(module="unique", module_options=unrolled)
+    def forces_rows(
+        xs: wp.array2d[xvec],
+        v: View,
+        params: wp.array[params_vec],
+        rest: wp.array[vec],
+        eps_prev: wp.array[vec],
+        dt: float,
+        g: wp.array2d[xvec],
+    ):
+        """:attr:`forces` once per local DOF (``xs[i, row]``: element ``i``'s DOFs), so one reverse pass seeded
+        with ``g[i, row]``'s ``row``-th component gives every row of the Hessians."""
+        i, row = wp.tid()
+        g[i, row] = force(xs[i, row], v, i, params[i], rest[i], eps_prev[i], dt)
 
     @wp.kernel(module="unique", module_options=unrolled)
     def scatter(g: wp.array[xvec], v: View, fixed: wp.array[wp.int32], r: wp.array[float]):
@@ -316,25 +334,24 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
                 wp.atomic_add(r, d[k], gi[k])
 
     @wp.kernel(module="unique")
-    def hessian_row(
-        row: int,
-        h: wp.array[xvec],
+    def hessian_rows(
+        h: wp.array2d[xvec],
         v: View,
         fixed: wp.array[wp.int32],
         slots: wp.array2d[wp.int32],
         vals: wp.array[wp.float64],
     ):
-        """Row ``row`` of each element's Hessian (``h = d g[row] / dx``) into the upper CSR (``slots`` as
-        :meth:`assemble`'s)."""
-        i = wp.tid()
+        """The elements' Hessians (``h[i, row] = d g[row] / dx``, :attr:`forces_rows`) into the upper CSR
+        (``slots`` as :meth:`assemble`'s)."""
+        i, row = wp.tid()
         d = dofs(v, i)
         if fixed[d[row]] != 0:
             return
-        hi = h[i]
+        hi = h[i, row]
         for c in range(row, D):
             if fixed[d[c]] == 0 and hi[c] != 0.0:
                 wp.atomic_add(vals, slots[triu_slot(row, c, D), i], wp.float64(hi[c]))
 
     return SimpleNamespace(vec=vec, xvec=xvec, D=D, measure=measure, warm=warm, previous=previous, penalty=penalty,
                            assemble=assemble, grad=grad, energy=energy, commit=commit, gather=gather, forces=forces,
-                           scatter=scatter, hessian_row=hessian_row)
+                           scatter=scatter, forces_rows=forces_rows, hessian_rows=hessian_rows)

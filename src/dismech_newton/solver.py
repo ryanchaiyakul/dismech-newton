@@ -256,18 +256,17 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             if tape is not None:
                 self._record(tape, state_in, state_out, dt)
 
-    def vjp(self, state_in: State, state_out: State, dt: float, contacts=None) -> None:
+    def vjp(self, state_in: State, state_out: State, dt: float, contacts=None, arm=None) -> None:
         """Backpropagate the step from ``state_out``'s ``.grad``, ``contacts`` its touching contacts as recorded
-        (:meth:`~.contact.BarrierBlock.snapshot`). Gradients reach ``state_in`` and, where
+        (:meth:`~.contact.BarrierBlock.snapshot`), ``arm`` its proxies' (:meth:`~.coupling.ProxyArm.snapshot`).
+        Gradients reach ``state_in`` (with proxies: their synced ``body_q``, ``body_qd``) and, where
         ``requires_grad``, the elements' params and rest strains, ``edge_length``, ``particle_mass`` and
         ``edge_inertia``."""
-        if self._qw is not None:
-            raise NotImplementedError("no adjoint with proxy bodies (SolverCoupledProxy)")
         if self._adjoint is None:
             from .adjoint import StepAdjoint  # noqa: PLC0415 (imports this module's kernels)
 
             self._adjoint = StepAdjoint(self)
-        self._adjoint.vjp(state_in, state_out, float(dt), contacts)
+        self._adjoint.vjp(state_in, state_out, float(dt), contacts, arm)
 
     def _record(self, tape: wp.Tape, state_in: State, state_out: State, dt: float) -> None:
         s_in, s_out = state_in.dismech, state_out.dismech
@@ -284,8 +283,12 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self.der.edge_inertia,
             *(a for e in self.elements for a in (e.params, e.rest)),
         ]
+        arm = None
+        if self._proxy_arm is not None:  # the proxies' step, held for its adjoint
+            inputs += [state_in.body_q, state_in.body_qd]
+            arm = self._proxy_arm.snapshot(self._qw[self.num_state_dofs:], state_in, self.pins)
         arrays = [a for a in (*inputs, *outputs) if a is not None and a.requires_grad]
-        tape.record_func(lambda: self.vjp(state_in, state_out, dt, contacts), arrays)
+        tape.record_func(lambda: self.vjp(state_in, state_out, dt, contacts, arm), arrays)
 
     def _step(self, state_in: State, state_out: State, dt: float) -> None:
         flatten_state(state_in)
@@ -565,7 +568,7 @@ def _step_length(k: int) -> float:
     return wp.pow(0.5, float(k - 1))
 
 
-@wp.kernel
+@wp.kernel(module="unique")  # generic: an overload recompiles this, not the module
 def _copy_if_kernel(valid: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp.array(dtype=Any)):
     i = wp.tid()
     if valid[0] != 0:

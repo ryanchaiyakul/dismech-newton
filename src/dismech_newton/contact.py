@@ -403,7 +403,7 @@ class BarrierBlock:
         self._launch(_keep_kernel, [self.s, self.lam, self.lam_key])
 
     def assemble(self, q: wp.array, A) -> None:
-        self._launch(_barrier_assemble_kernel, [q, self.s, self.arm, self.slip, self.fixed, A.indptr, A.indices,
+        self._launch(_barrier_assemble_kernel, [q, self.s, self.arm, self.slip, self.fixed, 0, A.indptr, A.indices,
                                                 A.vals])
         if self.arm.k:
             wp.launch(_arm_assemble_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[self.arm, A.indptr,
@@ -611,11 +611,13 @@ def _barrier_assemble_kernel(
     arm: Arm,
     eps: float,
     fixed: wp.array[wp.int32],
+    exact: int,
     indptr: wp.array[wp.int32],
     indices: wp.array[wp.int32],
     vals: wp.array[wp.float64],
 ):
-    """``C^T (e'' n n^T + mu lam f1/y (I - n n^T)) C`` into the upper CSR, majorized as :func:`_assemble_kernel`'s."""
+    """``C^T (e'' n n^T + mu lam f1/y (I - n n^T)) C`` into the upper CSR, majorized as :func:`_assemble_kernel`'s;
+    ``exact``: a one-sided pair's exact Hessian (:func:`contact_hessian`, uncapped: a float64 factorization's)."""
     i = wp.tid()
     if s.active[i] == 0:
         return
@@ -629,6 +631,8 @@ def _barrier_assemble_kernel(
     for j in range(4):
         if pair[j] >= 0 and w[j] < 0.0:
             f = 2.0
+    if exact != 0 and f == 1.0:
+        H = contact_hessian(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
     for a in range(4):
         na = pair[a]
         for bb in range(4):
@@ -785,7 +789,7 @@ def _apply_kernel(moved: wp.array[wp.int32], lam: wp.array[float], world: wp.arr
         s.lam[i] = lam[i]
 
 
-@wp.kernel
+@wp.kernel(module="unique")  # generic: an overload recompiles this, not the module
 def _compact_kernel(
     active: wp.array[wp.int32], offset: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp.array(dtype=Any)
 ):

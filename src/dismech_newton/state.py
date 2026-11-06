@@ -115,7 +115,7 @@ def dof_worlds(model: Model, n: int, stencils) -> np.ndarray:
     return out.astype(np.int32)
 
 
-@wp.kernel
+@wp.kernel(module="unique")  # generic: an overload recompiles this, not the module
 def masked_copy_kernel(start: int, world: wp.array[wp.int32], mask: wp.array[wp.bool], src: wp.array(dtype=Any),
                        dst: wp.array(dtype=Any)):
     """``dst[i] = src[i]`` for the rows ``i`` (from ``start``) whose world ``mask`` selects."""

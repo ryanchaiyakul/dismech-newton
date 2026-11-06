@@ -1,6 +1,8 @@
 """Rods and shells as the destination of Newton's ``SolverCoupledProxy``: the source's proxy bodies yield to the
 contacts within the soft step (:class:`ProxyArm`), so a pinch holds at the source's servo force."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import warp as wp
 from newton import BodyFlags, JointType, Model, State
@@ -51,6 +53,8 @@ class ProxyArm:
         self._offset = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)  # synced pose - start
         self._start = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the step began at
         self._valid = wp.zeros(nb, dtype=wp.int32, device=self.device)  # per body: it has a last pose
+        self._was_valid = wp.zeros_like(self._valid)  # the step's: its start pose is the last step's end
+        self._last_grad = None  # the last recorded step's adjoint of its end poses (snapshot)
         self.restart = False  # the next step repeats the last (a coupler's iteration restart): from its start
         self._arm: Arm | None = None
 
@@ -75,6 +79,7 @@ class ProxyArm:
         """The arm at the step from ``state`` (step ``h``); returns the body poses and velocities for the step: the
         proxies' at their own start, still."""
         m, a = self.model, self._arm
+        wp.copy(self._was_valid, self._valid)
         wp.copy(self._q, state.body_q)
         wp.copy(self._qd, state.body_qd)
         wp.launch(_proxy_update_kernel, dim=self._body.shape[0],
@@ -85,6 +90,22 @@ class ProxyArm:
                   device=self.device)
         self.restart = False
         return self._q, self._qd
+
+    def snapshot(self, z: wp.array, state_in: State, pins) -> SimpleNamespace:
+        """The step just taken, for its adjoint: the moves ``z``, ``Minv``, the centres of mass, the step's body poses
+        (``poses``: a proxy's its start), ``body_f``, the pins' stiffnesses, whether a proxy started from the last
+        step's end (``chained``) and the adjoint of that end (``prev``: the last snapshot's ``end_grad``)."""
+        a = self._arm
+        f = state_in.body_f if state_in.body_f is not None else wp.zeros_like(self._qd)
+        out = SimpleNamespace(z=z, Minv=a.Minv, com=a.com, poses=self._q, body_f=f, chained=self._was_valid)
+        if pins is not None:
+            out.pin_k = pins.p.k
+        out = SimpleNamespace(**{k: wp.clone(v) for k, v in vars(out).items()})
+        out.poses.requires_grad = True
+        out.end_grad = wp.zeros_like(self._q)
+        out.prev = self._last_grad
+        self._last_grad = out.end_grad
+        return out
 
     def finish(self, z: wp.array, state_in: State, state_out: State, dt: float, h: float) -> None:
         """Pose the proxies in ``state_out`` from their moves ``z`` over ``h``, extrapolated to ``dt``."""

@@ -103,9 +103,22 @@ the converged interface oscillates in the gripper's squeeze mode at the step rat
   as today. Dissipation: Hunt-Crossley as a velocity term in the step (check it keeps A SPD).
 - Friction: the existing smoothed Coulomb with normal force p_q A_q per point (feeds the friction thread,
   contact-step3.md).
-- **Tactile output**: per pad, pressure at its taxels (sensor layout from the user: MIDAS taxel grid / pitch /
-  pad material, ask) = p at the pad surface points; an observable on SolverDiSMech (or per-pair p A) for a sensor
-  readout; compare to the MIDAS sensor's units later.
+- **Tactile output: the MIDAS hand's PaXini PX-6AX GEN3 kit** (user, 2026-11-08): 3 fingertip sensors
+  PX6AX-GEN3-DP-S2015-Elite (~20 x 15 mm footprint, "15 mm" fingertip class), 1 thumb sensor PX6AX-GEN3-DP-M2826-Omega
+  (26 mm class, ~28 x 26 x 14 mm), a high-speed comm board. GEN3 is **Hall-effect, magnet-in-elastomer**: each taxel
+  reads a 3-axis deformation (normal + shear), the sensor reports a 6-axis net wrench plus the taxel array. So the
+  simulated readout must be per-taxel **3-axis traction** (pressure p n plus the friction traction, integrated over
+  the taxel's area) and the pad's net wrench, not pressure alone. Specs found online disagree (vendor-adjacent
+  pages, not PaXini's datasheet): S2015 "52 force signals" vs "up to 121 taxels" (family max), pitch ~1-1.5 mm,
+  0.01 N min force, 0-50 N fingertip range, 200 Hz vs 1000 Hz. **Authoritative taxel coordinates are PaXini's
+  per-variant XLSX maps: PXSR-STDDP03G.xlsx (S2015), PXSR-STDDP03B.xlsx (M2826)** (PXSR software / comm board):
+  get them from the user or the kit, and the elastomer's thickness and modulus (else calibrate E / h from a press
+  test: force vs indentation, and shear vs tangential displacement). Sources: roboticscenter.ai/hardware/paxini-gen3
+  (+ /specs), roboticscenter.ai/store/product/paxini-px6ax-gen3-dp-s2015-elite.
+- Shear: Drake's pressure field has no tangential compliance; the sensor does (elastomer shear). Model the pad's
+  tangential stiffness as the friction regularization of a stuck point (a tangential spring k_t = G / h per unit
+  area until mu p), so a stuck grip reads shear like the sensor; check against a tangential press test.
+- Pads only on **flagged shapes** (user's decision): every other rigid-vs-soft pair stays on the barrier.
 - Coupling: the pad's stiffness is the interface K Robin needs (physical, much softer than the barrier's 1e3 x
   inertia / h^2): rerun A's gates with pads on the Franka fingers / MIDAS links.
 
@@ -128,6 +141,7 @@ Default suite must stay green (76 passed / 3 xfailed at the A baseline); `uv run
 
 ## Open questions for the user
 
-- MIDAS tactile sensor specs: taxel layout, pad thickness and material (sets E, h), output units.
+- PaXini taxel maps (PXSR-STDDP03G.xlsx, PXSR-STDDP03B.xlsx), elastomer thickness / modulus, which MIDAS links
+  carry which sensor, and the readout units the user wants matched (raw Hall counts vs calibrated N).
 - Single-pass vs iterated Robin after A1.
-- Should pads replace the barrier for every rigid-proxy vs soft pair, or only flagged shapes? (Proposed: flagged.)
+- (Decided: pads only on flagged shapes.)

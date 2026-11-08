@@ -156,9 +156,14 @@ def _robin_harvest(arm, local_to_global, out_body_f):
         sl = slice(6 * slot[p], 6 * slot[p] + 6)
         Fref[world[p], sl], xs[world[p], sl], vs[world[p], sl], v0s[world[p], sl] = Fg[glob[p]], dx[p], qd[p], qd0[p]
     out = Fg.copy()
+    debt = os.environ.get("DM_ROBIN_DEBT") == "1"  # momentum: the source pays back what it took beyond our contact
+    if debt:
+        arm._robin_debt = getattr(arm, "_robin_debt", np.zeros((W, k))) + Fa - Fref
     for w in range(W):
         vfree = 2 * vs[w] - v0s[w] - h * Minv[w] @ Fa[w]
         F = np.linalg.solve(np.eye(k) - h * h * K[w] @ Minv[w], Fref[w] + K[w] @ (xs[w] + h * vfree))
+        if debt:
+            F = F - arm._robin_debt[w]
         for p in np.flatnonzero(world == w):
             out[glob[p]] = F[6 * slot[p]:6 * slot[p] + 6]
     out_body_f.assign(out)

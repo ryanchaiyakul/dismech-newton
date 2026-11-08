@@ -101,3 +101,28 @@ eps .03 / .1 / .3 x1 [4.55, 5.31] / [4.63, 5.26] / [4.70, 5.15], x2 [4.70, 5.33]
 the passes. Open: is a +-0.3 N grip chatter physical with a stiff (true-impedance) finger on a moving cable
 (monolithic reference, idea 7), and the drift. View-mass x1 (5.00 +- 0.01) may be smooth because a light, lagged
 proxy filters.
+
+## Round 5: Robin exchange (idea 3) — 2026-11-08
+
+Chatter check (`chatter.py`, phases lift / carry / settle): the +-0.2 N grip chatter of lagged x2 and of every
+Schur variant is the same in all phases, all in the squeeze mode (antisymmetric +-0.001), ~80% sign flips per step,
+uncorrelated with the cable's acceleration: numerical (the squeeze mode is 0.196 kg on 1000 N/m: 11 Hz, not 300 Hz).
+
+numpy squeeze model with the log barrier (`finger_robin.py`): reproduces the impact (lagged x1 rebound 2.4, x2
+0.001); grip instability appears at x1 in the model but x2 in the scene (the scene's cycle needs something more:
+adaptive load scale / cable). Robin fixes both in the model at x1.
+
+`DM_ROBIN=1`: after our solve, A reassembled at the end, condensed on the arm (scipy): K = -(S - M/h^2) (contact
+stiffness on the proxy DOFs, cable re-equilibrated). Before the passes the coupler applies F solving
+F = F_ref + K (x0 + h v(F) - x_ref), v(F) = v_base + R (F - F0) (R from the probes; MuJoCo unchanged).
+
+| variant | grip lift / carry / settle | bounce ratio (deepest) |
+|---|---|---|
+| lagged x1 (today) | 4.997 +- .002 / .003 / .003 | 1.91 (2.41 mm) |
+| lagged x2 | 5.05 +- .17 / .18 / .19 | 0.15 |
+| **Robin, view mass, x1** | **4.917 +- .001 / .002 / .002** | **0.21 (0.36 mm)** |
+| Robin, view mass, x2 | 5.04 +- .02 / .09 / .16 | 0.15 (0.19 mm) |
+| Robin + full Schur x1 / x2 | 2.3 / 6.9 (wrong) | 0.23 |
+
+Robin x1 grip 4.917: servo 1000 N/m x (5 mm - gap): the finger rests 83 um into the barrier's 100 um margin
+(SMOOTH 0.02 x radius), MuJoCo pose == proxy pose at steady state; today's 5.00 carries the lagged offset.

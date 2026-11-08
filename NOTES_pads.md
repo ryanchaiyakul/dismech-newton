@@ -35,3 +35,38 @@ momentum and the fold grip, so it is not the cure by itself.
 | sheet (um) | 0.164 / 0.164 | 1.635 / 1.635 | 16.350 / 16.350 | 50.001 / 50.000 |
 
 Not done: dissipation (Hunt-Crossley), moment/quadrature convergence (gate 3), incline (5), tactile readout (6).
+
+### Gate 3 (exp/pads/tilt.py): stiff rod, off-centre point load, tilt vs exact (Winkler, exact integral)
+
+| nodes | delta0 err | theta err |
+|---|---|---|
+| 6 | 1.5e-3 | 8.1e-2 |
+| 11 | 7.1e-4 | 2.4e-2 |
+| 21 | 3.3e-4 | 7.9e-3 |
+| 41 | 1.9e-4 | 3.4e-3 |
+
+(n = 81: the float32 solve returns dq = 0 from step 0: stretch 1e7 + EI/le 1e4 at 5 mm edges, a setup limit.) Added
+`PAD_FLOOR`: A holds a pad pair's curvature at least at 0.05 h deep (a rod's delta^1/2 is 0 at the surface).
+
+### Gate 7 preview: Franka finger pads (DM_PADS on 12 finger shapes), pick-place grip (servo 5 N)
+
+| variant | pad | grip lift / carry / settle | flips | fold | pick test |
+|---|---|---|---|---|---|
+| Robin x3, no pad (A1 row 1) | - | 5.05 +- .23 / .28 / .27 | 0.84-0.94 | | |
+| Robin x3 | out, kh 5e8, h 2 mm | 6.38 +- .04 / 5.71 +- .10 / 0.42 | 0.66 / 0.41 / 0 | grip 3.5-4.5 (servo 2) | |
+| Robin x1 | out, 5e8 | 6.36 +- .04 / 5.67 +- .11 / 0.49 | 0.68 / 0.36 / 0 | napkin into table | |
+| Robin x3 | out, 5e7 | 5.86 +- .03 / 5.26 +- .10 / 0.32 | 0.66 / 0.28 / 0 | grip 3.7-3.9 | |
+| lagged x1 | out, 5e8 | 6.39 +- .04 / 5.75 +- .10 / 0.44 | 0.66 / 0.41 / 0 | napkin into table | grip 1.5-6.3 |
+| Robin x3 | in, kh 1e9, h 1 mm | 3.86 +- .14 / 1.04 +- .22 / 0.01 | 0.03 / 0 | grip 0.5-36 | grip 0.02-3.4 |
+| Robin x1 | in | 3.89 +- .14 / 1.20 +- .23 / 0.01 | 0.02 / 0 | grip 0.9-18 | grip 0.05-3.5 |
+| lagged x1 | in | 3.80 +- .15 / 0.95 +- .20 / 0.01 | 0 / 0 | grip 0-27 | grip 0-3.3 |
+
+(out: the pad 2 mm outside the finger's surface, its geometry shifts the servo's stop; in: the pad inside the contact
+thickness, same geometry.) Momentum/pin have no fingers (unchanged). Suite without pads: same as b45a3ff (75 + the
+2 coupling momentum/pin failures of this branch's default env).
+
+**The 2-cycle is gone with pads in every coupling variant, even lagged x1** (flips 0-0.4, the barrier's 0.84-0.94):
+the interface stiffness was the cause. **But the grip is wrong**: the cable's nodes are 2 cm apart (0.38 m / 19), about
+a finger pad's width, and pads take only node quadrature points (edge interiors skipped), so 0-1 cable node is in a
+pad: the cable slips out (settle ~0). Next: quadrature along rod edges / over shell triangles against pads
+(Drake's resolution hint: points per edge, weights (1-u, u)), then rerun.

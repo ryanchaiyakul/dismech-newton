@@ -18,3 +18,14 @@ for k in range(12):
     s0, s1 = s1, s0
     z = s0.particle_q.numpy()[:, 2] - (TOP + H + 0.002)
     print(k, f"z {z.mean()*1e6:.3f} um", solver.counts.numpy(), flush=True)
+if len(sys.argv) > 2:
+    orig = SolverDiSMech._search
+    def search(self, state_in, q, f):
+        orig(self, state_in, q, f)
+        e = self._energy.numpy()[: self.num_candidates]
+        print("  E", np.round(e - e[0], 9)[:8], "slope", self._slope.numpy()[:1], "t", self._impact.numpy()[:1],
+              "pick", self._pick.numpy()[:1], "|dq|", np.abs(self._dq.numpy()).max(), "cnt", self.contact.count)
+    SolverDiSMech._search = search
+    s0, s1 = model.state(), model.state(); flatten_state(s0); flatten_state(s1)
+    solver2 = SolverDiSMech(model, iterations=6)
+    solver2.step(s0, s1, None, None, 1 / 240)

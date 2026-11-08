@@ -7,6 +7,7 @@ friction, each pair's stiffness) and the pair list; where contacts come from is 
 appends them to the :class:`Slots`.
 """
 
+import os
 from typing import Any
 
 import numpy as np
@@ -23,7 +24,9 @@ GROW = wp.constant(2.0)  # a node's load scale grows at most this factor per ste
 DECAY = wp.constant(0.99)  # and relaxes by this factor per step, toward 1
 MAX_SCALE = wp.constant(1.0e5)  # and stays below this (unbounded, it spreads pair to pair and overflows k)
 CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most this many k (its log's: d >= tau/10)
-STIFFNESS = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
+STIFFNESS = float(os.environ.get("DM_STIFF", 1.0e3))  # EXP DM_STIFF
+ARM_FLEX = wp.constant(float(os.environ.get("DM_ARM_FLEX", 1.0)))  # EXP: arm flexibility scale in k
+_UNUSED = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
 SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
 IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
@@ -569,7 +572,7 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
         for j in range(4):
             if s.pair[i][j] >= 0:
                 sc = wp.max(sc, scale[s.pair[i][j]])
-        k = c / wp.max(flexibility(s.pair[i], s.w[i], mass, fixed) + arm_flexibility(arm, s, i), 1.0e-30) * sc
+        k = c / wp.max(flexibility(s.pair[i], s.w[i], mass, fixed) + ARM_FLEX * arm_flexibility(arm, s, i), 1.0e-30) * sc
         x = s.thickness[i] - wp.dot(s.normal[i], s.c0[i]) + s.lam[i] / k  # its compression at the step's start
         # (the multiplier's force as the barrier's compression)
         if grow != 0 and unsettled[s.world[i]] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs

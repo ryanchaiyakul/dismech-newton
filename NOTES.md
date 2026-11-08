@@ -150,3 +150,18 @@ Closed form: F = (M/h^2) [h X M (2 v1 - v0) - (pred - z) - h (2 v1 - v0)], X = (
 Momentum: Robin hands the source a prediction of the next contact force; prediction errors accumulate (no
 telescoping). Debt (D += F_app - F_ref, source gets R - D) bounds the imbalance to the last step's error (20% of p0
 at the rod impact) and costs impact (0.39).
+
+### Round 6: Robin iterated within the step (DM_ROBIN=2, repeat passes solve x1(F) = x1 + h^2 Minv (F - F_app))
+
+| gate | x2 | x3 | x4 |
+|---|---|---|---|
+| momentum (1e-4) / pin | 0.0029 / pass | pass / pass | |
+| napkin fold / MIDAS | pass / pass | | |
+| bounce ratio | 0.15 (deepest 0.19 mm) | | |
+| pick-place grip | 5.05 +- .19 | 5.05 +- .27 | 5.05 +- .31 |
+
+Pick-place grip chatter grows with passes (as plain lagged x2): the converged interface itself oscillates in the
+squeeze mode in this scene; one pass filters it. MuJoCo restart checked (`restart_check.py`): each pass does start
+from the restored state (SolverMuJoCo re-reads joint_q each step); the finger velocity flips sign pass to pass.
+Open: why the converged Franka-finger/cable interface 2-cycles (mimic equality softness? barrier stiffness scaled by
+the view mass while the finger's response mass is 0.196?).

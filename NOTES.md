@@ -30,7 +30,24 @@ clamped: rebound 0.002 m/s, stop exactly m v / h.
 The 3.4% grip deficit appears whenever `dc` leaves pred (opt 1 and staggered): the lagged offset is what carries the
 servo's position into the proxy.
 
-## Conclusion
+## Round 2 (user leans staggered; Newton's own levers)
+
+Newton offers proxy iterations (+ fixed / Aitken relaxation), mass_scale, and SolverCoupledADMM (coupler-owned
+contacts: bypasses OGC, not for us).
+
+- Lagged + iterations 2: bounce 0.15, pinned exact (z 0.124079, f = weight); 4 / 8 / Aitken identical (2 passes
+  converge here). sci6000: trampoline 4/4, suite 74 + 3 xfail but momentum tests fail (0.258, dp 0.021): partly the
+  tests' pending `dt F` term (momentum test w/o it: 0.052 -> 0.0037, still > 1e-4: 2 passes don't converge a hard
+  impact). Grips noisy: pick-place 4.74-5.30, swap 4.72-5.26 (servo 5). Costs 2x.
+- Staggered + extrapolated source acceleration (`DM_EXTRAP=1`: a_own = (v_end - v_prev)/h - F_prev/m into pred,
+  out of the harvest via the offset): bounce 0.15, pinned exact and MuJoCo == proxy at rest (0 um; was h^2 g = 39 um).
+  test_coupling 6/9: fold grip + swap pass now; pick-place grip centred but noisy (4.82-5.03); pin gap 0.043 (the
+  test compares the rod with MuJoCo's pose, a step behind); MIDAS NaN at its iterations 2, 0.25 at iterations 1
+  (plain staggered 0.773). Likely: an articulated hand's link velocity change includes the other links' contact
+  responses, not only F/m_eff: extrapolation feeds them back.
+- `DM_EXTRAP=2` (gravity only): grips 4.83 as plain staggered.
+
+## Conclusion (round 1)
 
 No option passes all gates. Staggered is the right impact physics but loses steady servo forces and breaks the
 trampoline. Candidate next: staggered with MuJoCo's own acceleration extrapolated into pred

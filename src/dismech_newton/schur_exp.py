@@ -135,8 +135,10 @@ def _robin_harvest(arm, local_to_global, out_body_f):
     x1 the source's end pose this step (synced pose + h v1), v_free = v1 + h a_own with the source's own
     acceleration carried over: a_own = (v1 - v0) / h - Minv F_applied (v0 the last step's v1)."""
     q, qd, h, Minv = arm._sync
+    within = arm._robin_pass < int(os.environ.get("DM_PASSES", "1")) - 1  # a pass that the step repeats
     qd0 = getattr(arm, "_robin_v0", qd)
-    arm._robin_v0 = qd
+    if not within:
+        arm._robin_v0 = qd
     com_ref, q_ref = arm._robin_pose
     K = arm._robin_K
     W, k = K.shape[0], arm.k
@@ -160,8 +162,11 @@ def _robin_harvest(arm, local_to_global, out_body_f):
     if debt:
         arm._robin_debt = getattr(arm, "_robin_debt", np.zeros((W, k))) + Fa - Fref
     for w in range(W):
-        vfree = 2 * vs[w] - v0s[w] - h * Minv[w] @ Fa[w]
-        F = np.linalg.solve(np.eye(k) - h * h * K[w] @ Minv[w], Fref[w] + K[w] @ (xs[w] + h * vfree))
+        if within:  # the same step again: x1(F) = x1 + h^2 Minv (F - F_applied)
+            rhs = Fref[w] + K[w] @ (xs[w] - h * h * Minv[w] @ Fa[w])
+        else:  # the next step: x2(F) = x1 + h v_free + h^2 Minv F
+            rhs = Fref[w] + K[w] @ (xs[w] + h * (2 * vs[w] - v0s[w] - h * Minv[w] @ Fa[w]))
+        F = np.linalg.solve(np.eye(k) - h * h * K[w] @ Minv[w], rhs)
         if debt:
             F = F - arm._robin_debt[w]
         for p in np.flatnonzero(world == w):
@@ -216,6 +221,7 @@ def install():
     update = coupling.ProxyArm.update
 
     def _update(self, state, h):
+        self._robin_pass = getattr(self, "_robin_pass", 0) + 1 if self.restart else 0
         out = update(self, state, h)
         if ROBIN == "2":  # the synced start pose and end velocity (the source's), and the view's inverse inertia
             b = self._body.numpy()

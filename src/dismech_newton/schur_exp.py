@@ -132,8 +132,11 @@ def _select(S):
 
 def _robin_harvest(arm, local_to_global, out_body_f):
     """The next step's force for the source, ``F = F_ref + K (x1 + h v(F) - x_ref)``, ``v(F) = v_free + h Minv F``:
-    x1 the source's end pose this step (synced pose + h v1), v_free = v1 - h Minv F_applied (carried over)."""
+    x1 the source's end pose this step (synced pose + h v1), v_free = v1 + h a_own with the source's own
+    acceleration carried over: a_own = (v1 - v0) / h - Minv F_applied (v0 the last step's v1)."""
     q, qd, h, Minv = arm._sync
+    qd0 = getattr(arm, "_robin_v0", qd)
+    arm._robin_v0 = qd
     com_ref, q_ref = arm._robin_pose
     K = arm._robin_K
     W, k = K.shape[0], arm.k
@@ -147,14 +150,14 @@ def _robin_harvest(arm, local_to_global, out_body_f):
     q1 = _qmul(turn, q[:, 3:])
     dx = np.concatenate([com1 - com_ref, _rotvec(_qmul(q1, _qconj(q_ref)))], axis=1)
     Fg = out_body_f.numpy()
-    Fref, Fapp, xs, vs = (np.zeros((W, k)) for _ in range(4))
+    Fref, xs, vs, v0s = (np.zeros((W, k)) for _ in range(4))
     Fa = getattr(arm, "_schur_F", np.zeros((W, k)))
     for p in range(len(body)):
         sl = slice(6 * slot[p], 6 * slot[p] + 6)
-        Fref[world[p], sl], xs[world[p], sl], vs[world[p], sl] = Fg[glob[p]], dx[p], qd[p]
+        Fref[world[p], sl], xs[world[p], sl], vs[world[p], sl], v0s[world[p], sl] = Fg[glob[p]], dx[p], qd[p], qd0[p]
     out = Fg.copy()
     for w in range(W):
-        vfree = vs[w] - h * Minv[w] @ Fa[w]
+        vfree = 2 * vs[w] - v0s[w] - h * Minv[w] @ Fa[w]
         F = np.linalg.solve(np.eye(k) - h * h * K[w] @ Minv[w], Fref[w] + K[w] @ (xs[w] + h * vfree))
         for p in np.flatnonzero(world == w):
             out[glob[p]] = F[6 * slot[p]:6 * slot[p] + 6]

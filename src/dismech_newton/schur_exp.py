@@ -283,7 +283,8 @@ def install():
         import scipy.sparse as sp
         import scipy.sparse.linalg as spla
 
-        self._assemble(q, self.dofs)  # the step's matrix at its end
+        if os.environ.get("DM_ROBIN_K", "end") == "end":
+            self._assemble(q, self.dofs)  # the step's matrix at its end (else its last factorized)
         indptr, indices = self.A.pattern
         U = sp.csr_matrix((self.A.vals.numpy(), indices, indptr), shape=(self.A.n, self.A.n))
         A = (U + U.T - sp.diags(U.diagonal())).tocsc()

@@ -18,7 +18,8 @@ MODE = os.environ.get("DM_SCHUR", "")
 EPS = float(os.environ.get("DM_SCHUR_EPS", "0.01"))
 DELTA = float(os.environ.get("DM_SCHUR_DELTA", "1.0"))
 EVERY = int(os.environ.get("DM_SCHUR_EVERY", "1"))
-ROBIN = os.environ.get("DM_ROBIN", "") == "1"  # the source takes F(x1) = F_ref + K (x1 - x_ref), implicitly
+ROBIN = os.environ.get("DM_ROBIN", "")  # the source takes F(x1) = F_ref + K (x1 - x_ref), implicitly: 1 by the
+# probes before the passes; 2 in our harvest (no probes: view inertia, the source's free velocity carried over)
 STATS = {"probes": 0}
 
 
@@ -77,7 +78,7 @@ def _probe(coupler, state_in, control, contacts, dt):
                     R[world[p], 6 * slot[p]:6 * slot[p] + 6, 6 * s + r] = dv[p]
         STATS["probes"] += k + 1
         Fg = F0
-        if ROBIN and getattr(arm, "_robin_K", None) is not None and getattr(arm, "_robin_pose", None) is not None:
+        if ROBIN == "1" and getattr(arm, "_robin_K", None) is not None and getattr(arm, "_robin_pose", None) is not None:
             K, (com_ref, q_ref) = arm._robin_K, arm._robin_pose
             com0 = q0[:, :3] + _qrot(q0[:, 3:], arm._com_local)
             dx = np.concatenate([com0 - com_ref, _rotvec(_qmul(q0[:, 3:], _qconj(q_ref)))], axis=1)
@@ -129,6 +130,38 @@ def _select(S):
     return out
 
 
+def _robin_harvest(arm, local_to_global, out_body_f):
+    """The next step's force for the source, ``F = F_ref + K (x1 + h v(F) - x_ref)``, ``v(F) = v_free + h Minv F``:
+    x1 the source's end pose this step (synced pose + h v1), v_free = v1 - h Minv F_applied (carried over)."""
+    q, qd, h, Minv = arm._sync
+    com_ref, q_ref = arm._robin_pose
+    K = arm._robin_K
+    W, k = K.shape[0], arm.k
+    body, world, slot = arm._body.numpy(), arm._world, arm._slot
+    glob = local_to_global.numpy()[body]
+    com_local = arm.model.body_com.numpy()[body].astype(np.float64)
+    com1 = q[:, :3] + _qrot(q[:, 3:], com_local) + h * qd[:, :3]
+    om = h * qd[:, 3:]
+    ang = np.linalg.norm(om, axis=1, keepdims=True)
+    turn = np.concatenate([np.where(ang > 0, np.sin(ang / 2) / np.maximum(ang, 1e-30), 0.5) * om, np.cos(ang / 2)], 1)
+    q1 = _qmul(turn, q[:, 3:])
+    dx = np.concatenate([com1 - com_ref, _rotvec(_qmul(q1, _qconj(q_ref)))], axis=1)
+    Fg = out_body_f.numpy()
+    Fref, Fapp, xs, vs = (np.zeros((W, k)) for _ in range(4))
+    Fa = getattr(arm, "_schur_F", np.zeros((W, k)))
+    for p in range(len(body)):
+        sl = slice(6 * slot[p], 6 * slot[p] + 6)
+        Fref[world[p], sl], xs[world[p], sl], vs[world[p], sl] = Fg[glob[p]], dx[p], qd[p]
+    out = Fg.copy()
+    for w in range(W):
+        vfree = vs[w] - h * Minv[w] @ Fa[w]
+        F = np.linalg.solve(np.eye(k) - h * h * K[w] @ Minv[w], Fref[w] + K[w] @ (xs[w] + h * vfree))
+        for p in np.flatnonzero(world == w):
+            out[glob[p]] = F[6 * slot[p]:6 * slot[p] + 6]
+    out_body_f.assign(out)
+    STATS["robin"] = STATS.get("robin", 0) + 1
+
+
 def install():
     from newton.solvers.experimental.coupled import SolverCoupledProxy
 
@@ -140,7 +173,7 @@ def install():
             object.__setattr__(self, "iterations", int(os.environ["DM_PASSES"]))
 
         SolverCoupledProxy.Config.__init__ = _init
-    if not MODE:
+    if not MODE and not ROBIN:
         return
     SolverCoupledProxy.graph_capturable = False  # host-side numpy every step
 
@@ -150,7 +183,8 @@ def install():
     step_coupled = SolverCoupledProxy._step_coupled
 
     def _step_coupled(self, state_in, state_out, control, contacts, dt):
-        _probe(self, state_in, control, contacts, dt)
+        if MODE:
+            _probe(self, state_in, control, contacts, dt)
         step_coupled(self, state_in, state_out, control, contacts, dt)
 
     SolverCoupledProxy._step_coupled = _step_coupled
@@ -160,8 +194,9 @@ def install():
     def _rewind(self, local_to_global, state, coupling_forces, gravity, dt):
         rewind(self, local_to_global, state, coupling_forces, gravity, dt)
         arm = self._proxy_arm
-        if arm is not None and getattr(arm, "_schur", None) is not None:
-            body, glob, _, world, slot = arm._schur_maps
+        if arm is not None and arm.k and (getattr(arm, "_schur", None) is not None or ROBIN == "2"):
+            body, world, slot = arm._body.numpy(), arm._world, arm._slot
+            glob = local_to_global.numpy()[body]
             Fg = coupling_forces.numpy()
             F = np.zeros((arm._arm.M.shape[0], arm.k))
             for p in range(len(body)):
@@ -174,6 +209,10 @@ def install():
 
     def _update(self, state, h):
         out = update(self, state, h)
+        if ROBIN == "2":  # the synced start pose and end velocity (the source's), and the view's inverse inertia
+            b = self._body.numpy()
+            self._sync = (state.body_q.numpy()[b].astype(np.float64), state.body_qd.numpy()[b].astype(np.float64), h,
+                          self._arm.Minv.numpy().astype(np.float64))
         S = getattr(self, "_schur", None)
         if S is None or MODE == "probe":
             return out
@@ -216,7 +255,10 @@ def install():
     def _harvest(self, local_to_global, out_body_f, **kw):
         arm = self._proxy_arm
         if arm is None or getattr(arm, "_schur_step", None) is None:
-            return harvest(self, local_to_global, out_body_f, **kw)
+            harvest(self, local_to_global, out_body_f, **kw)
+            if ROBIN == "2" and arm is not None and getattr(arm, "_robin_K", None) is not None:
+                _robin_harvest(arm, local_to_global, out_body_f)
+            return
         M, pred, h = arm._schur_step
         Fn = np.einsum("wij,wj->wi", M, arm._schur_z - pred) / (h * h)
         body, glob, _, world, slot = arm._schur_maps

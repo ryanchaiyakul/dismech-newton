@@ -70,3 +70,26 @@ the interface stiffness was the cause. **But the grip is wrong**: the cable's no
 a finger pad's width, and pads take only node quadrature points (edge interiors skipped), so 0-1 cable node is in a
 pad: the cable slips out (settle ~0). Next: quadrature along rod edges / over shell triangles against pads
 (Drake's resolution hint: points per edge, weights (1-u, u)), then rerun.
+
+## Round 2 (after reading Elandt et al. 2019 / Drake docs): Drake's form
+
+- Drake: pressure 0 on the shape's own surface, E at the medial axis or a rigid core; bodies interpenetrate the
+  undeformed shape. Its `margin` inflates only for detection (pressure negative there: speculative constraints, no
+  force). So the "out" variant (pad outside the finger) was an artifact; "in" is Drake's. Its contact surface is the
+  intersection of the compliant tets with the partner's mesh, triangulated about polygon centroids, quadrature per
+  triangle (continuous: pieces enter at zero area); resolution from the meshes, not the partner's physics nodes.
+- Now: a pad holds the outer half of each pair's thickness (`PAD_DEPTH`), its core's barrier the inner half; only
+  Newton's `kh` (`DM_PADS=kh,pattern[,d]`). Points: per rod edge `ceil(l / r)` fixed points (<= SIDES = 16), per
+  triangle `n^2` sub-triangle centroids (`n = ceil(size / r)` <= 4); nodes keep the core's barrier only. Pair keys
+  `key0 + SIDES shape + side`. Fixed points: energy continuous (a point enters at zero pressure).
+- Hunt-Crossley lagged as Drake's: damping `d f0 / dt` on the depth change, a quadratic potential (`DM_PADS` 3rd
+  field or `DM_PAD_HC`).
+
+| gate | result |
+|---|---|
+| 1-2 press (rod, sheet, 1-300 g) | ratio 1.0000 (sheet 1.0025 at 1 g) |
+| 3 tilt, n = 11 / 21 / 41 | delta0 5.0e-3 / 3.1e-3 / 2.2e-3, theta 1.0e-2 all (rod bending 8-9 um vs the rigid exact: the floor) |
+| 4 drop, rebound vs HC's d v_o + ln(1 - d v_o) = -(d v_i - ln(1 + d v_i)), v_i 0.5, dt 5e-5 | d 0: 0.965 (BE); d 0.5 / 1 / 2 / 4: e 0.829 / 0.726 / 0.577 / 0.400 vs 0.857 / 0.748 / 0.594 / 0.411 (sim / exact 0.967-0.974: BE's own) |
+
+(Detached-HEAD incident: something checked out 92886a1 in this worktree mid-session; content was intact, moved back
+onto the branch as c9f4848. The first "new quadrature" press/tilt numbers were from the old code on sci6000.)

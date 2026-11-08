@@ -62,3 +62,33 @@ No option passes all gates. Staggered is the right impact physics but loses stea
 trampoline. Candidate next: staggered with MuJoCo's own acceleration extrapolated into pred
 (a_own = (v_end - v_prev)/h - F_prev/m: exact for gravity and steady servos), or lagged with the pending impulse
 applied (hybrid). Awaiting the user's call.
+
+## Round 4: principled coupling, idea 1 (Schur proxy inertia) — 2026-11-08
+
+Handoff: scratch/handoffs/proxy-coupling-principled.md. Switch `DM_SCHUR=full|body|diag` (`src/dismech_newton/
+schur_exp.py`, installed from `__init__`; `DM_PASSES` overrides every coupler's passes): each coupled step MuJoCo is
+stepped k+1 extra times from the same input (proxy forces F0, F0 + delta e_j) -> R = dv/dF per world, Minv_s = R / h
+(J A^-1 J^T with articulation, implicit damping, equality constraints). ProxyArm: M = (Minv_s + eps Minv_view)^-1,
+pred rewinds F with Minv_s, harvest M (z - pred) / h^2. contact.py arm loops over the world's full k block.
+
+Per-pass slope by hand (lagged, rigid wall): F_new - F* = (1 - m_p / m_s) (F - F*), m_s the source's response mass
+(finger: m + h kd = 0.196). View m_p = 0.0855 -> 0.56 (measured 0.46). 1D single-finger numpy model
+(`exp/principled/finger1d.py`) never 2-cycles: the cycle needs the second finger.
+
+Measured response, pick-place held at 3.6 s (`dump_schur.py`; bodies hand, left, right finger):
+- finger y: Minv 3.01 (0.33 kg), view 0.0855 kg; **left-right y coupling -2.09** (the fingers' mimic equality):
+  squeeze mode 3.01 + 2.09 = 5.1 -> **0.196 kg = m + h kd**, antisymmetric 0.92. Hand ~5 kg, rank ~10 of 18.
+- probe asymmetry 16% (constraint nonlinearity / torque probes).
+
+Grip trace (3.6-3.7 s, per finger |grip|, servo 5 N):
+
+| variant | passes 1 | passes 2 |
+|---|---|---|
+| off (view mass) | 5.00 [4.99, 5.01] | 5.04 [4.71, 5.27] |
+| body (6x6 blocks of Minv_s, eps .01) | 5.04 [4.38, 5.44], 2-cycle | 5.01 [4.51, 5.54] |
+| diag | 5.05 [4.39, 5.45] | 5.01 [4.52, 5.48] |
+| full eps .01 | stalls every solve, no grip | same |
+
+Body/diag drop the cross term: squeeze mass 0.33 > 0.196 -> slope 1 - 0.33/0.196 = -0.7: alternation, as seen.
+The view mass underestimates (slope +0.56: passes converge monotonically, x1 steady). Full needed; eps .01 gives
+arm masses ~550 kg in rigid directions (float32 energies).

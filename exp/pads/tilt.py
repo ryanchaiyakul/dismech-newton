@@ -54,7 +54,7 @@ def sim(n):
 
 
 if __name__ == "__main__":
-    for n in (6, 11, 21, 41, 81):
+    for n in (int(a) for a in sys.argv[1:]) if sys.argv[1:] else (6, 11, 21, 41, 81):
         d0, th, sj, w, bend = sim(n)
         S = sj
         e0, et = exact(w)

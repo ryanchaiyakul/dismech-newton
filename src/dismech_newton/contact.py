@@ -27,6 +27,7 @@ CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most t
 STIFFNESS = float(os.environ.get("DM_STIFF", 1.0e3))  # EXP DM_STIFF
 ARM_FLEX = wp.constant(float(os.environ.get("DM_ARM_FLEX", 1.0)))  # EXP: arm flexibility scale in k
 _UNUSED = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
+PAD_FLOOR = wp.constant(0.05)  # A holds a pad pair at least at this fraction of its depth (:func:`_majorizer`)
 SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
 IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
@@ -694,6 +695,10 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     n = s.normal[i]
     g, h, fr = _barrier_force(c, s, i, eps)
     h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
+    pad = s.pad[i]
+    x = s.thickness[i] + pad[2] - wp.dot(n, c)  # in its pad: a rod's curvature (delta^1/2) is 0 at the surface,
+    if pad[0] > 0.0 and x >= 0.0:  # so A holds at least the pad's at PAD_FLOOR of it deep
+        h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
     return h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
 
 

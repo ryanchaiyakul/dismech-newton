@@ -17,4 +17,4 @@ for k in range(12):
     solver.step(s0, s1, None, None, 1 / 240)
     s0, s1 = s1, s0
     z = s0.particle_q.numpy()[:, 2] - (TOP + H + 0.002)
-    print(k, f"z {z.mean()*1e6:.3f} um", {a: getattr(solver, a) for a in dir(solver) if a in ("iterations_used", "converged", "last_iterations")})
+    print(k, f"z {z.mean()*1e6:.3f} um", solver.counts.numpy(), flush=True)

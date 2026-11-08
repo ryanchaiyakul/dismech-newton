@@ -18,6 +18,7 @@ MODE = os.environ.get("DM_SCHUR", "")
 EPS = float(os.environ.get("DM_SCHUR_EPS", "0.01"))
 DELTA = float(os.environ.get("DM_SCHUR_DELTA", "1.0"))
 EVERY = int(os.environ.get("DM_SCHUR_EVERY", "1"))
+ROBIN = os.environ.get("DM_ROBIN", "") == "1"  # the source takes F(x1) = F_ref + K (x1 - x_ref), implicitly
 STATS = {"probes": 0}
 
 
@@ -51,6 +52,7 @@ def _probe(coupler, state_in, control, contacts, dt):
         W, k = arm._arm.M.shape[0], arm.k
         F0 = proxy.coupling_forces.numpy().copy()
         restart = arm.restart
+        q0 = src.state_0.body_q.numpy()[sidx].astype(np.float64)  # the synced start poses (freshly distributed)
 
         def run(F):
             coupler._distribute_state(state_in, dt=dt, iteration_restart=True)
@@ -74,11 +76,47 @@ def _probe(coupler, state_in, control, contacts, dt):
                 for p in range(len(body)):
                     R[world[p], 6 * slot[p]:6 * slot[p] + 6, 6 * s + r] = dv[p]
         STATS["probes"] += k + 1
-        proxy.coupling_forces.assign(F0)
+        Fg = F0
+        if ROBIN and getattr(arm, "_robin_K", None) is not None and getattr(arm, "_robin_pose", None) is not None:
+            K, (com_ref, q_ref) = arm._robin_K, arm._robin_pose
+            com0 = q0[:, :3] + _qrot(q0[:, 3:], arm._com_local)
+            dx = np.concatenate([com0 - com_ref, _rotvec(_qmul(q0[:, 3:], _qconj(q_ref)))], axis=1)
+            F0s, xs, vs = (np.zeros((W, k)) for _ in range(3))
+            for p in range(len(body)):
+                sl = slice(6 * slot[p], 6 * slot[p] + 6)
+                F0s[world[p], sl], xs[world[p], sl], vs[world[p], sl] = F0[glob[p]], dx[p], v0[p]
+            Fs = np.empty_like(F0s)
+            for w in range(W):  # (I - h K R) F = F_ref + K (dx + h v0) - h K R F0
+                KR = dt * K[w] @ R[w]
+                Fs[w] = np.linalg.solve(np.eye(k) - KR, F0s[w] + K[w] @ (xs[w] + dt * vs[w]) - KR @ F0s[w])
+            Fg = F0.copy()
+            for p in range(len(body)):
+                Fg[glob[p]] = Fs[world[p], 6 * slot[p]:6 * slot[p] + 6]
+            STATS["robin"] = STATS.get("robin", 0) + 1
+        proxy.coupling_forces.assign(Fg)
         coupler._distribute_state(state_in, dt=dt, iteration_restart=True)
         arm.restart = restart
         arm._schur = 0.5 * (R + R.transpose(0, 2, 1)) / dt
         arm._schur_asym = np.abs(R - R.transpose(0, 2, 1)).max() / max(np.abs(R).max(), 1e-30)
+
+
+def _qmul(a, b):
+    v1, w1, v2, w2 = a[:, :3], a[:, 3:], b[:, :3], b[:, 3:]
+    return np.concatenate([w1 * v2 + w2 * v1 + np.cross(v1, v2), w1 * w2 - (v1 * v2).sum(1, keepdims=True)], axis=1)
+
+
+def _qconj(q):
+    return np.concatenate([-q[:, :3], q[:, 3:]], axis=1)
+
+
+def _qrot(q, v):
+    return _qmul(_qmul(q, np.concatenate([v, np.zeros((len(v), 1))], axis=1)), _qconj(q))[:, :3]
+
+
+def _rotvec(q):
+    q = np.where(q[:, 3:] < 0, -q, q)
+    s = np.linalg.norm(q[:, :3], axis=1, keepdims=True)
+    return np.where(s > 1e-12, 2 * np.arctan2(s, q[:, 3:]) / np.maximum(s, 1e-30), 2.0) * q[:, :3]
 
 
 def _select(S):
@@ -136,7 +174,7 @@ def install():
     def _update(self, state, h):
         out = update(self, state, h)
         S = getattr(self, "_schur", None)
-        if S is None:
+        if S is None or MODE == "probe":
             return out
         a = self._arm
         W, k = a.M.shape[0], self.k
@@ -160,6 +198,11 @@ def install():
 
     def _finish(self, z, state_in, state_out, dt, h):
         finish(self, z, state_in, state_out, dt, h)
+        if ROBIN:  # the reference pose of the Robin force: the proxies' end poses
+            b = self._body.numpy()
+            self._com_local = self.model.body_com.numpy()[b].astype(np.float64)
+            qo = state_out.body_q.numpy()[b].astype(np.float64)
+            self._robin_pose = (qo[:, :3] + _qrot(qo[:, 3:], self._com_local), qo[:, 3:])
         if getattr(self, "_schur_step", None) is not None:
             a = self._arm
             W, k = a.M.shape[0], self.k
@@ -183,3 +226,29 @@ def install():
         arm._schur_step = None
 
     SolverDiSMech.coupling_harvest_proxy_wrenches = _harvest
+
+    solve = SolverDiSMech._solve
+
+    def _solve(self, state_in, q, dt):
+        solve(self, state_in, q, dt)
+        arm = self._proxy_arm
+        if not ROBIN or arm is None or not arm.k:
+            return
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+
+        self._assemble(q, self.dofs)  # the step's matrix at its end
+        indptr, indices = self.A.pattern
+        U = sp.csr_matrix((self.A.vals.numpy(), indices, indptr), shape=(self.A.n, self.A.n))
+        A = (U + U.T - sp.diags(U.diagonal())).tocsc()
+        a = arm._arm
+        W, k = a.M.shape[0], arm.k
+        z = np.arange(a.start, a.start + W * k)
+        rest = np.setdiff1d(np.arange(self.A.n), z)
+        Azn = A[z][:, rest].toarray()
+        S = A[z][:, z].toarray() - Azn @ spla.splu(A[rest][:, rest].tocsc()).solve(Azn.T)
+        M = a.M.numpy().astype(np.float64) * a.inv_h2
+        K = np.stack([-(S[w * k:(w + 1) * k, w * k:(w + 1) * k] - M[w]) for w in range(W)])
+        arm._robin_K = 0.5 * (K + K.transpose(0, 2, 1))
+
+    SolverDiSMech._solve = _solve

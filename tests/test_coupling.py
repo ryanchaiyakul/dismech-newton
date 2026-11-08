@@ -2,12 +2,15 @@
 Newton's Franka pick-and-place with our rod."""
 
 import newton
+import os
+
 import numpy as np
 import pytest
 import warp as wp
 
 from dismech_newton import SolverDiSMech, flatten_state
 
+PEND = float(os.environ.get("PEND", "1"))  # EXPERIMENT: count the pending feedback
 pytest.importorskip("mujoco_warp")
 from newton.solvers import SolverMuJoCo  # noqa: E402
 
@@ -126,7 +129,7 @@ def test_proxy_momentum(rng):
     feedback = solver._proxy_mappings[0].coupling_forces  # applied to the box next step
 
     def momentum(s):
-        return (m * s.particle_qd.numpy()).sum(0) + mb * s.body_qd.numpy()[body, :3] + dt * feedback.numpy()[body, :3]
+        return (m * s.particle_qd.numpy()).sum(0) + mb * s.body_qd.numpy()[body, :3] + PEND * dt * feedback.numpy()[body, :3]
 
     p0, worst, moved, deepest = momentum(s0), 0.0, 0.0, -np.inf
     for _ in range(300):
@@ -177,7 +180,7 @@ def test_proxy_pin(rng):
 
     def momenta(s):
         x, v = s.particle_q.numpy(), s.particle_qd.numpy()
-        bq, bqd, f = s.body_q.numpy()[body], s.body_qd.numpy()[body], dt * feedback.numpy()[body]
+        bq, bqd, f = s.body_q.numpy()[body], s.body_qd.numpy()[body], PEND * dt * feedback.numpy()[body]
         X = wp.transform(wp.vec3(*bq[:3]), wp.quat(*bq[3:]))
         c = np.array(wp.transform_point(X, wp.vec3(*com)))
         R = np.array(wp.quat_to_matrix(wp.quat(*bq[3:]))).reshape(3, 3)

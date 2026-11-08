@@ -32,6 +32,7 @@ from newton import State
 from .collide import FLAT, OPEN, Bodies, _closest_st, _edge_scan, _shape_gap
 from .contact import (
     LIFT,
+    SIDES,
     Arm,
     Slots,
     _arm_assemble_kernel,
@@ -559,7 +560,7 @@ def _contact_residual_kernel(
     if body >= 0:
         cq -= arm_move(q, arm, body, lever)
     anchors[i] = anchor
-    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i])
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.damp[i])
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)
@@ -581,7 +582,7 @@ def _scan_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], key0: int, 
     t0[i] = 0.0
     if c.key[i] >= key0 and c.pair[i][1] >= 0:
         sk = shape_of(c.key[i], key0)
-        if c.key[i] != key0 + 2 * sk:
+        if c.key[i] != key0 + SIDES * sk:
             X = b.xform[sk]
             if b.body[sk] >= 0:
                 X = wp.transform_multiply(poses[b.body[sk]], b.xform[sk])
@@ -602,7 +603,7 @@ def _weights_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], poses0: 
         if b.body[sk] >= 0:
             X = wp.transform_multiply(poses[b.body[sk]], b.xform[sk])
             X0 = wp.transform_multiply(poses0[b.body[sk]], b.xform[sk])
-        w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, X, X0, c.key[i] != key0 + 2 * sk, t0[i])
+        w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, X, X0, c.key[i] != key0 + SIDES * sk, t0[i])
     out[i] = w
 
 

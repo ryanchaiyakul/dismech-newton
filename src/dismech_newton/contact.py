@@ -27,6 +27,7 @@ CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most t
 STIFFNESS = float(os.environ.get("DM_STIFF", 1.0e3))  # EXP DM_STIFF
 ARM_FLEX = wp.constant(float(os.environ.get("DM_ARM_FLEX", 1.0)))  # EXP: arm flexibility scale in k
 _UNUSED = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
+SIDES = 16  # a shape's pair keys per feature: a line contact's ends, or a pad's points (collide)
 PAD_FLOOR = wp.constant(0.05)  # A holds a pad pair at least at this fraction of its depth (:func:`_majorizer`)
 SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
@@ -59,7 +60,8 @@ class Slots:
     roll: wp.array[wp.vec4]
     ta: wp.array[wp.vec3]
     tb: wp.array[wp.vec3]
-    pad: wp.array[wp.vec3]  # a hydroelastic pad's node: (c, p, h), its energy c (th + h - d)^p (:func:`pad_energy`)
+    pad: wp.array[wp.vec4]  # a pad's point: (c, p, h, d), its energy c (th + h - d)^p, Hunt-Crossley's d [s/m]
+    damp: wp.array[float]  # and its damping d f0 / dt (f0 its pressure's force at the step's start)
 
 
 @wp.struct
@@ -151,8 +153,8 @@ def slot_roll(q: wp.array[float], s: Slots, i: int) -> wp.vec3:
 
 @wp.func
 def shape_of(key: int, key0: int) -> int:
-    """A shape pair's shape from its key ``key0 + 2 shape + side`` (side 1: a line contact's other end)."""
-    return (key - key0) // 2
+    """A shape pair's shape from its key ``key0 + SIDES shape + side`` (side 1: a line contact's other end)."""
+    return (key - key0) // SIDES
 
 
 @wp.func
@@ -262,7 +264,7 @@ def emit(
     th: float,
     mu: float,
     radius: wp.vec4,
-    pad: wp.vec3,
+    pad: wp.vec4,
 ):
     """Activate slot ``i``; ``xb``: the anchor at the end of the step, ``db``: its displacement over it; ``radius``:
     per node its rod's (0 off rods): a side on two rod nodes (an edge) rolls (:func:`roll_point`); ``pad``: a pad's
@@ -391,7 +393,7 @@ class BarrierBlock:
         self._launch(_carry_kernel, [self.sort_key, self.sort_at, self.held_key, self.held_lam, self.s, self.lam])
         self._launch(_rebase_kernel, [q, state_in.dismech.q, self.s])
         self._launch(_lift_kernel, [q, lift, self.s, self.arm])
-        self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.mass, self.fixed, self.scale,
+        self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.dt, self.mass, self.fixed, self.scale,
                                    int(start), self.unsettled, self.s, self.arm])
 
     def snapshot(self) -> Slots | None:
@@ -508,7 +510,7 @@ def barrier(d: float, th: float, k: float, lam: float) -> wp.vec3:
 
 
 @wp.func
-def pad_energy(d: float, th: float, pad: wp.vec3) -> wp.vec3:
+def pad_energy(d: float, th: float, pad: wp.vec4) -> wp.vec3:
     """``(e, e', e'')`` at the gap ``d`` of a node in a hydroelastic pad (Elandt et al. 2019 with a linear pressure
     field: an elastic foundation, pressure ``kh`` times depth) ``h`` deep over its rigid core: ``c delta^p``, ``delta =
     th + h - d`` the node's surface's depth in the pad; per node its pressure integrated over its share of the partner
@@ -521,10 +523,22 @@ def pad_energy(d: float, th: float, pad: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def pad_damping(d: float, d0: float, th: float, pad: wp.vec4, damp: float) -> wp.vec3:
+    """Hunt-Crossley's dissipation in the pad (Elandt et al. 2019, Eq. 3: ``p0 d v_n``), lagged as Drake's: the
+    pressure's force at the step's start ``f0`` times ``d`` times the approach ``(d0 - d) / dt``, the potential
+    ``damp (d0 - d)^2 / 2`` (``damp = d f0 / dt``) while in the pad."""
+    if damp == 0.0 or th + pad[2] - d <= 0.0:
+        return wp.vec3(0.0)
+    y = d0 - d
+    return wp.vec3(0.5 * damp * y * y, -damp * y, damp)
+
+
+@wp.func
 def pair_energy(d: float, s: Slots, i: int) -> wp.vec3:
-    """The pair's barrier (its pad's core's, on a pad) plus its pad's energy."""
+    """The pair's barrier (its pad's core's, on a pad) plus its pad's energy and damping."""
     th = s.thickness[i]
-    return barrier(d, th, s.stiffness[i], s.lam[i]) + pad_energy(d, th, s.pad[i])
+    return barrier(d, th, s.stiffness[i], s.lam[i]) + pad_energy(d, th, s.pad[i]) + pad_damping(
+        d, wp.dot(s.normal[i], s.c0[i]), th, s.pad[i], s.damp[i])
 
 
 @wp.func
@@ -585,8 +599,8 @@ def _decay_kernel(scale: wp.array[float]):
 
 
 @wp.kernel
-def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scale: wp.array[float], grow: int,
-                unsettled: wp.array[wp.int32], s: Slots, arm: Arm):
+def _lag_kernel(c: float, dt: float, mass: wp.array[float], fixed: wp.array[wp.int32], scale: wp.array[float],
+                grow: int, unsettled: wp.array[wp.int32], s: Slots, arm: Arm):
     """The pair's stiffness ``c / (C M^-1 C^T)`` (``c``: stiffness / dt^2) times its
     nodes' largest load scale, and its normal force at the step's start (in ``rho``): friction's ``lam``. At a step's
     start (``grow``), a pair compressed deeper than :data:`LOAD` thicknesses raises its nodes' scales (at most
@@ -606,7 +620,9 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
                 if s.pair[i][j] >= 0:
                     wp.atomic_max(scale, s.pair[i][j], up)
         s.stiffness[i] = k
-        s.rho[i] = -pair_energy(wp.dot(s.normal[i], s.c0[i]), s, i)[1]
+        d0 = wp.dot(s.normal[i], s.c0[i])
+        s.damp[i] = s.pad[i][3] * -pad_energy(d0, s.thickness[i], s.pad[i])[1] / dt
+        s.rho[i] = -pair_energy(d0, s, i)[1]
 
 
 @wp.func
@@ -618,10 +634,11 @@ def _slip(c: wp.vec3, c0: wp.vec3, n: wp.vec3) -> wp.vec3:
 
 @wp.func
 def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float,
-                  pad: wp.vec3):
+                  pad: wp.vec4, damp: float = 0.0):
     """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, friction
     ``mu rho = mu_rho``), and its barrier's and friction's curvatures."""
-    e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad)
+    e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad) + pad_damping(
+        wp.dot(n, c), wp.dot(n, c0), th, pad, damp)
     slip = _slip(c, c0, n)
     friction = mu_rho * slip_energy(wp.length(slip), eps)[1]
     return e[1] * n + friction * slip, e[2], friction
@@ -630,7 +647,7 @@ def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam:
 @wp.func
 def _barrier_force(c: wp.vec3, s: Slots, i: int, eps: float):
     return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps,
-                         s.pad[i])
+                         s.pad[i], s.damp[i])
 
 
 @wp.func

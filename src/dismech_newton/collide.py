@@ -21,10 +21,11 @@ from newton._src.geometry import kernels as G  # its shape SDFs; triangle_...: e
 from scipy.sparse.csgraph import maximum_bipartite_matching
 
 from .builder import _P
-from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
+from .contact import SIDES, Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
 from .state import node
 
 PAIRS = 8  # the pair list's places per feature (node or edge), shared: the scenes' peak is 1.7 (cloth_style3d)
+PAD_DEPTH = wp.constant(0.5)  # a pad holds the outer half of a pair's thickness, its core's barrier the rest
 REACH = 2.0  # pairs within this many thicknesses: the thickness, plus two move caps (a radius each)
 EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod are not contacts
 OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
@@ -65,7 +66,6 @@ class Mesh:
     edge_arc: wp.array[float]
     edge_dir: wp.array[float]
     world: wp.array[wp.int32]
-    area: wp.array[float]  # per node its share of its rods' rest length, or of its triangles' rest area (pads)
     shift: wp.array[wp.vec3]  # per node, its world's place in the trees (each world apart: no other world's pairs)
 
 
@@ -162,15 +162,6 @@ def _mesh(model: Model, device) -> Mesh:
     ):
         value = np.asarray(value)
         setattr(m, name, wp.array(value if dtype is float else value.astype(np.int32), dtype=dtype, device=device))
-    area = np.zeros(max(n, 1))  # the pads' quadrature: a rod node's half its edges, a shell node's third its faces
-    rods = edge_rod[: len(n0)] >= 0
-    np.add.at(area, n0[rods], 0.5 * length[rods])
-    np.add.at(area, n1[rods], 0.5 * length[rods])
-    if nf:
-        x = model.particle_q.numpy()
-        fa = 0.5 * np.linalg.norm(np.cross(x[tris[:, 1]] - x[tris[:, 0]], x[tris[:, 2]] - x[tris[:, 0]]), axis=1)
-        np.add.at(area, tris.ravel(), np.repeat(fa / 3.0, 3))
-    m.area = wp.array(area, dtype=float, device=device)
     m.shift = wp.array(_world_shift(model), dtype=wp.vec3, device=device)
     return m
 
@@ -207,7 +198,7 @@ class Offset:
         self._mu_shape = wp.array(_mu_shape(model)[0], dtype=wp.int32, device=dev)
         self.fixed, self.self_contact = fixed, int(self_contact)
         self.num_nodes, self.num_edges, self.num_faces = model.particle_count, mesh.edges.shape[0], mesh.faces.shape[0]
-        self.shape_key0 = self.num_nodes + self.num_edges + self.num_faces  # shape k's keys: shape_key0 + 2 k + side
+        self.shape_key0 = self.num_nodes + self.num_edges + self.num_faces  # shape k's: shape_key0 + SIDES k + side
         self.num_rod_edges = model.dismech.edge_node0.shape[0]
         self.pad = 2.0 * float(mesh.radius.numpy().max()) * REACH
         e, x = mesh.edges.numpy(), model.particle_q.numpy()
@@ -222,7 +213,7 @@ class Offset:
         self._bvh = wp.Bvh(self._lo[:E], self._hi[:E])
         self._face_bvh = wp.Bvh(self._lo[E:], self._hi[E:]) if self.num_faces else None
         self.bodies = _bodies(model, dev)
-        self.num_prims = self.shape_key0 + 2 * max(model.shape_count, 1)  # a pair key's range
+        self.num_prims = self.shape_key0 + SIDES * max(model.shape_count, 1)  # a pair key's range
         sc = self.scene = Scene()  # the step's positions and list set in fill
         sc.m, sc.b, sc.fixed, sc.self_contact = mesh, self.bodies, fixed, self.self_contact
         sc.num_nodes = self.num_nodes
@@ -305,7 +296,7 @@ class Bodies:
     margin: wp.array[float]
     mu: wp.array[float]
     kh: wp.array[float]  # a hydroelastic pad's (Newton's is_hydroelastic) pressure per depth [N/m^3], 0 off pads
-    depth: wp.array[float]  # and its thickness over its core (its margin)
+    hc: wp.array[float]  # and its Hunt-Crossley dissipation [s/m]
     radius: wp.array[float]
     shapes: wp.array[wp.int32]
     world_ptr: wp.array[wp.int32]
@@ -329,20 +320,16 @@ def _bodies(model: Model, device) -> Bodies:
     b.margin, b.mu = model.shape_margin, model.shape_material_mu
     pad = (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
     kh = model.shape_material_kh.numpy() if pad.any() else np.zeros(len(kind))
-    margin = model.shape_margin.numpy().copy()
-    depth = margin.copy()
-    if os.environ.get("DM_PADS"):  # EXPERIMENT: DM_PADS=kh,h,pattern pads the shapes of bodies labelled *pattern*
-        kp, hp, pat, *inward = os.environ["DM_PADS"].split(",")  # ,in: the pad inside the margin (same geometry)
+    hc = np.full(len(kind), float(os.environ.get("DM_PAD_HC", 0.0)))  # EXPERIMENT: Newton has no such property
+    if os.environ.get("DM_PADS"):  # EXPERIMENT: DM_PADS=kh,pattern pads the shapes of bodies labelled *pattern*
+        kp, pat, *hcp = os.environ["DM_PADS"].split(",")  # EXPERIMENT: ,d Hunt-Crossley's [s/m]
         labels = list(model.body_label)
         sel = np.array([bb >= 0 and pat in labels[bb] for bb in body])
         pad, kh = pad | sel, np.where(sel, float(kp), kh)
-        depth = np.where(sel, float(hp), depth)
-        if not inward:
-            margin = np.where(sel, margin + float(hp), margin)
-            b.margin = wp.array(margin, dtype=float, device=device)
-        print(f"DM_PADS: {sel.sum()} shapes padded: kh {kp} h {hp}", flush=True)
+        hc = np.where(sel, float(hcp[0]) if hcp else 0.0, hc)
+        print(f"DM_PADS: {sel.sum()} shapes padded: kh {kp}", flush=True)
     b.kh = wp.array(np.where(pad, kh, 0.0), dtype=float, device=device)
-    b.depth = wp.array(depth, dtype=float, device=device)
+    b.hc = wp.array(np.where(pad, hc, 0.0), dtype=float, device=device)
     # the cull sphere about the shape's origin; Newton's mesh radius is about its AABB's centre: a mesh's from its
     # vertices (unculled without them)
     radius = model.shape_collision_radius.numpy().copy()
@@ -685,7 +672,7 @@ def _clear_kernel(s: Slots):
 
 @wp.func
 def _keep(sc: Scene, own: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float,
-          mu: float, sweep: float, pad: wp.vec3):
+          mu: float, sweep: float, pad: wp.vec4):
     """Append the contact of feature ``own`` with ``key`` to the list, unless farther than :data:`REACH` thicknesses
     (found twice, through two triangles or edges: the sort drops one); past the list's end, dropped (:func:`_drop`).
     ``n``: the normal, or zero for ``C q``'s direction; ``xb``, ``db``: a body's point at the end of the step and its
@@ -726,25 +713,63 @@ def _keep(sc: Scene, own: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3,
 @wp.func
 def _keep_pair(sc: Scene, own: int, key: int, pair: wp.vec4i, w: wp.vec4, th: float, mu: float):
     """:func:`_keep` for two features of rods and shells: the normal along ``C q``, no anchor."""
-    _keep(sc, own, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu, 0.0, wp.vec3(0.0))
+    _keep(sc, own, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu, 0.0, wp.vec4(0.0))
 
 
 @wp.func
 def _keep_shape(sc: Scene, own: int, k: int, side: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3,
-                th: float):
+                th: float, c: float = 0.0, power: float = 0.0):
     """:func:`_keep` against shape ``k``, at its world point ``x`` (the step's start) with the normal ``n``; ``side``:
-    which end of a rod edge's line contact (0 for a single point)."""
+    which end of a rod edge's line contact (0 for a single point), or a pad's point; against a pad, its pressure's
+    ``c delta^power`` (:attr:`.contact.Slots.pad`; 0: a node's, its core's barrier only)."""
     xb, db = _anchor(sc.b, k, x)
-    key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + 2 * k + side
-    pad = wp.vec3(0.0)
-    v = pair[0]
-    kh = sc.b.kh[k]
-    if kh > 0.0 and pair[1] < 0:  # a pad's node: Winkler's cylinder (Johnson, Contact Mechanics 1985) or face
-        if sc.m.rod[v] >= 0:
-            pad = wp.vec3(kh * sc.m.area[v] * (8.0 / 15.0) * wp.sqrt(2.0 * sc.m.radius[v]), 2.5, sc.b.depth[k])
-        else:
-            pad = wp.vec3(0.5 * kh * sc.m.area[v], 2.0, sc.b.depth[k])
+    key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + SIDES * k + side
+    pad = wp.vec4(0.0)
+    if sc.b.kh[k] > 0.0:
+        pad = wp.vec4(c, power, PAD_DEPTH * th, sc.b.hc[k])
     _keep(sc, own, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]), _sweep(sc.b, k), pad)
+
+
+@wp.func
+def _pad_points(sc: Scene, own: int, k: int, X: wp.transform, tri: wp.vec3i, th: float, reach: float, far: float):
+    """A rod edge's (``tri[2] < 0``) or a triangle's points against pad ``k``: its pressure field (Elandt et al. 2019,
+    linear: ``kh`` per depth) over the partner, at fixed points (so the energy is continuous: a point enters at zero
+    pressure) about a radius apart: a rod edge's ``q`` points along it, each its length's share of Winkler's cylinder
+    across the section (``kh l (8/15) sqrt(2R) delta^(5/2)``, Johnson 1985); a triangle's ``n^2`` sub-triangles'
+    centroids, each its area's share (``kh A delta^2 / 2``)."""
+    m, b, q = sc.m, sc.b, sc.q
+    kh = b.kh[k]
+    r = m.radius[tri[0]]
+    if tri[2] < 0:
+        le = wp.length(node(m.rest, tri[1]) - node(m.rest, tri[0]))
+        nq = wp.clamp(int(wp.ceil(le / r)), 1, SIDES)
+        c = kh * le / float(nq) * (8.0 / 15.0) * wp.sqrt(2.0 * r)
+        for j in range(nq):
+            u = (float(j) + 0.5) / float(nq)
+            x = wp.lerp(node(q, tri[0]), node(q, tri[1]), u)
+            d, n = _shape_gap(b, k, X, x, far)
+            if d <= reach:
+                _keep_shape(sc, own, k, j, wp.vec4i(tri[0], tri[1], -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n,
+                            n, th, c, 2.5)
+        return
+    r0 = node(m.rest, tri[0])
+    e1 = node(m.rest, tri[1]) - r0
+    e2 = node(m.rest, tri[2]) - r0
+    size = wp.max(wp.length(e1), wp.max(wp.length(e2), wp.length(e2 - e1)))
+    nq = wp.clamp(int(wp.ceil(size / r)), 1, 4)  # n^2 <= SIDES
+    c = 0.5 * kh * 0.5 * wp.length(wp.cross(e1, e2)) / float(nq * nq)
+    for j in range(nq * nq):  # the sub-triangles: cell (i, l) under the diagonal its up one, (i + 1/3, l + 1/3) / n;
+        i = j // nq  # past it the down one of its mirror (n - 1 - i, n - 1 - l), (i + 2/3, l + 2/3) / n
+        l = j % nq
+        up = i + l < nq
+        o = wp.where(up, 1.0 / 3.0, 2.0 / 3.0)
+        u = (float(wp.where(up, i, nq - 1 - i)) + o) / float(nq)
+        v = (float(wp.where(up, l, nq - 1 - l)) + o) / float(nq)
+        wv = wp.vec4(1.0 - u - v, u, v, 0.0)
+        x = wv[0] * node(q, tri[0]) + u * node(q, tri[1]) + v * node(q, tri[2])
+        d, n = _shape_gap(b, k, X, x, far)
+        if d <= reach:
+            _keep_shape(sc, own, k, j, wp.vec4i(tri[0], tri[1], tri[2], -1), wv, x - d * n, n, th, c, 2.0)
 
 
 @wp.kernel
@@ -796,14 +821,16 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
     x2 = node(q, tri[2])
     if jj < _shape_count(b, m.world[a0]):
         k = _shape_at(b, m.world[a0], jj)
-        if b.kh[k] > 0.0:
-            return  # a pad: its nodes' pairs (the quadrature)
         X = _shape_pose(b, k)
         c = wp.transform_get_translation(X)
         th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
         reach = REACH * th + _sweep(b, k)
         size = wp.max(wp.length(x0 - x1), wp.max(wp.length(x1 - x2), wp.length(x2 - x0)))
         if wp.length(c - x0) > b.radius[k] + reach + size and wp.length(c - xa) > b.radius[k] + reach + size:
+            return
+        if b.kh[k] > 0.0:  # a pad: its triangle's points (the edge holding it), none along the edge
+            if f >= 0:
+                _pad_points(sc, sc.num_nodes + e, k, X, tri, th, reach + size, reach + size)
             return
         # the edge: BISECT bisections of the gap's slope, then its point and both ends
         t0 = float(0.0)
@@ -873,8 +900,6 @@ def _edge_shape(sc: Scene, e: int, jj: int, at: int):
     xb = node(q, a1)
     if jj < _shape_count(b, m.world[a0]):
         k = _shape_at(b, m.world[a0], jj)
-        if b.kh[k] > 0.0:
-            return  # a pad: its nodes' pairs (the quadrature)
         X = _shape_pose(b, k)
         th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
         reach = REACH * th
@@ -886,6 +911,9 @@ def _edge_shape(sc: Scene, e: int, jj: int, at: int):
         if wp.length(c - wp.lerp(xa, xb, t)) > b.radius[k] + reach:
             return
         far = reach + wp.length(xb - xa)  # a mesh's query radius
+        if b.kh[k] > 0.0:  # a pad: its points
+            _pad_points(sc, sc.num_nodes + e, k, X, wp.vec3i(a0, a1, -1), th, reach, far)
+            return
         # The closest point; lying along a face, the edge touches it on a segment, and the segment's other end too, so
         # it holds when the edge tilts either way (else the frozen point is the wrong end and the other sinks in). A
         # point at a node is the node's pair.
@@ -943,7 +971,7 @@ def _node_shape(sc: Scene, i: int, jj: int, at: int):
         if wp.length(xv - wp.transform_get_translation(X)) > b.radius[k] + reach:
             return
         d, n = _shape_gap(b, k, X, xv, reach)
-        if d <= reach and (b.kh[k] > 0.0 or not (m.rod[i] >= 0 and _edge_holds(q, m, b, k, X, i, n, reach))):
+        if d <= reach and not (m.rod[i] >= 0 and _edge_holds(q, m, b, k, X, i, n, reach)):
             _found(sc, at, k, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), xv - d * n, n, th)
 
 

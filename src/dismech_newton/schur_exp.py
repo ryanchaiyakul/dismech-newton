@@ -142,6 +142,7 @@ def install():
         SolverCoupledProxy.Config.__init__ = _init
     if not MODE:
         return
+    SolverCoupledProxy.graph_capturable = False  # host-side numpy every step
 
     from . import coupling
     from .solver import SolverDiSMech

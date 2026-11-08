@@ -559,7 +559,7 @@ def _contact_residual_kernel(
     if body >= 0:
         cq -= arm_move(q, arm, body, lever)
     anchors[i] = anchor
-    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps)
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i])
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)

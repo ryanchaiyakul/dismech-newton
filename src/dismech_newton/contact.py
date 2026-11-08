@@ -58,6 +58,7 @@ class Slots:
     roll: wp.array[wp.vec4]
     ta: wp.array[wp.vec3]
     tb: wp.array[wp.vec3]
+    pad: wp.array[wp.vec3]  # a hydroelastic pad's node: (c, p, h), its energy c (th + h - d)^p (:func:`pad_energy`)
 
 
 @wp.struct
@@ -260,9 +261,11 @@ def emit(
     th: float,
     mu: float,
     radius: wp.vec4,
+    pad: wp.vec3,
 ):
     """Activate slot ``i``; ``xb``: the anchor at the end of the step, ``db``: its displacement over it; ``radius``:
-    per node its rod's (0 off rods): a side on two rod nodes (an edge) rolls (:func:`roll_point`)."""
+    per node its rod's (0 off rods): a side on two rod nodes (an edge) rolls (:func:`roll_point`); ``pad``: a pad's
+    node (:attr:`Slots.pad`), ``th`` to the pad's surface (its core's ``h`` less)."""
     s.active[i] = 1
     s.pair[i] = pair
     s.w[i] = w
@@ -296,7 +299,8 @@ def emit(
                         s.tb[i] = wp.normalize(t)
     s.roll[i] = roll
     s.c0[i] = contact_point(q, pair, w, xb) + db + slot_roll(q, s, i)
-    s.thickness[i] = th
+    s.thickness[i] = th - pad[2]
+    s.pad[i] = pad
     s.mu[i] = mu
 
 
@@ -503,6 +507,26 @@ def barrier(d: float, th: float, k: float, lam: float) -> wp.vec3:
 
 
 @wp.func
+def pad_energy(d: float, th: float, pad: wp.vec3) -> wp.vec3:
+    """``(e, e', e'')`` at the gap ``d`` of a node in a hydroelastic pad (Elandt et al. 2019 with a linear pressure
+    field: an elastic foundation, pressure ``kh`` times depth) ``h`` deep over its rigid core: ``c delta^p``, ``delta =
+    th + h - d`` the node's surface's depth in the pad; per node its pressure integrated over its share of the partner
+    (a rod's cylinder across its length: ``p = 5/2``; a shell's face: ``p = 2``)."""
+    x = th + pad[2] - d
+    if pad[0] == 0.0 or x <= 0.0:
+        return wp.vec3(0.0)
+    c, q = pad[0], pad[1]
+    return wp.vec3(c * wp.pow(x, q), -q * c * wp.pow(x, q - 1.0), q * (q - 1.0) * c * wp.pow(x, q - 2.0))
+
+
+@wp.func
+def pair_energy(d: float, s: Slots, i: int) -> wp.vec3:
+    """The pair's barrier (its pad's core's, on a pad) plus its pad's energy."""
+    th = s.thickness[i]
+    return barrier(d, th, s.stiffness[i], s.lam[i]) + pad_energy(d, th, s.pad[i])
+
+
+@wp.func
 def slip_energy(y: float, eps: float) -> wp.vec2:
     """IPC's ``f0(y)`` and ``f1(y) / y`` (``f1 = f0'``), smoothed below ``eps``."""
     if y >= eps:
@@ -581,7 +605,7 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
                 if s.pair[i][j] >= 0:
                     wp.atomic_max(scale, s.pair[i][j], up)
         s.stiffness[i] = k
-        s.rho[i] = -barrier(wp.dot(s.normal[i], s.c0[i]), s.thickness[i], s.stiffness[i], s.lam[i])[1]
+        s.rho[i] = -pair_energy(wp.dot(s.normal[i], s.c0[i]), s, i)[1]
 
 
 @wp.func
@@ -592,10 +616,11 @@ def _slip(c: wp.vec3, c0: wp.vec3, n: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float):
+def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float,
+                  pad: wp.vec3):
     """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, friction
     ``mu rho = mu_rho``), and its barrier's and friction's curvatures."""
-    e = barrier(wp.dot(n, c), th, k, lam)
+    e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad)
     slip = _slip(c, c0, n)
     friction = mu_rho * slip_energy(wp.length(slip), eps)[1]
     return e[1] * n + friction * slip, e[2], friction
@@ -603,7 +628,8 @@ def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam:
 
 @wp.func
 def _barrier_force(c: wp.vec3, s: Slots, i: int, eps: float):
-    return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps)
+    return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps,
+                         s.pad[i])
 
 
 @wp.func
@@ -803,7 +829,7 @@ def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: 
     pair = s.pair[i]
     w = s.w[i]
     n = s.normal[i]
-    e = barrier(wp.dot(n, pair_point(q, s, i, arm, s.anchor[i])), s.thickness[i], s.stiffness[i], s.lam[i])
+    e = pair_energy(wp.dot(n, pair_point(q, s, i, arm, s.anchor[i])), s, i)
     if e[2] == 0.0:
         return
     m = (flexibility(pair, w, mass, fixed) + arm_flexibility(arm, s, i)) * h2  # a force as the move it gives the
@@ -824,7 +850,7 @@ def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, stride
     if i < s.active.shape[0] and s.active[i] != 0:
         c = pair_point(q_cand[j], s, i, arm, s.anchor[i])
         n = s.normal[i]
-        e = wp.float64(barrier(wp.dot(n, c), s.thickness[i], s.stiffness[i], s.lam[i])[0])
+        e = wp.float64(pair_energy(wp.dot(n, c), s, i)[0])
         e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(wp.length(_slip(c, s.c0[i], n)), eps)[0])
     world_sum(energy, w, j, stride, e)
 

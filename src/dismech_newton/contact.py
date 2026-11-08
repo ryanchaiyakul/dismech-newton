@@ -952,7 +952,7 @@ def _compact_kernel(
 def _arm_inertia(q: wp.array[float], arm: Arm, w: int, m: int) -> float:
     """``(M (z - pred))_m / h^2`` of world ``w``: ``M`` block-diagonal, a body's 6 DOFs (:class:`.coupling.ProxyArm`)."""
     v = float(0.0)
-    for m2 in range(6 * (m // 6), 6 * (m // 6) + 6):
+    for m2 in range(arm.k):  # EXPERIMENT (DM_SCHUR): the world's full block
         j = w * arm.k + m2
         v += arm.M[w, m, m2] * (q[arm.start + j] - arm.pred[j])
     return v * arm.inv_h2
@@ -992,5 +992,5 @@ def _arm_assemble_kernel(arm: Arm, indptr: wp.array[wp.int32], indices: wp.array
                          vals: wp.array[wp.float64]):
     w, m = wp.tid()
     zm = arm.start + w * arm.k
-    for m2 in range(m, 6 * (m // 6) + 6):  # its body's block
+    for m2 in range(m, arm.k):  # EXPERIMENT (DM_SCHUR): the world's full block
         wp.atomic_add(vals, row_slot(indptr, indices, zm + m, zm + m2), wp.float64(arm.M[w, m, m2] * arm.inv_h2))

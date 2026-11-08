@@ -76,13 +76,17 @@ def test_admm_entry(rng):
     assert deepest < 0.6 * r, deepest
 
 
-def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None):
-    """The solver as Newton's ``SolverCoupledProxy`` destination: ``body`` MuJoCo's, a proxy in our solve; ``pin``: a
-    point in ``body``'s frame its ball joint holds the rod's first node to."""
+def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None, fixed=False):
+    """The solver as Newton's ``SolverCoupledProxy`` destination: ``body`` MuJoCo's, a proxy in our solve, two proxy
+    passes a step (the second takes the first's contact force within the step: one lags an impact a step and throws
+    the body back); ``pin``: a point in ``body``'s frame its ball joint holds the rod's first node to; ``fixed``: the
+    rod clamped along its length."""
     from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy  # noqa: PLC0415
 
     capsules, _ = SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu),
                                         stretch_stiffness=1.0e4, bend_stiffness=2.0e-3, bend_damping=1.0e-4)
+    for c in capsules if fixed else ():
+        SolverDiSMech.fix_segment(builder, c)
     if pin is not None:
         half = 0.5 * float(np.linalg.norm(np.diff(rod.points[:2], axis=0)))
         builder.add_joint_ball(parent=body, child=capsules[0], parent_xform=wp.transform(pin, wp.quat_identity()),
@@ -96,7 +100,7 @@ def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None):
         SolverCoupled.Entry(name="soft", solver=SolverDiSMech, particles=list(range(model.particle_count)),
                             bodies=list(range(body + 1, model.body_count)),
                             joints=[j for j in range(model.joint_count) if j not in box_joints]),
-    ], coupling=SolverCoupledProxy.Config(proxies=[
+    ], coupling=SolverCoupledProxy.Config(iterations=int(os.environ.get("DM_ITER", "2")), proxies=[
         SolverCoupledProxy.Proxy(source="rigid", destination="soft", bodies=[body])]))
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
@@ -204,6 +208,40 @@ def test_proxy_pin(rng):
     assert dL < 4.0e-3, dL
     assert gap < 4.0e-4, gap
     assert mb * np.linalg.norm(s0.body_qd.numpy()[body, :3]) > 0.3 * np.linalg.norm(p0), "the rod did not drag the box"
+
+
+@pytest.mark.usefixtures("needs_cuda")
+def test_proxy_impact():
+    """A free MuJoCo box dropped 1 cm onto a rod clamped along its length (only the box yields), through
+    ``SolverCoupledProxy``: the step that meets the rod stops it (implicit Euler: no rebound, under 5% of the impact
+    speed back), and it rests a contact thickness (the rod's radius) on the rod, never inside, its weight the
+    coupler's feedback (1%). One proxy pass a step sends it back at about twice its impact speed."""
+    builder = newton.ModelBuilder()
+    hx, r, n, drop = 0.02, 0.004, 21, 0.01
+    rest = 0.1 + r + hx
+    rod = newton.Rod(np.column_stack([np.zeros(n), np.linspace(-0.05, 0.05, n), np.full(n, 0.1)]), radius=r)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, rest + drop), wp.quat_identity()))
+    builder.add_shape_box(body, hx=hx, hy=hx, hz=hx, cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.5))
+    model, solver, pipeline, s0, s1 = _proxy_scene(builder, body, rod, 0.5, fixed=True)
+    contacts = pipeline.contacts()
+    feedback = solver._proxy_mappings[0].coupling_forces
+    weight = float(model.body_mass.numpy()[body] * 9.81)
+    z, vz, f = [], [], []
+    for k in range(600):
+        s0.clear_forces()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, None, contacts, 2.0e-3)
+        s0, s1 = s1, s0
+        z.append(s0.body_q.numpy()[body, 2])
+        vz.append(s0.body_qd.numpy()[body, 2])
+        if k >= 500:
+            f.append(feedback.numpy()[body, 2])
+    impact = -min(vz)
+    print("impact", impact, "rebound", max(vz[int(np.argmin(vz)):]), "z", z[-1] - rest, min(z) - rest, "f", np.mean(f) / weight)
+    assert max(vz[int(np.argmin(vz)):]) < 0.05 * impact, (max(vz), impact)
+    assert abs(z[-1] - rest) < 0.25 * r, (z[-1], rest)
+    assert min(z) > rest - r, (min(z), rest)
+    assert abs(np.mean(f) - weight) < 1.0e-2 * weight, (np.mean(f), weight)
 
 
 @pytest.mark.usefixtures("needs_cuda")

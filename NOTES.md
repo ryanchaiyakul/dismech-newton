@@ -47,6 +47,15 @@ contacts: bypasses OGC, not for us).
   responses, not only F/m_eff: extrapolation feeds them back.
 - `DM_EXTRAP=2` (gravity only): grips 4.83 as plain staggered.
 
+## Round 3: lagged passes vs the grip (2026-11-08; grip_trace.py, sci6000 iters logs)
+
+Iterations on the failing tests (PEND=0): momentum exact from 3 passes; MIDAS ok at 2-4; grips worse with passes
+(x2 4.71-5.26, x3 4.74-5.38, x4 4.62-5.38, x4 Aitken 4.61-5.44). Trace (pick-place, held, 1/600 s): x1 5.00 +- 0.01;
+x2 alternates step to step (-4.82 / -5.34 converged per step; per-pass slope 0.46). Not fixed by relaxation 0.5/0.7,
+starting at MuJoCo's pose (DM_SYNC), offset out (DM_NODC: worse), mass_scale 2.9 (worse). Solves all converged.
+Finger: model 0.029 kg, proxy 0.0855 kg, PD ke 1000 kd 100 implicitfast: step response ~0.2 kg + articulation.
+Diagnosis: wrong interface impedance (partitioned-coupling literature). Next: scratch/handoffs/proxy-coupling-principled.md.
+
 ## Conclusion (round 1)
 
 No option passes all gates. Staggered is the right impact physics but loses steady servo forces and breaks the

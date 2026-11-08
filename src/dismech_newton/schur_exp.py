@@ -141,11 +141,13 @@ def install():
         a = self._arm
         W, k = a.M.shape[0], self.k
         Minv_old = a.Minv.numpy().astype(np.float64)
-        Minv = _select(S) + EPS * Minv_old
+        Minv_s = _select(S)
+        Minv = Minv_s + EPS * Minv_old
         M = np.linalg.inv(Minv)
         pred = a.pred.numpy().astype(np.float64).reshape(W, k)
         F = getattr(self, "_schur_F", np.zeros((W, k)))
-        pred += h * h * np.einsum("wij,wj->wi", Minv_old - Minv, F)
+        rewind = Minv_s if os.environ.get("DM_SCHUR_REWIND", "s") == "s" else Minv  # the source's own response
+        pred += h * h * np.einsum("wij,wj->wi", Minv_old - rewind, F)
         a.M.assign(M.astype(np.float32))
         a.Minv.assign(Minv.astype(np.float32))
         a.pred.assign(pred.reshape(-1).astype(np.float32))

@@ -305,6 +305,7 @@ class Bodies:
     margin: wp.array[float]
     mu: wp.array[float]
     kh: wp.array[float]  # a hydroelastic pad's (Newton's is_hydroelastic) pressure per depth [N/m^3], 0 off pads
+    depth: wp.array[float]  # and its thickness over its core (its margin)
     radius: wp.array[float]
     shapes: wp.array[wp.int32]
     world_ptr: wp.array[wp.int32]
@@ -329,15 +330,19 @@ def _bodies(model: Model, device) -> Bodies:
     pad = (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
     kh = model.shape_material_kh.numpy() if pad.any() else np.zeros(len(kind))
     margin = model.shape_margin.numpy().copy()
+    depth = margin.copy()
     if os.environ.get("DM_PADS"):  # EXPERIMENT: DM_PADS=kh,h,pattern pads the shapes of bodies labelled *pattern*
-        kp, hp, pat = os.environ["DM_PADS"].split(",")
+        kp, hp, pat, *inward = os.environ["DM_PADS"].split(",")  # ,in: the pad inside the margin (same geometry)
         labels = list(model.body_label)
         sel = np.array([bb >= 0 and pat in labels[bb] for bb in body])
         pad, kh = pad | sel, np.where(sel, float(kp), kh)
-        margin = np.where(sel, margin + float(hp), margin)
-        b.margin = wp.array(margin, dtype=float, device=device)
+        depth = np.where(sel, float(hp), depth)
+        if not inward:
+            margin = np.where(sel, margin + float(hp), margin)
+            b.margin = wp.array(margin, dtype=float, device=device)
         print(f"DM_PADS: {sel.sum()} shapes padded: kh {kp} h {hp}", flush=True)
     b.kh = wp.array(np.where(pad, kh, 0.0), dtype=float, device=device)
+    b.depth = wp.array(depth, dtype=float, device=device)
     # the cull sphere about the shape's origin; Newton's mesh radius is about its AABB's centre: a mesh's from its
     # vertices (unculled without them)
     radius = model.shape_collision_radius.numpy().copy()
@@ -736,9 +741,9 @@ def _keep_shape(sc: Scene, own: int, k: int, side: int, pair: wp.vec4i, w: wp.ve
     kh = sc.b.kh[k]
     if kh > 0.0 and pair[1] < 0:  # a pad's node: Winkler's cylinder (Johnson, Contact Mechanics 1985) or face
         if sc.m.rod[v] >= 0:
-            pad = wp.vec3(kh * sc.m.area[v] * (8.0 / 15.0) * wp.sqrt(2.0 * sc.m.radius[v]), 2.5, sc.b.margin[k])
+            pad = wp.vec3(kh * sc.m.area[v] * (8.0 / 15.0) * wp.sqrt(2.0 * sc.m.radius[v]), 2.5, sc.b.depth[k])
         else:
-            pad = wp.vec3(0.5 * kh * sc.m.area[v], 2.0, sc.b.margin[k])
+            pad = wp.vec3(0.5 * kh * sc.m.area[v], 2.0, sc.b.depth[k])
     _keep(sc, own, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]), _sweep(sc.b, k), pad)
 
 

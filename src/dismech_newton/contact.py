@@ -3,8 +3,8 @@
 A contact is a pair ``(vec4i nodes, vec4 w)``: ``C q = sum_k w_k x_k - anchor = x_a - x_b``; side ``a`` holds the
 nodes of positive weight, side ``b`` those of negative weight (a point on an edge or a triangle, or a node) or the
 anchor alone. ``-1`` marks an unused node. :class:`BarrierBlock` owns the contact law (a barrier on the gap, lagged
-friction, each pair's stiffness); where contacts come from is :mod:`.collide`'s, whose source fills the
-:class:`Slots`.
+friction, each pair's stiffness) and the pair list; where contacts come from is :mod:`.collide`'s, whose source
+appends them to the :class:`Slots`.
 """
 
 from typing import Any
@@ -21,22 +21,26 @@ SMOOTH = wp.constant(0.02)  # the barrier's activation margin above the thicknes
 LOAD = wp.constant(0.25)  # a node's pairs are stiffened until they hold its load at most this many thicknesses deep
 GROW = wp.constant(2.0)  # a node's load scale grows at most this factor per step
 DECAY = wp.constant(0.99)  # and relaxes by this factor per step, toward 1
-IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
 MAX_SCALE = wp.constant(1.0e5)  # and stays below this (unbounded, it spreads pair to pair and overflows k)
 CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most this many k (its log's: d >= tau/10)
 STIFFNESS = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
 SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
 LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
+IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
+NONE = wp.constant(wp.int64(9223372036854775807))  # an empty place's sort key
 
 
 @wp.struct
 class Slots:
     """Per contact: ``pair`` with weights ``w``, the normal from ``b`` to ``a``, the anchor, the start ``c0`` of
     ``C q`` (minus the anchor's motion), the thickness, friction coefficient, lagged normal force ``rho``,
-    stiffness and multiplier ``lam``; ``key``: the other feature, which a source keeps each contact once by;
-    ``roll``, ``ta``, ``tb``: its rod edges' surface turn (:func:`roll_point`)."""
+    stiffness and multiplier ``lam``; ``own``, ``key``: its feature and the other one, which the list is sorted and
+    its multipliers carried by; ``roll``, ``ta``, ``tb``: its rod edges' surface turn (:func:`roll_point`); ``world``:
+    its world."""
 
     active: wp.array[wp.int32]
+    own: wp.array[wp.int32]
+    world: wp.array[wp.int32]
     pair: wp.array[wp.vec4i]
     w: wp.array[wp.vec4]
     normal: wp.array[wp.vec3]
@@ -309,27 +313,31 @@ class BarrierBlock:
     contact), and lagged smoothed Coulomb friction (IPC), ``mu lam f0(|slip|)`` with the normal force ``lam`` at the
     step's start and ``f0`` smoothed over :data:`SLIP_SPEED` ``dt``. Each pair's ``k`` is :data:`STIFFNESS` times its
     inertia ``1 / (dt^2 C M^-1 C^T)`` (a light sheet vertex and a rod node alike: Newton sees the contact coming),
-    times its nodes' load scale (:func:`_lag_kernel`). The source finds every pair within its reach (no prediction);
-    the solver caps each node's move per detection so no pair beyond it can close."""
+    times its nodes' load scale (:func:`_lag_kernel`). The source appends every pair within its reach (no
+    prediction) to one list; the solver caps each node's move per detection so no pair beyond it can close (Divide
+    and Truncate's isotropic region: a pair's frozen gap is linear in ``q``, so the line search's energy keeps every
+    found pair from passing). The list is sorted by its pairs' features after each detection (a pair found twice kept
+    once), and each pair's multiplier carried by them into the next detection."""
 
     def __init__(self, model: Model, fixed: wp.array, source, dof_world: np.ndarray, stride: int):
         self.fixed, self.device, self.source = fixed, wp.get_device(model.device), source
         self.stiffness, self.slip_speed, self.slip = STIFFNESS, SLIP_SPEED, 0.0
-        self.count = source.slots()
+        self.count = source.capacity()
         size = max(self.count, 1)
         self.s = _slots(size, self.device)
         nw, self.stride = int(dof_world.max(initial=0)) + 1, stride  # the worlds; per-world sums a[w stride + k]
         self.num_worlds = nw
-        world = np.zeros(1, np.int32)
-        if self.count:  # per slot its world: its feature's (a node, an edge's first node)
-            nodes = np.concatenate([np.arange(source.num_nodes), source.mesh.edges.numpy()[:, 0]])
-            world = np.repeat(dof_world[3 * nodes], source.scene.slots)
-        self.world = wp.array(world, dtype=wp.int32, device=self.device)
+        self.world = self.s.world
         self.touching = wp.zeros(1, dtype=wp.int32, device=self.device)  # a pair has curvature at the last grad's q
         self.scale = wp.ones(max(model.particle_count, 1), dtype=float, device=self.device)  # nodes' load scales
-        self.block = source.scene.slots if self.count else 1  # a feature's slots
-        self.lam = wp.zeros(size, dtype=float, device=self.device)  # the last step's multipliers, by slot and key
-        self.lam_key = wp.full(size, -1, dtype=wp.int32, device=self.device)
+        self.lam = wp.zeros(size, dtype=float, device=self.device)  # per pair, the multiplier kept for the next
+        # detection and step; the list's sort (keys, places; twice the size: the radix sort's) and the last
+        # detection's sorted keys and kept multipliers, which the next one's pairs look theirs up in
+        self.sort_key = wp.full(2 * size, NONE, dtype=wp.int64, device=self.device)
+        self.sort_at = wp.zeros(2 * size, dtype=wp.int32, device=self.device)
+        self.held_key = wp.full(size, NONE, dtype=wp.int64, device=self.device)
+        self.held_lam = wp.zeros(size, dtype=float, device=self.device)
+        self.prims = getattr(source, "num_prims", 1)
         # per world: a multiplier moved its pair past tolerance; moved[nw]: in any world
         self.moved = wp.zeros(nw + 1, dtype=wp.int32, device=self.device)
         self.any_moved = self.moved[nw:]
@@ -345,10 +353,10 @@ class BarrierBlock:
         """No multipliers or load scales carried into the next step (in the worlds of ``mask``, ``node_world`` per
         DOF: a node ``n``'s at ``3 n``)."""
         if mask is None:
-            self.lam_key.fill_(-1)
+            self.lam.zero_()
             self.scale.fill_(1.0)
             return
-        self._launch(_forget_kernel, [self.world, mask, self.lam_key])
+        self._launch(_forget_kernel, [self.world, mask, self.lam])
         wp.launch(_unscale_kernel, dim=self.scale.shape[0], inputs=[node_world, mask, self.scale], device=self.device)
 
     def begin_step(self, state_in: State, dt: float, mass: wp.array, unsettled: wp.array) -> None:
@@ -366,13 +374,17 @@ class BarrierBlock:
         """The pairs near ``q`` (the step's start or an iterate), their normals there and lagged normal forces; a
         shape's pair starts at least ``lift`` thicknesses from its barrier's zero (an iterate's only if undetected).
         At the step's ``start``, loaded pairs raise their nodes' load scales."""
-        if self.count:
-            self.source.fill(state_in, self.dt, q, self.s)
+        if not self.count:
+            return
+        self._launch(_hold_kernel, [self.sort_key, self.sort_at, self.lam, self.held_key, self.held_lam])
+        self.source.fill(state_in, self.dt, q, self.s)
+        self._launch(_sort_key_kernel, [self.s, self.prims, self.sort_key, self.sort_at])
+        wp.utils.radix_sort_pairs(self.sort_key, self.sort_at, self.count)
+        self._launch(_carry_kernel, [self.sort_key, self.sort_at, self.held_key, self.held_lam, self.s, self.lam])
         self._launch(_rebase_kernel, [q, state_in.dismech.q, self.s])
-        self._launch(_carry_kernel, [self.block, self.lam, self.lam_key, self.s])
         self._launch(_lift_kernel, [q, lift, self.s, self.arm])
         self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.mass, self.fixed, self.scale,
-                                   int(start), self.unsettled, self.world, self.s, self.arm])
+                                   int(start), self.unsettled, self.s, self.arm])
 
     def snapshot(self) -> Slots | None:
         """This step's active pairs, gathered for its adjoint if any carries force at its end (one host read; two if
@@ -396,14 +408,14 @@ class BarrierBlock:
         step's end, whether its solve converged or not. Per world, in the worlds of ``mask``; ``go[num_worlds]``: any
         world goes on."""
         self.moved.zero_()
-        self._launch(_uzawa_kernel, [q, self.s, self.arm, self.world, mask, tol, self.lam, self.lam_key, self.moved])
+        self._launch(_uzawa_kernel, [q, self.s, self.arm, mask, tol, self.lam, self.moved])
         wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, pick, tol, int(converged), self.num_worlds,
                   mask, self.left, self.moved, go], device=self.device)
-        self._launch(_apply_kernel, [self.moved, self.lam, self.world, self.s])
+        self._launch(_apply_kernel, [self.moved, self.lam, self.s])
 
     def end_step(self) -> None:
         """The multipliers the step solved with, kept for the next (an update it did not solve with would kick)."""
-        self._launch(_keep_kernel, [self.s, self.lam, self.lam_key])
+        self._launch(_keep_kernel, [self.s, self.lam])
 
     def assemble(self, q: wp.array, A) -> None:
         self._launch(_barrier_assemble_kernel, [q, self.s, self.arm, self.slip, self.fixed, 0, A.indptr, A.indices,
@@ -412,20 +424,26 @@ class BarrierBlock:
             wp.launch(_arm_assemble_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[self.arm, A.indptr,
                       A.indices, A.vals], device=self.device)
 
+    def correction(self, q: wp.array, p: wp.array, y: wp.array, some: wp.array) -> None:
+        """``y += D p``: the pairs' Hessian less ``A``'s: friction exact along the slip (``A``: its majorizer) and a
+        two-sided pair's cross terms (``A``: twice each side's own blocks, the pattern's); ``some[w]``: ``D != 0`` in
+        world ``w`` (not cleared)."""
+        self._launch(_correction_kernel, [q, self.s, self.arm, self.slip, self.fixed, p, y, some])
+
     def impact(self, q: wp.array, dq: wp.array, t: wp.array) -> None:
         """``t = min(t, ...)`` the line search's longest step along ``-dq`` (each pair's gap ``d`` is linear in it, on
         the frozen normal): :data:`IMPACT` of the length at which a touching pair's gap would reach the barrier's
         zero (IPC's filter), or the length at which an untouched pair reaches its barrier's full curvature (the Newton
         step, built without the pair's curvature, holds only that far)."""
-        self._launch(_impact_kernel, [q, dq, self.s, self.arm, self.world, t])
+        self._launch(_impact_kernel, [q, dq, self.s, self.arm, t])
 
     def newton_size(self, q: wp.array, dq: wp.array, cap: float, size: wp.array) -> None:
         """``size = max(size, e''(d) |n . C dq| h^2 / m)`` over the pairs: the Newton step's change of each pair's
         normal force as the move it would give the pair's mass ``m = 1 / (C M^-1 C^T)`` in a step (its force error,
         comparable to the nodes' moves: the stopping test), relative to ``cap`` plus the force the pair holds (as a
         move too): a loaded pair's force converges to a relative tolerance."""
-        self._launch(_newton_size_kernel, [q, dq, self.s, self.arm, self.world, self.mass, self.fixed,
-                                           self.dt * self.dt, cap, size])
+        self._launch(_newton_size_kernel, [q, dq, self.s, self.arm, self.mass, self.fixed, self.dt * self.dt, cap,
+                                           size])
 
     def grad(self, q: wp.array, b: wp.array) -> None:
         self.touching.zero_()
@@ -446,7 +464,7 @@ class BarrierBlock:
                       inputs=[q, self.arm, ulp, load, floor], device=self.device)
 
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
-        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.world, self.stride, self.slip, energy],
+        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.stride, self.slip, energy],
                      dim=(q_cand.shape[0], padded(self.count)))
         if self.arm.k:
             wp.launch(_arm_energy_kernel, dim=(q_cand.shape[0], padded(self.arm.M.shape[0] * self.arm.k)),
@@ -540,7 +558,7 @@ def _decay_kernel(scale: wp.array[float]):
 
 @wp.kernel
 def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scale: wp.array[float], grow: int,
-                unsettled: wp.array[wp.int32], world: wp.array[wp.int32], s: Slots, arm: Arm):
+                unsettled: wp.array[wp.int32], s: Slots, arm: Arm):
     """The pair's stiffness ``c / (C M^-1 C^T)`` (``c``: stiffness / dt^2) times its
     nodes' largest load scale, and its normal force at the step's start (in ``rho``): friction's ``lam``. At a step's
     start (``grow``), a pair compressed deeper than :data:`LOAD` thicknesses raises its nodes' scales (at most
@@ -554,7 +572,7 @@ def _lag_kernel(c: float, mass: wp.array[float], fixed: wp.array[wp.int32], scal
         k = c / wp.max(flexibility(s.pair[i], s.w[i], mass, fixed) + arm_flexibility(arm, s, i), 1.0e-30) * sc
         x = s.thickness[i] - wp.dot(s.normal[i], s.c0[i]) + s.lam[i] / k  # its compression at the step's start
         # (the multiplier's force as the barrier's compression)
-        if grow != 0 and unsettled[world[i]] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs
+        if grow != 0 and unsettled[s.world[i]] == 0 and x > LOAD * s.thickness[i]:  # deeper than LOAD: stiffer pairs
             up = wp.min(sc * wp.min(GROW, x / (LOAD * s.thickness[i])), MAX_SCALE)
             for j in range(4):
                 if s.pair[i][j] >= 0:
@@ -592,13 +610,18 @@ def contact_hessian(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     n = s.normal[i]
     nn = wp.outer(n, n)
     g, h, fr = _barrier_force(c, s, i, eps)
-    H = h * nn + fr * (wp.identity(3, float) - nn)
-    slip = _slip(c, s.c0[i], n)
+    return h * nn + fr * (wp.identity(3, float) - nn) + _along_slip(c, s, i, eps)
+
+
+@wp.func
+def _along_slip(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
+    """Friction's exact curvature along the slip less its majorizer's: ``mu rho (f1' - f1 / y) t t^T``."""
+    slip = _slip(c, s.c0[i], s.normal[i])
     y = wp.length(slip)
-    if y > 0.0:  # f1' - f1 / y along the slip
-        t = slip / y
-        H = H - s.mu[i] * s.rho[i] * wp.where(y < eps, y / (eps * eps), 1.0 / y) * wp.outer(t, t)
-    return H
+    if y == 0.0:
+        return wp.mat33()
+    t = slip / y
+    return -s.mu[i] * s.rho[i] * wp.where(y < eps, y / (eps * eps), 1.0 / y) * wp.outer(t, t)
 
 
 @wp.kernel
@@ -635,6 +658,74 @@ def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, loa
         wp.atomic_add(load, k + 3, wp.length(wp.cross(s.anchor[i] - arm.com[body], g)))
 
 
+@wp.func
+def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
+    """The pair's Hessian as ``A`` holds it (with respect to ``C q = c``): the barrier's curvature capped, friction's
+    majorized along the slip (``f1 / y``)."""
+    n = s.normal[i]
+    g, h, fr = _barrier_force(c, s, i, eps)
+    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
+    return h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
+
+
+@wp.kernel
+def _correction_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
+                       p: wp.array[wp.float64], y: wp.array[wp.float64], some: wp.array[wp.int32]):
+    """``y += D p``: per pair ``C^T H C p`` (``H`` its majorizer with friction exact along the slip) less ``A``'s
+    part: ``C^T H_A C`` (one-sided), or twice each side's own blocks (two-sided: :func:`_barrier_assemble_kernel`);
+    ``some[w] = 1`` if a pair of world ``w`` has ``D != 0``."""
+    i = wp.tid()
+    if s.active[i] == 0:
+        return
+    pair = s.pair[i]
+    w = s.w[i]
+    c = pair_point(q, s, i, arm, s.anchor[i])
+    two = wp.min(w) < 0.0
+    D = _along_slip(c, s, i, eps)
+    if not two and D[0, 0] == 0.0 and D[1, 1] == 0.0 and D[2, 2] == 0.0:
+        return  # one-sided, not sliding: A holds it exactly
+    HA = _majorizer(c, s, i, eps)
+    if HA[0, 0] == 0.0 and HA[1, 1] == 0.0 and HA[2, 2] == 0.0:
+        return  # untouched
+    some[s.world[i]] = 1
+    up = wp.vec3(0.0)  # C p: the positive side's part, the negative's
+    un = wp.vec3(0.0)
+    for a in range(4):
+        na = pair[a]
+        if na >= 0:
+            pa = wp.vec3(0.0)
+            for k in range(3):
+                if fixed[3 * na + k] == 0:
+                    pa[k] = float(p[3 * na + k])
+            if w[a] < 0.0:
+                un += slot_map(s, i, a) * pa
+            else:
+                up += slot_map(s, i, a) * pa
+    body = arm_body(arm, s, i)
+    r = wp.vec3(0.0)
+    if body >= 0:
+        r = s.anchor[i] - arm.com[body]
+        k0 = arm.base[body]
+        up -= wp.vec3(float(p[k0]), float(p[k0 + 1]), float(p[k0 + 2])) + wp.cross(
+            wp.vec3(float(p[k0 + 3]), float(p[k0 + 4]), float(p[k0 + 5])), r)
+    vp = (HA + D) * (up + un)
+    vn = vp
+    if two:
+        vp = vp - 2.0 * (HA * up)
+        vn = vn - 2.0 * (HA * un)
+    else:
+        vp = D * up
+    for a in range(4):
+        na = pair[a]
+        if na >= 0:
+            v = wp.transpose(slot_map(s, i, a)) * wp.where(w[a] < 0.0, vn, vp)
+            for k in range(3):
+                if fixed[3 * na + k] == 0:
+                    wp.atomic_add(y, 3 * na + k, wp.float64(v[k]))
+    if body >= 0:
+        arm_scatter(y, arm, body, r, vp)
+
+
 @wp.kernel
 def _barrier_assemble_kernel(
     q: wp.array[float],
@@ -654,10 +745,7 @@ def _barrier_assemble_kernel(
         return
     pair = s.pair[i]
     w = s.w[i]
-    n = s.normal[i]
-    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
-    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
-    H = h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
+    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
     f = float(1.0)
     for j in range(4):
         if pair[j] >= 0 and w[j] < 0.0:
@@ -686,8 +774,7 @@ def _barrier_assemble_kernel(
 
 
 @wp.kernel
-def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32],
-                   t: wp.array[float]):
+def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, t: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
@@ -699,15 +786,14 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
         k = s.stiffness[i]
         if barrier(d, th, k, s.lam[i])[2] == 0.0:  # untouched: Newton did not see it, so its step holds only to
             # the ramp's end, where the barrier is at full curvature (th + lam / k: past it, the multiplier's force)
-            wp.atomic_min(t, world[i], (d - th - s.lam[i] / k) / approach)
+            wp.atomic_min(t, s.world[i], (d - th - s.lam[i] / k) / approach)
         else:
-            wp.atomic_min(t, world[i], IMPACT * d / approach)
+            wp.atomic_min(t, s.world[i], IMPACT * d / approach)
 
 
 @wp.kernel
-def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32],
-                        mass: wp.array[float], fixed: wp.array[wp.int32], h2: float, cap: float,
-                        size: wp.array[float]):
+def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, mass: wp.array[float],
+                        fixed: wp.array[wp.int32], h2: float, cap: float, size: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
@@ -721,17 +807,17 @@ def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: 
     # pair's mass in a step
     df = e[2] * wp.abs(wp.dot(n, pair_point(dq, s, i, arm, wp.vec3(0.0)))) * m
     f = -e[1] * m
-    wp.atomic_max(size, world[i], df * cap / (cap + f))  # within tol of the inertial scale (cap) plus the force it holds
+    wp.atomic_max(size, s.world[i], df * cap / (cap + f))  # within tol of the inertial scale (cap) plus its force
 
 
 @wp.kernel
-def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, world: wp.array[wp.int32], stride: int,
-                           eps: float, energy: wp.array[wp.float64]):
+def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, stride: int, eps: float,
+                           energy: wp.array[wp.float64]):
     j, i = wp.tid()
     e = wp.float64(0.0)
     w = int(-1)
     if i < s.active.shape[0]:
-        w = world[i]
+        w = s.world[i]
     if i < s.active.shape[0] and s.active[i] != 0:
         c = pair_point(q_cand[j], s, i, arm, s.anchor[i])
         n = s.normal[i]
@@ -741,46 +827,80 @@ def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, world:
 
 
 @wp.kernel
-def _carry_kernel(block: int, lam: wp.array[float], lam_key: wp.array[wp.int32], s: Slots):
-    """A pair's multiplier from the last step's, kept by its feature's slots under its key; zero if new."""
-    i = wp.tid()
-    s.lam[i] = 0.0
-    if s.active[i] == 0:
-        return
-    base = (i // block) * block
-    for j in range(base, base + block):
-        if lam_key[j] == s.key[i] and lam_key[j] >= 0:
-            s.lam[i] = lam[j]
+def _hold_kernel(sort_key: wp.array[wp.int64], sort_at: wp.array[wp.int32], lam: wp.array[float],
+                 held_key: wp.array[wp.int64], held_lam: wp.array[float]):
+    """Before a detection: the list's sorted keys and its pairs' kept multipliers, for the next list to look up."""
+    j = wp.tid()
+    held_key[j] = sort_key[j]
+    held_lam[j] = wp.where(sort_key[j] != NONE, lam[sort_at[j]], 0.0)
 
 
 @wp.kernel
-def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, world: wp.array[wp.int32], mask: wp.array[wp.int32],
-                  tol: float, lam: wp.array[float], lam_key: wp.array[wp.int32], moved: wp.array[wp.int32]):
+def _sort_key_kernel(s: Slots, prims: int, sort_key: wp.array[wp.int64], sort_at: wp.array[wp.int32]):
+    """Pair ``i``'s key: its features ``own * prims + key`` (none: :data:`NONE`, sorted last)."""
+    i = wp.tid()
+    sort_key[i] = NONE
+    if s.active[i] != 0:
+        sort_key[i] = wp.int64(s.own[i]) * wp.int64(prims) + wp.int64(s.key[i])
+    sort_at[i] = i
+
+
+@wp.kernel
+def _carry_kernel(sort_key: wp.array[wp.int64], sort_at: wp.array[wp.int32], held_key: wp.array[wp.int64],
+                  held_lam: wp.array[float], s: Slots, lam: wp.array[float]):
+    """Per sorted place: a pair found twice (through two triangles) kept once; its multiplier the last detection's
+    pair's of the same features (binary search: the first, the kept one), else zero."""
+    j = wp.tid()
+    key = sort_key[j]
+    if key == NONE:
+        return
+    i = sort_at[j]
+    s.lam[i] = 0.0
+    lam[i] = 0.0
+    if j > 0:
+        if sort_key[j - 1] == key:
+            s.active[i] = 0
+            return
+    lo = int(0)
+    hi = held_key.shape[0]
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if held_key[mid] < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo < held_key.shape[0]:
+        if held_key[lo] == key:
+            s.lam[i] = held_lam[lo]
+            lam[i] = held_lam[lo]
+
+
+@wp.kernel
+def _uzawa_kernel(q: wp.array[float], s: Slots, arm: Arm, mask: wp.array[wp.int32], tol: float,
+                  lam: wp.array[float], moved: wp.array[wp.int32]):
     """``lam <- max(0, lam + k (th - d))`` into the store: the quadratic's force at ``q`` less the ``k dl / 2`` its
     barrier alone holds at the thickness (the ramp's middle), so the pair holds it there (the augmented Lagrangian's
     update); the log's force below ``th / 2`` is not taken (at an unconverged iterate it diverges, and through the
     load scale stiffens every later step). ``moved`` (its world's) if that moves its rest by more than ``tol``. Only
     in the worlds of ``mask``."""
     i = wp.tid()
-    if mask[world[i]] == 0:
+    if mask[s.world[i]] == 0:
         return
-    lam_key[i] = -1
     lam[i] = 0.0
     if s.active[i] == 0:
         return
     th, k = s.thickness[i], s.stiffness[i]
     d = wp.dot(s.normal[i], pair_point(q, s, i, arm, s.anchor[i]))
-    lam_key[i] = s.key[i]
     lam[i] = wp.max(0.0, s.lam[i] + k * (th - d))
     if wp.abs(lam[i] - s.lam[i]) > k * tol:
-        moved[world[i]] = 1
+        moved[s.world[i]] = 1
 
 
 @wp.kernel
-def _forget_kernel(world: wp.array[wp.int32], mask: wp.array[wp.bool], lam_key: wp.array[wp.int32]):
+def _forget_kernel(world: wp.array[wp.int32], mask: wp.array[wp.bool], lam: wp.array[float]):
     i = wp.tid()
     if mask[world[i]]:
-        lam_key[i] = -1
+        lam[i] = 0.0
 
 
 @wp.kernel
@@ -791,10 +911,9 @@ def _unscale_kernel(node_world: wp.array[wp.int32], mask: wp.array[wp.bool], sca
 
 
 @wp.kernel
-def _keep_kernel(s: Slots, lam: wp.array[float], lam_key: wp.array[wp.int32]):
+def _keep_kernel(s: Slots, lam: wp.array[float]):
     i = wp.tid()
-    lam_key[i] = wp.where(s.active[i] != 0, s.key[i], -1)
-    lam[i] = s.lam[i]
+    lam[i] = wp.where(s.active[i] != 0, s.lam[i], 0.0)
 
 
 @wp.kernel
@@ -814,9 +933,9 @@ def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float,
 
 
 @wp.kernel
-def _apply_kernel(moved: wp.array[wp.int32], lam: wp.array[float], world: wp.array[wp.int32], s: Slots):
+def _apply_kernel(moved: wp.array[wp.int32], lam: wp.array[float], s: Slots):
     i = wp.tid()
-    if moved[world[i]] != 0 and s.active[i] != 0:
+    if moved[s.world[i]] != 0 and s.active[i] != 0:
         s.lam[i] = lam[i]
 
 

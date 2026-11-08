@@ -1,0 +1,48 @@
+== DM_PROXY=0 DM_MODE=lagged
+9 passed, 11 warnings in 143.08s (0:02:23)
+  tramp1:     raise AssertionError(f"body {body_index} fell more than 1 m below the pinned sheet (z={z:.3f})")
+  tramp1: AssertionError: body 2 fell more than 1 m below the pinned sheet (z=-44.661)
+  tramp1 exit 0
+  tramp2 exit 0
+  tramp3 exit 0
+  tramp4 exit 0
+== DM_PROXY=1 DM_MODE=lagged
+E   AssertionError: np.float32(0.00090839824)
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\tests\test_coupling.py:202: AssertionError: np.float32(0.00090839824)
+E   AssertionError: grip 4.832-4.841 N, servo 5.000 N
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\newton\franka_cable_ik_pick_place.py:221: AssertionError: grip 4.832-4.841 N, servo 5.000 N
+E   AssertionError: (np.float32(4.8086557), np.float32(4.8214684), 5.0)
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\tests\test_coupling.py:341: AssertionError: (np.float32(4.8086557), np.float32(4.8214684), 5.0)
+3 failed, 6 passed, 11 warnings in 130.19s (0:02:10)
+  tramp1:     raise AssertionError(f"body {body_index} fell more than 1 m below the pinned sheet (z={z:.3f})")
+  tramp1: AssertionError: body 2 fell more than 1 m below the pinned sheet (z=-49.038)
+  tramp1 exit 0
+  tramp2:     raise AssertionError(f"body {body_index} fell more than 1 m below the pinned sheet (z={z:.3f})")
+  tramp2: AssertionError: body 2 fell more than 1 m below the pinned sheet (z=-38.351)
+  tramp2 exit 0
+  tramp3 exit 0
+  tramp4 exit 0
+== DM_PROXY=0 DM_MODE=staggered
+E   AssertionError: np.float32(0.043408614)
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\tests\test_coupling.py:202: AssertionError: np.float32(0.043408614)
+E   AssertionError: grip 4.829-4.840 N, servo 5.000 N
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\newton\franka_cable_ik_pick_place.py:221: AssertionError: grip 4.829-4.840 N, servo 5.000 N
+E   AssertionError: push / mu sum N: mean 0.773, -0.186-0.957
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\midas_axial.py:177: AssertionError: push / mu sum N: mean 0.773, -0.186-0.957
+E   AssertionError: grip 1.661-2.376 N, servo 2.000 N
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\newton\cloth_franka_fold.py:235: AssertionError: grip 1.661-2.376 N, servo 2.000 N
+E   AssertionError: (np.float32(4.828682), np.float32(4.841853), 5.0)
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\tests\test_coupling.py:341: AssertionError: (np.float32(4.828682), np.float32(4.841853), 5.0)
+5 failed, 4 passed, 11 warnings in 143.94s (0:02:23)
+  tramp1:     raise AssertionError(f"cloth penetrated a rigid body by {self.max_penetration:.6f} m")
+  tramp1: AssertionError: cloth penetrated a rigid body by 0.002464 m
+  tramp1 exit 0
+  tramp2:     raise AssertionError("simulation produced non-finite state")
+  tramp2: AssertionError: simulation produced non-finite state
+  tramp2 exit 0
+  tramp3:     raise AssertionError("simulation produced non-finite state")
+  tramp3: AssertionError: simulation produced non-finite state
+  tramp3 exit 0
+  tramp4:     raise AssertionError("simulation produced non-finite state")
+  tramp4: AssertionError: simulation produced non-finite state
+  tramp4 exit 0

@@ -49,6 +49,7 @@ class ElementBlock:
         self.P, self.z, self.u, self.eps_prev = (wp.zeros(self.count, dtype=vec, device=self.device) for _ in range(4))
         self.eps_cand = wp.zeros((num_candidates, self.count), dtype=vec, device=self.device)
         self.worlds = None  # Worlds, the solver's
+        self.anchor = None  # per DOF, the stiffness assembly drops coupling it to a fixed DOF (the solver's)
 
     def _launch(self, kernel, inputs, outputs, dim=None):
         wp.launch(kernel, dim=dim or self.count, inputs=inputs, outputs=outputs, device=self.device)
@@ -77,7 +78,8 @@ class ElementBlock:
         self._launch(self.k.measure, [s.q, self.bind(s)], [getattr(s, self.stored)])
 
     def assemble(self, q: wp.array, A: SymmetricCSR) -> None:
-        self._launch(self.k.assemble, [q, self.view, self.P, self.z, self.u, self.fixed], [self.slots, A.vals])
+        self._launch(self.k.assemble, [q, self.view, self.P, self.z, self.u, self.fixed],
+                     [self.slots, A.vals, self.anchor])
 
     def grad(self, q: wp.array, b: wp.array) -> None:
         self._launch(self.k.grad, [q, self.view, self.P, self.z, self.u, self.fixed], [b])
@@ -187,9 +189,11 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         fixed: wp.array[wp.int32],
         slots: wp.array2d[wp.int32],
         vals: wp.array[wp.float64],
+        anchor: wp.array[float],
     ):
         """``J^T P J`` (Gauss-Newton; plus ``geometric``'s ``G (x) I3``) into the upper CSR; ``slots``:
-        :meth:`SymmetricCSR.slots` of the DOFs."""
+        :meth:`SymmetricCSR.slots` of the DOFs. ``anchor``: a free DOF's coupling to a fixed one, dropped from ``A``:
+        the support's force there is resolved only to it times the free coordinate's float32 ulp."""
         i = wp.tid()
         eps, J = jacobian(local(q, v, i), v, i)
         d = dofs(v, i)
@@ -210,6 +214,8 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
                         val = val + G[a // 3, c // 3]
                 if val != 0.0 and free[a] != 0 and free[c] != 0:
                     wp.atomic_add(vals, slots[triu_slot(a, c, D), i], wp.float64(val))
+                if free[a] != free[c]:
+                    wp.atomic_add(anchor, d[wp.where(free[a] != 0, a, c)], wp.abs(val))
 
     @wp.kernel(module="unique")
     def grad(

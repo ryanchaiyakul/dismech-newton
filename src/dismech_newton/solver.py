@@ -40,6 +40,7 @@ from .state import (
 
 _C1 = 1.0e-4  # Armijo's sufficient decrease
 _NOISE = 1.0e-5  # a rise of the objective within its float32 rounding
+CG = 8  # Newton-CG's conjugate-gradient steps per iteration at most (Eisenstat-Walker stops them sooner)
 LINESEARCH = 4  # step lengths tried per iteration, halving from 1 (1: the full chord step)
 FINISH = 3  # a step's last iterations, after its multipliers are updated whether it has converged or not
 # the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
@@ -47,6 +48,7 @@ FINISH = 3  # a step's last iterations, after its multipliers are updated whethe
 TOLERANCE = 0.01
 ULP = 1.0e-6  # float32's reach: a few of its epsilons of a coordinate (+ the cap): forces below it, in a
 # DOF's inertia, are not resolved (the force balance's floor)
+EPS32 = 1.1920929e-07  # float32's epsilon: a coordinate's ulp is at most this times it
 CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q")  # state a step carries beyond the DOFs (and strains)
 
 
@@ -96,17 +98,22 @@ class SolverDiSMech(SolverBase, CouplingInterface):
     contacts within the step, their DOFs after the state's in the step's unknowns (:class:`~.coupling.ProxyArm`; no
     adjoint): a pinch holds.
 
-    Contacts are barriers (:class:`~.contact.BarrierBlock`): no candidate passes through one, and each node moves at
-    most the smallest particle radius per detection (the pairs are found again when a node has moved half of it).
+    Contacts are barriers (:class:`~.contact.BarrierBlock`) on pairs frozen per detection (each gap linear in the
+    DOFs): no candidate passes through a found pair, and each node moves at most the smallest particle radius per
+    detection, so no pair not yet found can close (Divide and Truncate's isotropic region; the pairs are found again
+    when a node has moved half of it). The line search's longest step stops where a pair's barrier changes the
+    Newton model (:meth:`~.contact.BarrierBlock.impact`): a touching pair's impact, an untouched pair's onset.
     With contacts the step iterates until its Newton step moves no node (nor a pair's force, nor a midedge angle's
-    offset midpoint) more than :data:`TOLERANCE` radii, or the line search stalls, at most ``iterations`` times.
+    offset midpoint) more than ``tolerance`` (:data:`TOLERANCE`) radii and the nodes' net force is within it of their
+    loads, or the line search stalls, at most ``iterations`` times.
 
     Each world's step is its own solve: its line search, convergence and failure (a world that has converged takes
     no step while others iterate on).
 
     ``counts`` (device ``int32[3]``) sums the worlds' contact steps that spent their ``iterations`` unconverged, those
-    that stalled, and those whose Newton step was not finite (it is taken: the state goes non-finite, loudly). A step is a fixed budget, not a solve to tolerance: compressed cloth (a buckling membrane, whose
-    step objective is nonconvex) often ends unconverged, and its :meth:`vjp` (exact at a solution) is then
+    that stalled, and those whose Newton step was not finite (it is taken: the state goes non-finite, loudly). A step
+    is a fixed budget, not a solve to tolerance: compressed cloth (a buckling membrane, whose step objective is
+    nonconvex) often ends unconverged, and its :meth:`vjp` (exact at a solution) is then
     approximate.
     """
 
@@ -124,12 +131,14 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
+        tolerance: float | None = None,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
             raise ValueError(f"theta must be in [1/2, 1], got {theta}")
         self.theta = float(theta)
         self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
+        self.tolerance = float(TOLERANCE if tolerance is None else tolerance)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
@@ -176,10 +185,11 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
         )
+        self._anchor = wp.zeros(n, dtype=float, device=dev)  # per DOF, its elements' coupling to fixed DOFs
         for e in self.elements:
-            e.worlds = wd
+            e.worlds, e.anchor = wd, self._anchor
         # every pair within twice its thickness; a node moves at most its smallest radius per detection
-        source = Offset(model, self.fixed, self_contact=self_contact)
+        source = Offset(model, self.fixed, self_contact=self_contact, world=of)
         self.contact = BarrierBlock(model, self.fixed, source, of, nc)
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
@@ -190,7 +200,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self.pins.world, self.pins.stride = wd.of, nc
         self._qw = wp.zeros(n, dtype=float, device=dev) if k else None  # the step's unknowns: the state's, the arms'
         self.cap = float(model.particle_radius.numpy().min()) if self.contact.count else 0.0
-        self._tol = TOLERANCE * self.cap
+        self._tol = self.tolerance * self.cap
         source.cap = self.cap
         self.blocks = (*self.elements, self.contact, *((self.pins,) if self.pins and self.pins.count else ()))
         self._adjoint = None  # StepAdjoint, built on the first vjp
@@ -214,10 +224,18 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._unbalanced = wp.zeros(W, dtype=float, device=dev)  # per world, max |residual| / its tolerance
         self._load = wp.zeros(n, dtype=float, device=dev)  # per DOF, the loads it carries (the tolerance's scale)
         self._floor = wp.zeros(n, dtype=float, device=dev)
-        self._net = wp.zeros(5 * W, dtype=wp.float64, device=dev)  # per world: the nodes' net force, load, floor
-        self._impact = wp.ones(W, dtype=float, device=dev)  # the line search's longest step: the first impact
+        self._net = wp.zeros(6 * W, dtype=wp.float64, device=dev)  # per world: net force, load, floor, anchor floor²
+        self._impact = wp.ones(W, dtype=float, device=dev)  # per world, the line search's longest step (impact)
         self._stalled = wp.zeros(W, dtype=wp.int32, device=dev)
         self._failed = wp.zeros(W, dtype=wp.int32, device=dev)  # the step's Newton step was not finite
+        # Newton-CG: x, r, z, p, A p, B p, A x; per world its scalars (_S each) and whether its CG goes on ([W]: any);
+        # its trust radius over the majorizer's step (A-norm, >= 1)
+        self._cg = [wp.zeros(n, dtype=wp.float64, device=dev) for _ in range(7)]
+        self._cgs = wp.zeros(W * _S, dtype=wp.float64, device=dev)
+        self._cg_go = wp.zeros(W + 1, dtype=wp.int32, device=dev)
+        self._cg_some = wp.zeros(W, dtype=wp.int32, device=dev)  # per world: D != 0 at this iterate
+        self._cg_j = wp.zeros(1, dtype=wp.int32, device=dev)  # the CG's step
+        self._radius = wp.ones(W, dtype=float, device=dev)
         self.counts = wp.zeros(3, dtype=wp.int32, device=dev)  # steps ended unconverged (budget spent), stalled, failed
         # the last step's contact forces on Newton's bodies (body_f layout): what a rigid solver couples back
         self.body_reaction = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_vector, device=dev)
@@ -437,8 +455,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             e.begin_step(state_in, dt, self.exact)
         if not self._started and not self.exact and not dev.is_capturing:
             self.reset(state_in)
-        if self._arm_radius.shape[0]:
-            self.contact.source.bodies.sweep.zero_()  # the step's start: the proxies not yet moved
+        if self._arm_radius.shape[0]:  # the step's start: the proxies not yet moved
+            self._arm_sweep(self._q0, 0)
         self.contact.begin_step(state_in, dt, self.mass, self._go)  # _go: the last step's end
         if self.pins and self.pins.count:
             self.pins.begin_step(state_in.body_q, dt)
@@ -457,6 +475,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         # picked candidate; _dof_kernel adds inertia and external force, _candidates_kernel spends it on the slope.
         self._regrad(q)
         self._go.fill_(1)
+        self._radius.fill_(1.0)  # each step starts at the majorizer's
+        self._cgs.zero_()
         for it in range(self.iterations):
             self._room = it < self.iterations - 2  # a multiplier update leaves the solve an iteration
             if self.contact.count and it == self.iterations - FINISH and it > 0:  # the multipliers updated,
@@ -482,22 +502,63 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         wp.launch(_activate_kernel, dim=self.num_worlds, inputs=[self._go], outputs=[self.worlds.active],
                   device=self.device)
         self._dof(q, f)
-        if self.cap > 0.0:  # the force balance at q: |b| within TOLERANCE of the loads, or below float32's reach
+        if self.cap > 0.0:  # the force balance at q: |b| within tolerance of the loads, or below float32's reach
             self._load.zero_()
             self._net.zero_()
             self._unbalanced.zero_()
             self.contact.load(q, self._load, self._floor, ULP)
             wp.launch(_unbalanced_kernel, dim=self.model.particle_count, inputs=[q, self.q_pred, f, self._b,
-                      self._load, self.worlds], outputs=[self._net], device=self.device)
+                      self._load, self._anchor, self.worlds], outputs=[self._net], device=self.device)
             a = self.contact.arm
             if a.k:
                 wp.launch(_arm_unbalanced_kernel, dim=(a.M.shape[0], a.k // 6),
-                          inputs=[self._b, self._load, self._floor, a.start, a.k], outputs=[self._unbalanced],
+                          inputs=[self._b, self._load, self._floor, a.start, a.k, self.tolerance],
+                          outputs=[self._unbalanced],
                           device=self.device)
-            wp.launch(_net_kernel, dim=self.num_worlds, inputs=[self._net], outputs=[self._unbalanced],
+            wp.launch(_net_kernel, dim=self.num_worlds, inputs=[self._net, self.tolerance], outputs=[self._unbalanced],
                       device=self.device)
         self._linear.solve(self._b, self._dq)
+        if self.contact.count:
+            self._newton_cg(q)
         self._search(state_in, q, f)
+
+    def _newton_cg(self, q: wp.array) -> None:
+        """``dq`` by Steihaug-Toint's truncated CG on ``B x = b`` (``B = A + D``: the pairs' Hessian, friction exact
+        along the slip and two-sided pairs' cross terms, :meth:`BarrierBlock.correction`), preconditioned by ``A``'s
+        factor (``A p`` by recurrence: ``A z = r``), within the trust radius (``A``-norm, ``radius`` times the
+        majorizer's step ``A^-1 b``: at 1 its first iterate is that step) and Eisenstat-Walker's forcing; per world."""
+        n, dev, W, wd = self.num_dofs, self.device, self.num_worlds, self.worlds
+        x, r, z, p, Ap, Bp, Ax = self._cg
+        c, go = self._cgs, self._cg_go
+        wp.launch(_ncg_zero_kernel, dim=W, outputs=[c], device=dev)
+        wp.launch(_ncg_start_kernel, dim=n, inputs=[self._b, self._dq, wd], outputs=[x, r, p, Ap, Ax, c], device=dev)
+        go[W:].zero_()
+        self._cg_some.zero_()
+        self._cg_j.zero_()
+        wp.launch(_ncg_eta_kernel, dim=W, inputs=[wd], outputs=[c, go], device=dev)
+
+        def step():  # one CG step (``alpha``), then the next direction unless it stopped
+            wp.copy(Bp, Ap)
+            self.contact.correction(q, p, Bp, self._cg_some)
+            wp.launch(_ncg_dot_kernel, dim=n, inputs=[p, Bp, Ap, Ax, self._b, wd, 1], outputs=[c], device=dev)
+            go[W:].zero_()
+            wp.launch(_ncg_alpha_kernel, dim=W, inputs=[wd, self._cg_j, self._radius, self._cg_some],
+                      outputs=[c, go], device=dev)
+            wp.launch(_ncg_update_kernel, dim=n, inputs=[c, p, Ap, Bp, wd], outputs=[x, Ax, r, self._cg_j], device=dev)
+            wp.capture_if(go[W:], on_true=self._ncg_next)
+
+        wp.capture_while(go[W:], step)
+        wp.launch(_ncg_end_kernel, dim=n, inputs=[x, wd], outputs=[self._dq], device=dev)
+
+    def _ncg_next(self) -> None:
+        """The next conjugate direction (``z = A^-1 r``), or the CG's stop (Eisenstat-Walker)."""
+        n, dev, W, wd = self.num_dofs, self.device, self.num_worlds, self.worlds
+        x, r, z, p, Ap, Bp, Ax = self._cg
+        self._linear.solve(r, z)
+        wp.launch(_ncg_dot_kernel, dim=n, inputs=[r, z, z, z, z, wd, 2], outputs=[self._cgs], device=dev)
+        self._cg_go[W:].zero_()
+        wp.launch(_ncg_beta_kernel, dim=W, inputs=[wd], outputs=[self._cgs, self._cg_go], device=dev)
+        wp.launch(_ncg_dir_kernel, dim=n, inputs=[self._cgs, z, r, wd], outputs=[p, Ap], device=dev)
 
     def _arm_cap(self, q: wp.array, q0: wp.array, out: wp.array) -> None:
         """``out``: the proxy bodies' moves in ``q`` from ``q0``, each capped so its farthest point moves at most
@@ -550,8 +611,11 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self._go[W:].zero_()
             self._settle[W:].zero_()
             wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._unbalanced, self._pick, self._moved, self._failed,
-                                                 self._tol, wd],
+                                                 self._radius, self._tol, wd],
                       outputs=[self._go, self._stalled, self._settle], device=dev)
+            if self.contact.count:
+                wp.launch(_radius_kernel, dim=W, inputs=[self._energy, self._impact, self._pick, self._cgs, wd],
+                          outputs=[self._radius], device=dev)
             if self._room:  # converged: the multipliers updated, and on if one moved
                 wp.capture_if(self._settle[W:], on_true=partial(self.contact.update, q, self._tol, self._dq_max,
                                                                 self._pick, self._go, self._settle))
@@ -560,6 +624,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
 
     def _assemble(self, q: wp.array, f) -> None:
         self.A.vals.zero_()
+        self._anchor.zero_()
         for blk in self.blocks:
             blk.assemble(q, self.A)
         wp.launch(diagonal_kernel, dim=self.num_dofs, inputs=[f], outputs=[self.A.indptr, self.A.vals],
@@ -572,11 +637,14 @@ class SolverDiSMech(SolverBase, CouplingInterface):
     def _detect(self, state_in: State, q: wp.array) -> None:
         wp.copy(self._q0, q)
         if self._arm_radius.shape[0]:  # the proxy bodies' moves so far: detection sees them at their start
-            a = self._proxy_arm
-            wp.launch(_arm_sweep_kernel, dim=a._body.shape[0],
-                      inputs=[q, a._body, self.contact.arm.base, self.num_state_dofs, self._arm_radius],
-                      outputs=[self.contact.source.bodies.sweep], device=self.device)
+            self._arm_sweep(q, 1)
         self.contact.detect(state_in, q)
+
+    def _arm_sweep(self, q: wp.array, moved: int) -> None:
+        a = self._proxy_arm
+        wp.launch(_arm_sweep_kernel, dim=a._body.shape[0],
+                  inputs=[q, a._body, self.contact.arm.base, self.num_state_dofs, self._arm_radius, self.cap, moved],
+                  outputs=[self.contact.source.bodies.sweep], device=self.device)
 
 
 # -- the global step and its line search ---------------------------------------------------
@@ -618,6 +686,196 @@ def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, n
     if best > 0 and energy[o + best] <= f0 + wp.float64(_NOISE) * wp.abs(f0):
         return best
     return 0
+
+
+# -- Newton-CG: per world its scalars at c[w * _S + k] -------------------------------------------
+_RZ, _RZ0, _PBP, _PAP, _PAX, _XAX, _PB, _BX, _XBX, _ALPHA, _BETA, _RZN, _PRZ0, _PETA, _ETA, _STOP = range(16)
+_S = 16
+
+
+@wp.kernel
+def _ncg_start_kernel(b: wp.array[wp.float64], dq: wp.array[float], wd: Worlds, x: wp.array[wp.float64],
+                      r: wp.array[wp.float64], p: wp.array[wp.float64], ap: wp.array[wp.float64],
+                      ax: wp.array[wp.float64], c: wp.array[wp.float64]):
+    """``x = 0``, ``r = b``, ``p = z = A^-1 b`` (the solve's ``dq``), ``A p = b``; per world ``r . z``."""
+    i = wp.tid()
+    w = wd.of[i]
+    x[i] = wp.float64(0.0)
+    ax[i] = wp.float64(0.0)
+    r[i] = b[i]
+    ap[i] = b[i]
+    p[i] = wp.float64(dq[i])
+    if wd.active[w] != 0:
+        wp.atomic_add(c, w * _S + _RZ0, b[i] * wp.float64(dq[i]))
+
+
+@wp.kernel
+def _ncg_zero_kernel(c: wp.array[wp.float64]):
+    """A world's per-iteration scalars zeroed (Eisenstat-Walker's previous kept)."""
+    w = wp.tid()
+    for k in range(_PRZ0):
+        c[w * _S + k] = wp.float64(0.0)
+
+
+@wp.kernel
+def _ncg_eta_kernel(wd: Worlds, c: wp.array[wp.float64], go: wp.array[wp.int32]):
+    """Eisenstat-Walker's forcing (their choice 2, ``A^-1``-norm of ``b``); the CG starts in the iterating worlds."""
+    w = wp.tid()
+    o = w * _S
+    rz0 = c[o + _RZ0]
+    c[o + _RZ] = rz0
+    eta = wp.float64(0.5)
+    if c[o + _PRZ0] > wp.float64(0.0):
+        eta = wp.float64(0.9) * rz0 / c[o + _PRZ0]
+        floor = wp.float64(0.9) * c[o + _PETA] * c[o + _PETA]
+        if floor > wp.float64(0.1):
+            eta = wp.max(eta, floor)
+        eta = wp.min(eta, wp.float64(0.9))
+    c[o + _PRZ0] = rz0
+    c[o + _PETA] = eta
+    c[o + _ETA] = eta
+    c[o + _STOP] = wp.float64(1.0)
+    go[w] = 0
+    if wd.active[w] != 0 and rz0 > wp.float64(0.0):
+        c[o + _STOP] = wp.float64(0.0)
+        go[w] = 1
+        go[wd.count] = 1
+
+
+@wp.kernel
+def _ncg_dot_kernel(a: wp.array[wp.float64], b0: wp.array[wp.float64], b1: wp.array[wp.float64],
+                    b2: wp.array[wp.float64], b3: wp.array[wp.float64], wd: Worlds, mode: int,
+                    c: wp.array[wp.float64]):
+    """Per running world, ``mode`` 1: ``p.Bp, p.Ap, p.Ax, p.b`` (``a = p``); 2: ``r.z``."""
+    i = wp.tid()
+    o = wd.of[i] * _S
+    if c[o + _STOP] != wp.float64(0.0):
+        return
+    if mode == 1:
+        wp.atomic_add(c, o + _PBP, a[i] * b0[i])
+        wp.atomic_add(c, o + _PAP, a[i] * b1[i])
+        wp.atomic_add(c, o + _PAX, a[i] * b2[i])
+        wp.atomic_add(c, o + _PB, a[i] * b3[i])
+    else:
+        wp.atomic_add(c, o + _RZN, a[i] * b0[i])
+
+
+@wp.kernel
+def _ncg_alpha_kernel(wd: Worlds, j: wp.array[wp.int32], radius: wp.array[float], some: wp.array[wp.int32],
+                      c: wp.array[wp.float64], go: wp.array[wp.int32]):
+    """The CG step ``alpha``, cut at the trust radius (negative curvature: to it); the model's terms ``b.x``,
+    ``x.B x`` and ``x.A x`` carried. Stops: at the radius, at step ``CG``, or at the first if ``D p = 0``
+    (``A^-1 b`` solves ``B x = b``)."""
+    w = wp.tid()
+    o = w * _S
+    c[o + _ALPHA] = wp.float64(0.0)
+    go[w] = 0
+    if c[o + _STOP] != wp.float64(0.0):
+        return
+    first = j[0] == 0
+    kap = c[o + _PBP]
+    pap = c[o + _PAP]
+    pax = c[o + _PAX]
+    xax = c[o + _XAX]
+    d2 = wp.float64(radius[w]) * wp.float64(radius[w]) * c[o + _RZ0]
+    same = first and some[w] == 0
+    stop = j[0] == CG - 1 or same
+    a = wp.float64(0.0)
+    if kap > wp.float64(0.0):
+        a = c[o + _RZ] / kap
+    if same:  # B = A: the majorizer's step
+        a = wp.float64(1.0)
+    elif kap <= wp.float64(0.0) or xax + a * (wp.float64(2.0) * pax + a * pap) > d2:  # to the boundary
+        a = (-pax + wp.sqrt(wp.max(pax * pax + pap * (d2 - xax), wp.float64(0.0)))) / wp.max(pap, wp.float64(1.0e-300))
+        stop = True
+    c[o + _ALPHA] = a
+    c[o + _XAX] = xax + a * (wp.float64(2.0) * pax + a * pap)
+    c[o + _BX] = c[o + _BX] + a * c[o + _PB]
+    c[o + _XBX] = c[o + _XBX] + a * (wp.float64(2.0) * (c[o + _PB] - c[o + _RZ]) + a * kap)
+    c[o + _PBP] = wp.float64(0.0)
+    c[o + _PAP] = wp.float64(0.0)
+    c[o + _PAX] = wp.float64(0.0)
+    c[o + _PB] = wp.float64(0.0)
+    c[o + _RZN] = wp.float64(0.0)
+    if stop:
+        c[o + _STOP] = wp.float64(1.0)
+    else:
+        go[w] = 1
+        go[wd.count] = 1
+
+
+@wp.kernel
+def _ncg_update_kernel(c: wp.array[wp.float64], p: wp.array[wp.float64], ap: wp.array[wp.float64],
+                       bp: wp.array[wp.float64], wd: Worlds, x: wp.array[wp.float64], ax: wp.array[wp.float64],
+                       r: wp.array[wp.float64], j: wp.array[wp.int32]):
+    i = wp.tid()
+    if i == 0:
+        j[0] = j[0] + 1
+    a = c[wd.of[i] * _S + _ALPHA]
+    if a != wp.float64(0.0):
+        x[i] = x[i] + a * p[i]
+        ax[i] = ax[i] + a * ap[i]
+        r[i] = r[i] - a * bp[i]
+
+
+@wp.kernel
+def _ncg_beta_kernel(wd: Worlds, c: wp.array[wp.float64], go: wp.array[wp.int32]):
+    """Eisenstat-Walker's stop (``r.z <= eta^2 b.A^-1 b``), else the next direction's ``beta``."""
+    w = wp.tid()
+    o = w * _S
+    go[w] = 0
+    if c[o + _STOP] != wp.float64(0.0):
+        return
+    rzn = c[o + _RZN]
+    if rzn <= c[o + _ETA] * c[o + _ETA] * c[o + _RZ0]:
+        c[o + _STOP] = wp.float64(1.0)
+        return
+    c[o + _BETA] = rzn / c[o + _RZ]
+    c[o + _RZ] = rzn
+    go[w] = 1
+    go[wd.count] = 1
+
+
+@wp.kernel
+def _ncg_dir_kernel(c: wp.array[wp.float64], z: wp.array[wp.float64], r: wp.array[wp.float64], wd: Worlds,
+                    p: wp.array[wp.float64], ap: wp.array[wp.float64]):
+    """``p = z + beta p``, ``A p = r + beta A p`` in the running worlds."""
+    i = wp.tid()
+    o = wd.of[i] * _S
+    if c[o + _STOP] == wp.float64(0.0):
+        b = c[o + _BETA]
+        p[i] = z[i] + b * p[i]
+        ap[i] = r[i] + b * ap[i]
+
+
+@wp.kernel
+def _ncg_end_kernel(x: wp.array[wp.float64], wd: Worlds, dq: wp.array[float]):
+    i = wp.tid()
+    if wd.active[wd.of[i]] != 0:
+        dq[i] = float(x[i])
+
+
+@wp.kernel
+def _radius_kernel(energy: wp.array[wp.float64], t: wp.array[float], pick: wp.array[wp.int32],
+                   c: wp.array[wp.float64], wd: Worlds, radius: wp.array[float]):
+    """The trust radius from the picked candidate's actual decrease over the CG model's (``a b.x - a^2 x.B x / 2``
+    at its step ``a``), continuously: ``2^(4 ratio - 2)`` times, within ``[1/4, 2]``; no step: a quarter. Never
+    below the majorizer's step (1)."""
+    w = wp.tid()
+    if wd.active[w] == 0:
+        return
+    k = pick[w]
+    o = w * _S
+    f = float(0.25)
+    if k > 0:
+        a = wp.float64(_step_length(k) * t[w])
+        model = a * c[o + _BX] - wp.float64(0.5) * a * a * c[o + _XBX]
+        e0 = energy[w * wd.stride]
+        if model <= wp.float64(_NOISE) * wp.abs(e0):  # below the objective's rounding: no information
+            return
+        ratio = float((e0 - energy[w * wd.stride + k]) / model)
+        f = wp.pow(2.0, wp.clamp(4.0 * ratio - 2.0, -2.0, 1.0))
+    radius[w] = wp.clamp(radius[w] * f, 1.0, 1.0e6)
 
 
 @wp.kernel
@@ -739,15 +997,20 @@ def _arm_cap_kernel(q: wp.array[float], q0: wp.array[float], start: int, radius:
 
 @wp.kernel
 def _arm_sweep_kernel(q: wp.array[float], body: wp.array[wp.int32], base: wp.array[wp.int32], start: int,
-                      radius: wp.array[float], sweep: wp.array[float]):
+                      radius: wp.array[float], cap: float, moved: int, sweep: wp.array[float]):
+    """How much further a proxy body's pairs reach: its move since the step's start (``moved``: by its DOFs in
+    ``q``; detection sees it at its start), plus the ``cap`` it may still move before the next detection (its pair
+    with a node then closes by at most two caps, as a rod-rod pair's)."""
     p = wp.tid()
     b = body[p]
     j0 = base[b]
-    dx, dth = wp.vec3(0.0), wp.vec3(0.0)
-    for c in range(3):
-        dx[c] = q[j0 + c]
-        dth[c] = q[j0 + 3 + c]
-    sweep[b] = wp.length(dx) + wp.length(dth) * radius[(j0 - start) // 6]
+    sweep[b] = cap
+    if moved != 0:
+        dx, dth = wp.vec3(0.0), wp.vec3(0.0)
+        for c in range(3):
+            dx[c] = q[j0 + c]
+            dth[c] = q[j0 + 3 + c]
+        sweep[b] = cap + wp.length(dx) + wp.length(dth) * radius[(j0 - start) // 6]
 
 
 @wp.kernel
@@ -770,13 +1033,16 @@ def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[flo
 
 @wp.kernel
 def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
-                       load: wp.array[float], wd: Worlds, net: wp.array[wp.float64]):
+                       load: wp.array[float], anchor: wp.array[float], wd: Worlds, net: wp.array[wp.float64]):
     """The nodes' force balance at ``q``, summed per world into ``net`` (net force, its loads, float32's floor):
     ``b``, the step's gradient, is the unbalanced force; the loads are magnitudes: its contacts' forces (``load``,
     opposed pairs adding), its inertia and external force; the elastic forces are internal: they carry the load, they
     are not it. Summed, not node by node: a stiff rod's nodes resolve their elastic forces only to its stiffness times
     float32's resolution of a coordinate, but those cancel in the sum (each force is added once with each sign); the
-    net, the momentum's balance, does not. Midedge angles and twists: internal, left to the step test."""
+    net, the momentum's balance, does not, nor does a fixed DOF's reaction: it is resolved only to its coupling to a
+    node (``anchor``, the assembly's) times the node's ulp, summed in quadrature (independent round-offs: 2x the
+    net's change under random 1-ulp moves on a clamped woven sheet).
+    Midedge angles and twists: internal, left to the step test."""
     n = wp.tid()
     i = 3 * n
     if f.fixed[i] != 0 and f.fixed[i + 1] != 0 and f.fixed[i + 2] != 0:
@@ -786,48 +1052,54 @@ def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: 
     ext = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
     k = f.mass[i] * f.inv_dt2
     for c in range(3):
-        wp.atomic_add(net, 5 * w + c, b[i + c])
+        wp.atomic_add(net, 6 * w + c, b[i + c])
     x = wp.vec3(q[i], q[i + 1], q[i + 2])
-    wp.atomic_add(net, 5 * w + 3, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
-    wp.atomic_add(net, 5 * w + 4, wp.float64(k * ULP * (wp.length(x) + wp.length(r))))
+    wp.atomic_add(net, 6 * w + 3, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
+    a = wp.vec3(anchor[i], anchor[i + 1], anchor[i + 2])
+    s = EPS32 * wp.length(a) * wp.length(x)
+    wp.atomic_add(net, 6 * w + 5, wp.float64(s * s))
+    floor = k * ULP * (wp.length(x) + wp.length(r))
+    wp.atomic_add(net, 6 * w + 4, wp.float64(floor))
 
 
 @wp.kernel
 def _arm_unbalanced_kernel(b: wp.array[wp.float64], load: wp.array[float], floor: wp.array[float], start: int,
-                           k: int, unbalanced: wp.array[float]):
-    """A proxy body's force and torque balance: ``|b|`` within TOLERANCE of its contacts' and inertia's, or below
+                           k: int, tolerance: float, unbalanced: wp.array[float]):
+    """A proxy body's force and torque balance: ``|b|`` within ``tolerance`` of its contacts' and inertia's, or below
     float32's reach."""
     w, p = wp.tid()
     i = start + w * k + 6 * p
     for o in range(0, 6, 3):
         u = wp.length(wp.vec3(float(b[i + o]), float(b[i + o + 1]), float(b[i + o + 2])))
-        wp.atomic_max(unbalanced, w, u / (TOLERANCE * load[i + o] + floor[i + o] + 1.0e-30))
+        wp.atomic_max(unbalanced, w, u / (tolerance * load[i + o] + floor[i + o] + 1.0e-30))
 
 
 @wp.kernel
-def _net_kernel(net: wp.array[wp.float64], unbalanced: wp.array[float]):
-    """Per world, the nodes' net force against TOLERANCE of their loads (plus float32's floor)."""
+def _net_kernel(net: wp.array[wp.float64], tolerance: float, unbalanced: wp.array[float]):
+    """Per world, the nodes' net force against ``tolerance`` of their loads (plus float32's floor)."""
     w = wp.tid()
-    u = wp.sqrt(net[5 * w] * net[5 * w] + net[5 * w + 1] * net[5 * w + 1] + net[5 * w + 2] * net[5 * w + 2])
-    tol = wp.float64(TOLERANCE) * net[5 * w + 3] + net[5 * w + 4] + wp.float64(1.0e-30)
+    u = wp.sqrt(net[6 * w] * net[6 * w] + net[6 * w + 1] * net[6 * w + 1] + net[6 * w + 2] * net[6 * w + 2])
+    tol = wp.float64(tolerance) * net[6 * w + 3] + net[6 * w + 4] + wp.sqrt(net[6 * w + 5]) + wp.float64(1.0e-30)
     unbalanced[w] = wp.max(unbalanced[w], float(u / tol))
 
 
 @wp.kernel
 def _go_kernel(dq_max: wp.array[float], unbalanced: wp.array[float], pick: wp.array[wp.int32],
-               moved: wp.array[wp.int32], failed: wp.array[wp.int32], tol: float, wd: Worlds, go: wp.array[wp.int32],
-               stalled: wp.array[wp.int32], settle: wp.array[wp.int32]):
+               moved: wp.array[wp.int32], failed: wp.array[wp.int32], radius: wp.array[float], tol: float, wd: Worlds,
+               go: wp.array[wp.int32], stalled: wp.array[wp.int32], settle: wp.array[wp.int32]):
     """Per iterating world: iterate on while the Newton step moves a node more than ``tol`` and the line search took a
-    step, or the pairs were just found again (the objective changed); a step that finds no decrease short of that
-    has stalled. ``settle``: the worlds that stopped at this iterate (``[count]``: any; ``go[count]``: any goes; both
-    zeroed before)."""
+    step, or the pairs were just found again (the objective changed), or its trust radius can shrink (a Newton-CG
+    step past the majorizer's found no decrease); a step that finds no decrease short of that has stalled.
+    ``settle``: the worlds that stopped at this iterate (``[count]``: any; ``go[count]``: any goes; both zeroed
+    before)."""
     w = wp.tid()
     n = wd.count
     settle[w] = 0
     if wd.active[w] != 0:
         far = dq_max[w] > tol or unbalanced[w] > 1.0  # the step still moves, or the forces do not balance
-        go[w] = wp.where(far and (pick[w] != 0 or moved[w] != 0) and failed[w] == 0, 1, 0)
-        if far and pick[w] == 0 and moved[w] == 0:
+        retry = radius[w] > 1.0
+        go[w] = wp.where(far and (pick[w] != 0 or moved[w] != 0 or retry) and failed[w] == 0, 1, 0)
+        if far and pick[w] == 0 and moved[w] == 0 and not retry:
             stalled[w] = 1
         if go[w] == 0:
             settle[w] = 1

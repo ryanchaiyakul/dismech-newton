@@ -1,4 +1,4 @@
-"""Where contacts come from: :class:`Offset` fills the :class:`~.contact.Slots` each step.
+"""Where contacts come from: :class:`Offset` appends them to the :class:`~.contact.Slots` list at each detection.
 
 Rods and shells against each other and against Newton's (non-rod) shapes, by Offset Geometric Contact (Chen et al.
 2025). A shell is a triangle mesh (feature blocks: Eqs. 8-10), a rod an edge-only manifold (Eqs. 14-15): a node's ball
@@ -22,8 +22,7 @@ from .builder import _P
 from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
 from .state import node
 
-SLOTS = 8  # contacts per feature (node or edge) on rods
-SHEET_SLOTS = 64  # with sheets: an edge on a sheet crosses several of its edges, and compressed layers stack
+PAIRS = 8  # the pair list's places per feature (node or edge), shared: the scenes' peak is 1.7 (cloth_style3d)
 REACH = 2.0  # pairs within this many thicknesses: the thickness, plus two move caps (a radius each)
 EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod are not contacts
 OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
@@ -182,13 +181,14 @@ def _world_shift(model: Model) -> np.ndarray:
 
 
 class Offset:
-    """Rods and shells against each other and against shapes: ``slots`` (:data:`SLOTS`) per node and per edge, keyed by
-    the other feature (node ``w``, edge ``num_nodes + f``, triangle ``num_nodes + num_edges + t``, or shape
-    ``num_nodes + num_edges + num_triangles + k``). Two BVHs, of the edges and of the triangles, hold their boxes at a
-    detection, grown by a contact's reach, and are refit each detection (graph-capturable); shapes are culled by their
-    bounding spheres. Without ``self_contact``, no rod-rod or shell-shell pairs."""
+    """Rods and shells against each other and against shapes, into one list of :data:`PAIRS` places per node and edge,
+    each pair keyed by its feature (node ``v`` or edge ``num_nodes + e``, ``own``) and the other (node ``w``, edge
+    ``num_nodes + f``, triangle ``num_nodes + num_edges + t``, or shape ``num_nodes + num_edges + num_triangles + 2 k +
+    side``). Two BVHs, of the edges and of the triangles, hold their boxes at a detection, grown by a contact's reach,
+    and are refit each detection (graph-capturable); shapes are culled by their bounding spheres. Without
+    ``self_contact``, no rod-rod or shell-shell pairs. ``world``: per DOF its world (a pair's: its feature's)."""
 
-    def __init__(self, model: Model, fixed: wp.array, *, self_contact: bool):
+    def __init__(self, model: Model, fixed: wp.array, *, self_contact: bool, world: np.ndarray):
         dev = wp.get_device(model.device)
         self.mesh = mesh = _mesh(model, dev)
         self.model = model
@@ -210,10 +210,14 @@ class Offset:
         self._bvh = wp.Bvh(self._lo[:E], self._hi[:E])
         self._face_bvh = wp.Bvh(self._lo[E:], self._hi[E:]) if self.num_faces else None
         self.bodies = _bodies(model, dev)
-        sc = self.scene = Scene()  # the step's positions and slots set in fill
+        self.num_prims = self.shape_key0 + 2 * max(model.shape_count, 1)  # a pair key's range
+        sc = self.scene = Scene()  # the step's positions and list set in fill
         sc.m, sc.b, sc.fixed, sc.self_contact = mesh, self.bodies, fixed, self.self_contact
-        sc.num_nodes, sc.slots = self.num_nodes, SHEET_SLOTS if self.num_faces else SLOTS
-        sc.overflow = self.overflow = wp.zeros(1, dtype=wp.int32, device=dev)  # contacts beyond a feature's slots
+        sc.num_nodes = self.num_nodes
+        sc.world = wp.array(world[3 * np.arange(self.num_nodes)] if self.num_nodes else np.zeros(1), dtype=wp.int32,
+                            device=dev)
+        sc.count = self.count = wp.zeros(1, dtype=wp.int32, device=dev)  # pairs appended (past the list: dropped)
+        sc.overflow = self.overflow = wp.zeros(1, dtype=wp.int32, device=dev)  # pairs dropped, the list full
         # With a move cap (the barrier's): each node's, lowered so a pair dropped by a full feature cannot close
         sc.limit = self.limit = wp.zeros(self.num_nodes, dtype=float, device=dev)
         ptr = self.bodies.world_ptr.numpy()  # the most shapes a feature meets: the global ones and a world's
@@ -235,18 +239,20 @@ class Offset:
             wp.launch(_mu_kernel, dim=self.num_nodes, inputs=[self._mu_shape, shape_mu, float(m.particle_mu)],
                       outputs=[self.mesh.mu], device=self.fixed.device)
 
-    def slots(self) -> int:
-        """The slot count, 0 where no pair can touch (recording a step for its adjoint then reads no count)."""
+    def capacity(self) -> int:
+        """The list's size, 0 where no pair can touch (recording a step for its adjoint then reads no count)."""
         on = self.mesh.edge_on.numpy()
         rods, shells = bool(on[: self.num_rod_edges].any()), self.num_faces > 0
         if (rods or shells) and (self.self_contact or self.bodies.shapes.shape[0] or (rods and shells)):
-            return (self.num_nodes + self.num_edges) * self.scene.slots
+            return (self.num_nodes + self.num_edges) * PAIRS
         return 0
 
     def fill(self, state_in: State, dt: float, q: wp.array, s: Slots):
         """The contacts near ``q`` (the step's start or an iterate), shapes moving over the step ``dt``."""
         sc, b, dev = self.scene, self.bodies, self.fixed.device
         sc.q, sc.s = q, s
+        wp.launch(_clear_kernel, dim=s.active.shape[0], inputs=[s], device=dev)
+        self.count.zero_()
         wp.launch(_bounds_kernel, dim=self.num_edges + self.num_faces,
                   inputs=[q, self._elems, self.mesh.shift, self.pad, self._lo, self._hi], device=dev)
         self._bvh.refit()
@@ -275,8 +281,8 @@ class Bodies:
     """Newton's shapes as nodes and rod edges meet them: per shape its geometry (type, scale, mesh, mesh properties),
     its frame in its body (-1: the world's), margin, ``mu`` and bounding radius; the shapes that take part (colliding
     with particles, not a rod's capsule); the bodies' poses, velocities and centres of mass at the step's start; the
-    step ``h``; ``sweep``: per body, how far a yielding one has moved since the step's start (an iterate's detection
-    sees it at its start pose: its pairs reach that much further)."""
+    step ``h``; ``sweep``: per body, how much further a yielding one's pairs reach: its move since the step's start (an
+    iterate's detection sees it at its start pose) plus the move cap it may still take before the next detection."""
 
     kind: wp.array[wp.int32]
     scale: wp.array[wp.vec3]
@@ -595,19 +601,21 @@ class Found:
 
 @wp.struct
 class Scene:
-    """A detection: the positions ``q``, what collides, the shapes, the fixed DOFs, the slots ``s`` filled, the
-    overflow count and the nodes' move limits; ``found``: the features' shape contacts."""
+    """A detection: the positions ``q``, what collides, the shapes, the fixed DOFs, the list ``s`` appended to (its
+    ``count``), the overflow count and the nodes' move limits; per node its world; ``found``: the features' shape
+    contacts."""
 
     q: wp.array[float]
     m: Mesh
     b: Bodies
     fixed: wp.array[wp.int32]
     s: Slots
+    count: wp.array[wp.int32]
     overflow: wp.array[wp.int32]
     limit: wp.array[float]
+    world: wp.array[wp.int32]
     self_contact: int
     num_nodes: int
-    slots: int
     found: Found
 
 
@@ -623,28 +631,33 @@ def _found(sc: Scene, r: int, k: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n:
 
 
 @wp.func
-def _keep_found(sc: Scene, base: int, i: int):
+def _keep_found(sc: Scene, i: int):
     """Feature ``i``'s shape contacts (:class:`Found`), kept in shape order, side 0 then 1."""
     f = sc.found
     for r in range(2 * f.width * i, 2 * f.width * (i + 1)):
         if f.shape[r] >= 0:
-            _keep_shape(sc, base, f.shape[r], r % 2, f.pair[r], f.w[r], f.x[r], f.n[r], f.th[r])
+            _keep_shape(sc, i, f.shape[r], r % 2, f.pair[r], f.w[r], f.x[r], f.n[r], f.th[r])
 
 
 @wp.func
 def _drop(sc: Scene, pair: wp.vec4i, gap: float):
-    """A pair no slot holds, ``gap`` apart along its normal: its nodes move at most 0.45 of it (each side's weights
-    sum to 1, so it closes by at most 0.9 of it) until the next detection."""
+    """A pair the full list drops, ``gap`` apart along its normal: its nodes move at most 0.45 of it (each side's
+    weights sum to 1, so it closes by at most 0.9 of it) until the next detection."""
     for k in range(4):
         if pair[k] >= 0:
             wp.atomic_min(sc.limit, pair[k], wp.max(0.45 * gap, 0.0))
 
 
+@wp.kernel
+def _clear_kernel(s: Slots):
+    clear(s, wp.tid())
+
+
 @wp.func
-def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float,
+def _keep(sc: Scene, own: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3, xb: wp.vec3, db: wp.vec3, th: float,
           mu: float, sweep: float):
-    """Emit the contact into a free slot of the feature's from ``base``, unless it is there already (found through
-    another triangle or edge) or farther than :data:`REACH` thicknesses; a full feature keeps its closest contacts.
+    """Append the contact of feature ``own`` with ``key`` to the list, unless farther than :data:`REACH` thicknesses
+    (found twice, through two triangles or edges: the sort drops one); past the list's end, dropped (:func:`_drop`).
     ``n``: the normal, or zero for ``C q``'s direction; ``xb``, ``db``: a body's point at the end of the step and its
     motion over it; ``sweep``: how much further a yielding body's pair reaches (:attr:`Bodies.sweep`). A shell-shell
     pair's thickness is at most half its rest distance, so none touches at rest (the rods' rule is
@@ -655,7 +668,7 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
         if wp.length(d) < 1.0e-9:
             return
         n = wp.normalize(d)
-    if pair_fixed(sc.fixed, pair):
+    if pair_fixed(sc.fixed, pair) and sweep == 0.0:  # nothing moves (a yielding body's sweep is at least its cap)
         return
     shells = True  # all shell nodes
     for k in range(4):
@@ -665,28 +678,14 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
         return
     if shells and (pair[1] >= 0 or pair[2] >= 0):  # no pair touches at rest
         th = wp.min(th, 0.5 * wp.length(contact_point(m.rest, pair, w, wp.vec3(0.0))))
-    slot = int(-1)
-    far = int(-1)  # with every slot taken, the farthest contact (by gap at the start), if farther than this one
-    gap = wp.dot(n, d) - th
-    for k in range(sc.slots):  # filled from base on (an evicted slot is refilled at once): stop at the first free
-        j = base + k
-        if s.key[j] == key:
-            return
-        if s.key[j] < 0:
-            slot = j
-            break
-        gj = wp.dot(s.normal[j], s.c0[j]) - s.thickness[j]
-        if gj > gap and (far < 0 or gj > wp.dot(s.normal[far], s.c0[far]) - s.thickness[far]):
-            far = j
-    if slot < 0:
+    slot = wp.atomic_add(sc.count, 0, 1)
+    if slot >= s.active.shape[0]:
         wp.atomic_add(sc.overflow, 0, 1)
-        if far < 0:
-            _drop(sc, pair, wp.dot(n, d))
-            return
-        slot = far
-        _drop(sc, s.pair[far], wp.dot(s.normal[far], s.c0[far]))
-        clear(s, slot)
+        _drop(sc, pair, wp.dot(n, d))
+        return
+    s.own[slot] = own
     s.key[slot] = key
+    s.world[slot] = sc.world[wp.where(own < sc.num_nodes, own, m.edges[wp.max(own - sc.num_nodes, 0)][0])]
     radius = wp.vec4(0.0)
     for k in range(4):
         if pair[k] >= 0 and m.rod[pair[k]] >= 0:
@@ -695,19 +694,19 @@ def _keep(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, n: wp.vec3
 
 
 @wp.func
-def _keep_pair(sc: Scene, base: int, key: int, pair: wp.vec4i, w: wp.vec4, th: float, mu: float):
+def _keep_pair(sc: Scene, own: int, key: int, pair: wp.vec4i, w: wp.vec4, th: float, mu: float):
     """:func:`_keep` for two features of rods and shells: the normal along ``C q``, no anchor."""
-    _keep(sc, base, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu, 0.0)
+    _keep(sc, own, key, pair, w, wp.vec3(0.0), wp.vec3(0.0), wp.vec3(0.0), th, mu, 0.0)
 
 
 @wp.func
-def _keep_shape(sc: Scene, base: int, k: int, side: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3,
+def _keep_shape(sc: Scene, own: int, k: int, side: int, pair: wp.vec4i, w: wp.vec4, x: wp.vec3, n: wp.vec3,
                 th: float):
     """:func:`_keep` against shape ``k``, at its world point ``x`` (the step's start) with the normal ``n``; ``side``:
     which end of a rod edge's line contact (0 for a single point)."""
     xb, db = _anchor(sc.b, k, x)
     key = sc.num_nodes + sc.m.edges.shape[0] + sc.m.faces.shape[0] + 2 * k + side
-    _keep(sc, base, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]), _sweep(sc.b, k))
+    _keep(sc, own, key, pair, w, n, xb, db, th, 0.5 * (sc.m.mu[pair[0]] + sc.b.mu[k]), _sweep(sc.b, k))
 
 
 @wp.kernel
@@ -862,14 +861,14 @@ def _edge_shape(sc: Scene, e: int, jj: int, at: int):
 
 
 @wp.func
-def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, base: int):
+def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int):
     """Edge ``e``'s contacts: a rod's interior against shapes (:func:`_edge_shape`), and against higher edges'
     interiors."""
     m, q = sc.m, sc.q
     a0 = m.edges[e][0]
     a1 = m.edges[e][1]
     if m.rod[a0] >= 0:
-        _keep_found(sc, base, sc.num_nodes + e)
+        _keep_found(sc, sc.num_nodes + e)
     query = wp.bvh_query_aabb(bvh, lo, hi)
     f = int(0)
     while wp.bvh_query_next(query, f):
@@ -884,7 +883,7 @@ def _edge_contacts(sc: Scene, bvh: wp.uint64, lo: wp.vec3, hi: wp.vec3, e: int, 
             continue  # an end: a node's pair (found exactly on a node, rounding would duplicate it)
         th = 0.5 * (m.radius[a0] + m.radius[a1] + m.radius[b0] + m.radius[b1])
         if not _excluded(q, m, e, -1, st[0], f, -1, st[1], EXCLUSION * th):
-            _keep_pair(sc, base, sc.num_nodes + f, wp.vec4i(a0, a1, b0, b1),
+            _keep_pair(sc, sc.num_nodes + e, sc.num_nodes + f, wp.vec4i(a0, a1, b0, b1),
                        wp.vec4(1.0 - st[0], st[0], st[1] - 1.0, -st[1]), th, 0.5 * (m.mu[a0] + m.mu[b0]))
 
 
@@ -925,7 +924,7 @@ def _shapes_kernel(sc: Scene):
 
 
 @wp.func
-def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base: int):
+def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int):
     """Node ``i``'s contacts: against rods (node-node, node-edge), shapes and triangles."""
     m, q = sc.m, sc.q
     xv = node(q, i)
@@ -968,8 +967,8 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
                 continue
             if _excluded(q, m, -1, i, 0.0, ef, c0, t, EXCLUSION * th):
                 continue
-        _keep_pair(sc, base, other, pair, w, th, 0.5 * (m.mu[i] + m.mu[c0]))
-    _keep_found(sc, base, i)  # against shapes (:func:`_node_shape`)
+        _keep_pair(sc, i, other, pair, w, th, 0.5 * (m.mu[i] + m.mu[c0]))
+    _keep_found(sc, i)  # against shapes (:func:`_node_shape`)
     if m.faces.shape[0] == 0:
         return
     query = wp.bvh_query_aabb(face_bvh, p, p)
@@ -1004,24 +1003,21 @@ def _node_contacts(sc: Scene, bvh: wp.uint64, face_bvh: wp.uint64, i: int, base:
             own = m.edge_opp[e][0] == i or m.edge_opp[e][1] == i
             if not _in_edge_region(q, m, e, xv) and not own:
                 continue  # (and its own triangle's opposite edge: that triangle's height)
-        _keep_pair(sc, base, key, pair, w, th, 0.5 * (m.mu[i] + m.mu[tri[0]]))
+        _keep_pair(sc, i, key, pair, w, th, 0.5 * (m.mu[i] + m.mu[tri[0]]))
 
 
 @wp.kernel
 def _offset_kernel(bvh: wp.uint64, face_bvh: wp.uint64, lo: wp.array[wp.vec3], hi: wp.array[wp.vec3], sc: Scene):
-    """Thread ``i < num_nodes``: node ``i``'s contacts, else edge ``i - num_nodes``'s, into its ``slots`` from
-    ``i * slots``. Query: the node's point, or the edge's box (the trees' boxes carry the pad). A rod node's pair
-    with another rod must lie in its own node's block; with a shape, unless a rod edge holds it (:func:`_edge_holds`);
-    a shell vertex's need not (vertex-facet is one-sided)."""
+    """Thread ``i < num_nodes``: node ``i``'s contacts, else edge ``i - num_nodes``'s, appended to the list. Query:
+    the node's point, or the edge's box (the trees' boxes carry the pad). A rod node's pair with another rod must lie
+    in its own node's block; with a shape, unless a rod edge holds it (:func:`_edge_holds`); a shell vertex's need not
+    (vertex-facet is one-sided)."""
     i = wp.tid()
-    base = i * sc.slots
-    for k in range(sc.slots):
-        clear(sc.s, base + k)
     if i >= sc.num_nodes:
         e = i - sc.num_nodes
         if sc.m.edge_on[e] != 0:
-            _edge_contacts(sc, bvh, lo[e], hi[e], e, base)
+            _edge_contacts(sc, bvh, lo[e], hi[e], e)
             if sc.m.rod[sc.m.edges[e][0]] < 0:  # a shell's: between its nodes
-                _keep_found(sc, base, i)
+                _keep_found(sc, i)
     elif sc.m.adj_ptr[i + 1] > sc.m.adj_ptr[i]:  # on a colliding rod or a shell
-        _node_contacts(sc, bvh, face_bvh, i, base)
+        _node_contacts(sc, bvh, face_bvh, i)

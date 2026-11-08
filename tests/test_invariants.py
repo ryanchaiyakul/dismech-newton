@@ -104,18 +104,20 @@ def _rollout(model, steps, reset_at=None, worlds=()):
 
 def test_masked_reset_replays_a_fresh_start():
     """Helices dropped on the ground for 40 steps (world 1 moves 1.9 cm, its twist 0.08 rad), then reset by
-    ``world_mask``, then 40 more steps. Both worlds reset: the same as 40 steps from the start to round-off (5e-8 m,
-    as two fresh runs differ). World 1 alone: it replays the fresh start and world 0 goes on unaffected, both within
-    a few of the solve's tolerance (0.01 radii: 4e-5 m; 5e-5 and 1.5e-5 on 2026-11-03): contacts are still found and
-    the matrix refactorized for all worlds at once, so another world's iterates reach a world's."""
+    ``world_mask``, then 40 more steps. Both worlds reset: the same as 40 steps from the start, as two fresh runs
+    differ (the Newton-CG's run-to-run spread: 8e-6 m, twists 2e-4 rad at 4 mm radius). World 1 alone: it replays
+    the fresh start and world 0 goes on unaffected, both within a few of the solve's tolerance (0.01 radii: 4e-5 m;
+    5e-5 and 1.5e-5 on 2026-11-03): contacts are still found and the matrix refactorized for all worlds at once, so
+    another world's iterates reach a world's."""
     model = _helices()
     fresh, world = _rollout(model, 40)
     plain, _ = _rollout(model, 80)
     both, _ = _rollout(model, 80, reset_at=40, worlds=(0, 1))
-    assert np.abs(both - fresh).max() < 1.0e-6
-    one, _ = _rollout(model, 80, reset_at=40, worlds=(1,))
     nodes = np.repeat(world, 3)
     nd = nodes.size
+    assert np.abs(both - fresh)[:nd].max() < 2.0e-5  # 8.3e-6 at the worst of 18 runs
+    assert np.abs(both - fresh)[nd:].max() < 1.0e-3  # twists: 2.1e-4
+    one, _ = _rollout(model, 80, reset_at=40, worlds=(1,))
     assert np.abs(one[:nd][nodes == 1] - fresh[:nd][nodes == 1]).max() < 2.0e-4
     assert np.abs(one[:nd][nodes == 0] - plain[:nd][nodes == 0]).max() < 2.0e-4
 

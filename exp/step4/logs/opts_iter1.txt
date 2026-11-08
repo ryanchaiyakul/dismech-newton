@@ -1,0 +1,27 @@
+== DM_PROXY=0 DM_MODE=lagged DM_ITER=1
+BOUNCE impact -1.054 rebound 2.017 ratio 1.91 deepest below rest 2.40 mm
+z 1.2200527 rest 0.12400000000000001 min 0.116898924 f [ 6.6113837e-11  1.1203399e-02  2.0196638e+00  4.4618655e-04
+E       AssertionError: (np.float32(1.2200527), 0.12400000000000001)
+exp\step4\test_pinned.py:41: AssertionError
+1 failed in 8.55s
+== DM_PROXY=1 DM_MODE=lagged DM_ITER=1
+BOUNCE impact -0.492 rebound 0.514 ratio 1.05 deepest below rest 1.22 mm
+z 0.12433672 rest 0.12400000000000001 min 0.12313174 f [ 6.2470235e-06 -2.9216203e-04  2.8289825e-01 -3.5702727e-05
+exp\step4\test_pinned.py:43: AssertionError
+1 failed in 8.59s
+== DM_PROXY=2 DM_MODE=lagged DM_ITER=1
+BOUNCE impact -1.726 rebound 3.544 ratio 2.05 deepest below rest 2.37 mm
+z 0.47182098 rest 0.12400000000000001 min 0.12253595 f [ 4.3640313e-08  1.5381928e-02  2.7233851e-01 -2.8710067e-04
+E       AssertionError: (np.float32(0.47182098), 0.12400000000000001)
+exp\step4\test_pinned.py:41: AssertionError
+1 failed in 8.05s
+== DM_PROXY=0 DM_MODE=staggered DM_ITER=1
+BOUNCE impact -0.432 rebound 0.064 ratio 0.15 deepest below rest 0.22 mm
+z 0.12403975 rest 0.12400000000000001 min 0.124036014 f [ 2.9213404e-10 -5.0197970e-09  3.1392014e-01  8.3876926e-11
+1 passed in 12.45s
+== DM_PROXY=1 DM_MODE=staggered DM_ITER=1
+BOUNCE impact -0.438 rebound 0.041 ratio 0.09 deepest below rest 5.79 mm
+z 0.10057296 rest 0.12400000000000001 min 0.10057296 f [ 1.8873665e-10 -4.9795518e-10  3.1392008e-01 -1.2693944e-11
+E       AssertionError: (np.float32(0.10057296), 0.12400000000000001)
+exp\step4\test_pinned.py:41: AssertionError
+1 failed in 12.52s

@@ -1,0 +1,136 @@
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.4
+   Devices:
+     "cpu"      : "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD"
+     "cuda:0"   : "NVIDIA GeForce RTX 5070 Ti" (16 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     \\?\C:\Users\12345\AppData\Local\NVIDIA\warp\Cache\1.17.0
+Module newton._src.utils.mesh 92b663b load on device 'cpu' took 1.29 ms  (cached)
+Module validate_and_correct_inertia_kernel_1ff2ac62 1ff2ac6 load on device 'cuda:0' took 1.06 ms  (cached)
+Module newton._src.geometry.bvh 58a3a49 load on device 'cuda:0' took 0.99 ms  (cached)
+Module newton._src.solvers.coupled.model_view a945984 load on device 'cuda:0' took 1.44 ms  (cached)
+Module newton._src.solvers.coupled.solver_coupled c3e4e36 load on device 'cuda:0' took 1.07 ms  (cached)
+Module newton._src.solvers.mujoco.kernels f77d9bf load on device 'cuda:0' took 8.10 ms  (cached)
+Module mujoco_warp._src.set_const 4f91db5 load on device 'cuda:0' took 1.64 ms  (cached)
+Module mujoco_warp._src.smooth 7937da7 load on device 'cuda:0' took 1.87 ms  (cached)
+Module _small_cholesky_factorize_block__locals__kernel_79a57364 20d25ea load on device 'cuda:0' took 0.65 ms  (cached)
+Module _small_cholesky_solve_block__locals__kernel_c4e2dcc2 4c4cbb4 load on device 'cuda:0' took 0.55 ms  (cached)
+Module dismech_newton.state 7e4b12c load on device 'cuda:0' took 0.76 ms  (cached)
+Module element_kernels__locals__measure_ed94df5e ed94df5 load on device 'cuda:0' took 0.83 ms  (cached)
+Module newton._src.solvers.coupled.interface 8695af3 load on device 'cuda:0' took 0.73 ms  (cached)
+Module newton._src.viewer.kernels 50484b9 load on device 'cuda:0' took 1.75 ms  (cached)
+Module newton._src.sim.articulation cc479e3 load on device 'cuda:0' took 3.27 ms  (cached)
+Module _copy_if_kernel_5eb93af2 aece376 load on device 'cuda:0' took 0.61 ms  (cached)
+Module _copy_if_kernel_5eb93af2 8e12fe9 load on device 'cuda:0' took 0.61 ms  (cached)
+Module _nxn_broadphase__locals__kernel_5424cb63 5424cb6 load on device 'cuda:0' took 0.59 ms  (cached)
+Module _primitive_narrowphase__locals__primitive_narrowphase_2b4ed5bf 2b4ed5b load on device 'cuda:0' took 0.96 ms  (cached)
+Module mujoco_warp._src.constraint 8d4d513 load on device 'cuda:0' took 0.59 ms  (cached)
+Module _friction_dof__locals__kernel_c23b2f31 c23b2f3 load on device 'cuda:0' took 0.68 ms  (cached)
+Module _efc_contact_init__locals__kernel_9009dd76 9009dd7 load on device 'cuda:0' took 0.71 ms  (cached)
+Module _efc_contact_jac_sparse__locals__kernel_54cecf88 54cecf8 load on device 'cuda:0' took 0.68 ms  (cached)
+Module _efc_contact_update__locals__kernel_efb3ac6e efb3ac6 load on device 'cuda:0' took 0.69 ms  (cached)
+Module mujoco_warp._src.passive 0de6fd1 load on device 'cuda:0' took 1.35 ms  (cached)
+Module _qfrc_passive_kernel__locals__kernel_976399dd 976399d load on device 'cuda:0' took 0.56 ms  (cached)
+Module _qfrc_smooth__locals__kernel_8b823980 8b82398 load on device 'cuda:0' took 0.54 ms  (cached)
+Module mujoco_warp._src.support 770ef7d load on device 'cuda:0' took 0.53 ms  (cached)
+Module _small_cholesky_factorize_solve_block__locals__kernel_9da335f1 a5c2521 load on device 'cuda:0' took 0.63 ms  (cached)
+Module _solve_init_dof__locals__kernel_7cb1664a 7cb1664 load on device 'cuda:0' took 0.54 ms  (cached)
+Module mujoco_warp._src.solver a33a125 load on device 'cuda:0' took 0.82 ms  (cached)
+Module _solve_init_jaref_kernel__locals__kernel_fd60cb6b fd60cb6 load on device 'cuda:0' took 0.60 ms  (cached)
+Module mul_m_kernel__locals___mul_m_f3de1cc7 f3de1cc load on device 'cuda:0' took 0.70 ms  (cached)
+Module _update_constraint_efc__locals__kernel_0539aa50 0539aa5 load on device 'cuda:0' took 0.58 ms  (cached)
+Module _update_constraint_init_qfrc_constraint_sparse__locals__kernel_801f2ee2 801f2ee load on device 'cuda:0' took 0.63 ms  (cached)
+Module _update_gradient_zero_grad_dot__locals__kernel_b20934d7 b20934d load on device 'cuda:0' took 0.54 ms  (cached)
+Module _update_gradient_grad__locals__kernel_c876081d c876081 load on device 'cuda:0' took 0.56 ms  (cached)
+Module _update_gradient_init_h_sparse__locals__kernel_f82bfdd8 f82bfdd load on device 'cuda:0' took 0.58 ms  (cached)
+Module _JTDACJ_sparse__locals__kernel_765abea5 765abea load on device 'cuda:0' took 0.68 ms  (cached)
+Module _JTDACJ_sparse__locals__kernel_765abea5 bd2cd56 load on device 'cuda:0' took 0.94 ms  (cached)
+Module _update_gradient_cholesky_blocked__locals__kernel_84037f96 e5d36c1 load on device 'cuda:0' took 93.64 ms  (cached)
+Module _linesearch_jv_fused_kernel__locals__kernel_81bfab8c 81bfab8 load on device 'cuda:0' took 0.79 ms  (cached)
+Module _linesearch_iterative_kernel__locals__kernel_b9f3ad38 5bb5de9 load on device 'cuda:0' took 1.20 ms  (cached)
+Module _update_constraint_efc__locals__kernel_e953547e e953547 load on device 'cuda:0' took 0.66 ms  (cached)
+Module _update_gradient_zero_grad_dot__locals__kernel_e9f8c963 e9f8c96 load on device 'cuda:0' took 0.56 ms  (cached)
+Module _update_gradient_grad__locals__kernel_87959044 8795904 load on device 'cuda:0' took 0.56 ms  (cached)
+Module _update_gradient_h_incremental_sparse__locals__kernel_e8129775 e812977 load on device 'cuda:0' took 0.64 ms  (cached)
+Module _update_gradient_cholesky_blocked_skip_unchanged__locals__kernel_116ae253 1e9ed71 load on device 'cuda:0' took 106.48 ms  (cached)
+Module _solve_done__locals__kernel_a46fb74d a46fb74 load on device 'cuda:0' took 0.86 ms  (cached)
+Module mujoco_warp._src.derivative 73aac08 load on device 'cuda:0' took 1.66 ms  (cached)
+Module mujoco_warp._src.forward fa7fa28 load on device 'cuda:0' took 1.05 ms  (cached)
+Module _next_time_builder__locals___next_time_bc454e15 bc454e1 load on device 'cuda:0' took 0.63 ms  (cached)
+Module newton._src.solvers.coupled.proxy_utils 390346f load on device 'cuda:0' took 0.70 ms  (cached)
+Module dismech_newton.coupling 53c0c4a load on device 'cuda:0' took 2.13 ms  (cached)
+Module element_kernels__locals__previous_14015f2c 14015f2 load on device 'cuda:0' took 0.70 ms  (cached)
+Module element_kernels__locals__penalty_cba0516e cba0516 load on device 'cuda:0' took 0.55 ms  (cached)
+Module dismech_newton.solver f4b386e load on device 'cuda:0' took 2.06 ms  (cached)
+Module dismech_newton.contact 1aade4f load on device 'cuda:0' took 7.24 ms  (cached)
+Module dismech_newton.collide e7eae97 load on device 'cuda:0' took 8.15 ms  (cached)
+Module element_kernels__locals__energy_2f546a2d 2f546a2 load on device 'cuda:0' took 1.11 ms  (cached)
+Module element_kernels__locals__grad_c771cfa1 c771cfa load on device 'cuda:0' took 1.31 ms  (cached)
+Module element_kernels__locals__assemble_bea6b233 bea6b23 load on device 'cuda:0' took 1.11 ms  (cached)
+Module dismech_newton.linear 1a50abe load on device 'cuda:0' took 0.56 ms  (cached)
+Module dismech_newton.linear b392c73 load on device 'cuda:0' took 0.65 ms  (cached)
+Module element_kernels__locals__commit_3d9cd601 3d9cd60 load on device 'cuda:0' took 1.32 ms  (cached)
+Module dismech_newton.linear e0e4c90 load on device 'cuda:0' took 0.71 ms  (cached)
+Module cloth_twist 0533745 load on device 'cuda:0' took 1.00 ms  (cached)
+F 0 t 0.017 mj +1.548 +1.848 +2.257 proxy +1.548 +1.848 +2.257 pen 0.0000 counts [0 0 0]
+Module newton._src.viewer.kernels 6180286 load on device 'cuda:0' took 1.63 ms  (cached)
+Module newton._src.viewer.kernels 0ce1dbe load on device 'cuda:0' took 1.41 ms  (cached)
+F 5 t 0.100 mj +1.251 +1.549 +1.999 proxy +1.251 +1.549 +1.999 pen 0.0000 counts [23  0  0]
+F 10 t 0.183 mj +1.102 +1.359 +1.826 proxy +1.102 +1.359 +1.826 pen 0.0000 counts [63  0  0]
+F 15 t 0.267 mj +0.999 +1.171 +1.648 proxy +0.999 +1.171 +1.648 pen 0.0000 counts [103   0   0]
+F 20 t 0.350 mj +0.946 +1.000 +1.417 proxy +0.946 +1.000 +1.417 pen 0.0000 counts [143   0   0]
+F 25 t 0.433 mj +0.998 +1.022 +1.131 proxy +0.998 +1.022 +1.131 pen 0.0000 counts [183   0   0]
+F 30 t 0.517 mj +1.056 +1.061 +1.004 proxy +1.056 +1.061 +1.004 pen 0.0000 counts [223   0   0]
+F 35 t 0.600 mj +1.057 +1.044 +1.037 proxy +1.057 +1.044 +1.037 pen 0.0000 counts [263   0   0]
+F 40 t 0.683 mj +1.025 +1.013 +1.083 proxy +1.025 +1.013 +1.083 pen 0.0000 counts [303   0   0]
+F 45 t 0.767 mj +1.002 +1.000 +1.064 proxy +1.002 +1.000 +1.064 pen 0.0000 counts [343   0   0]
+F 50 t 0.850 mj +1.018 +1.010 +0.991 proxy +1.018 +1.010 +0.991 pen 0.0000 counts [383   0   0]
+F 55 t 0.933 mj +1.037 +1.039 +0.994 proxy +1.037 +1.039 +0.994 pen 0.0000 counts [423   0   0]
+F 60 t 1.017 mj +1.042 +1.035 +1.034 proxy +1.042 +1.035 +1.034 pen 0.0000 counts [462   0   0]
+F 65 t 1.100 mj +1.032 +1.007 +1.031 proxy +1.032 +1.007 +1.031 pen 0.0000 counts [492   0   0]
+F 70 t 1.183 mj +1.017 +0.997 +1.001 proxy +1.017 +0.997 +1.001 pen 0.0000 counts [527   0   0]
+F 75 t 1.267 mj +1.014 +1.017 +1.012 proxy +1.014 +1.017 +1.012 pen 0.0000 counts [563   0   0]
+F 80 t 1.350 mj +1.030 +1.025 +1.029 proxy +1.030 +1.025 +1.029 pen 0.0000 counts [598   0   0]
+F 85 t 1.433 mj +1.041 +1.008 +1.022 proxy +1.041 +1.008 +1.022 pen 0.0000 counts [623   0   0]
+F 90 t 1.517 mj +1.030 +0.997 +1.019 proxy +1.030 +0.997 +1.019 pen 0.0000 counts [650   0   0]
+F 95 t 1.600 mj +1.013 +0.996 +1.021 proxy +1.013 +0.996 +1.021 pen 0.0000 counts [678   0   0]
+F 100 t 1.683 mj +1.014 +0.994 +1.018 proxy +1.014 +0.994 +1.018 pen 0.0000 counts [710   0   0]
+F 105 t 1.767 mj +1.024 +0.995 +1.020 proxy +1.024 +0.995 +1.020 pen 0.0000 counts [741   0   0]
+F 110 t 1.850 mj +1.027 +0.992 +1.021 proxy +1.027 +0.992 +1.021 pen 0.0000 counts [762   0   0]
+F 115 t 1.933 mj +1.023 +0.984 +1.016 proxy +1.023 +0.984 +1.016 pen 0.0000 counts [795   0   0]
+F 120 t 2.017 mj +1.015 +0.987 +1.012 proxy +1.015 +0.987 +1.012 pen 0.0000 counts [814   0   0]
+F 125 t 2.100 mj +1.014 +0.991 +1.012 proxy +1.014 +0.991 +1.012 pen 0.0000 counts [840   0   0]
+F 130 t 2.183 mj +1.021 +0.985 +1.009 proxy +1.021 +0.985 +1.009 pen 0.0000 counts [866   0   0]
+F 135 t 2.267 mj +1.020 +0.984 +1.006 proxy +1.020 +0.984 +1.006 pen 0.0000 counts [901   0   0]
+F 140 t 2.350 mj +1.013 +0.986 +1.002 proxy +1.013 +0.986 +1.002 pen 0.0000 counts [928   0   0]
+F 145 t 2.433 mj +1.012 +0.981 +0.995 proxy +1.012 +0.981 +0.995 pen 0.0000 counts [959   0   0]
+F 150 t 2.517 mj +1.013 +0.980 +0.991 proxy +1.013 +0.980 +0.991 pen 0.0000 counts [987   0   0]
+F 155 t 2.600 mj +1.014 +0.985 +0.989 proxy +1.014 +0.985 +0.989 pen 0.0000 counts [1015    0    0]
+F 160 t 2.683 mj +1.016 +0.984 +0.987 proxy +1.016 +0.984 +0.987 pen 0.0000 counts [1030    0    0]
+F 165 t 2.767 mj +1.014 +0.983 +0.987 proxy +1.014 +0.983 +0.987 pen 0.0000 counts [1058    0    0]
+F 170 t 2.850 mj +1.011 +0.979 +0.988 proxy +1.011 +0.979 +0.988 pen 0.0000 counts [1094    0    0]
+F 175 t 2.933 mj +1.012 +0.978 +0.982 proxy +1.012 +0.978 +0.982 pen 0.0000 counts [1117    0    0]
+F 180 t 3.017 mj +1.015 +0.982 +0.977 proxy +1.015 +0.982 +0.977 pen 0.0000 counts [1152    0    0]
+F 185 t 3.100 mj +1.016 +0.983 +0.982 proxy +1.016 +0.983 +0.982 pen 0.0000 counts [1168    0    0]
+F 190 t 3.183 mj +1.015 +0.981 +0.985 proxy +1.015 +0.981 +0.985 pen 0.0000 counts [1196    0    0]
+F 195 t 3.267 mj +1.013 +0.979 +0.980 proxy +1.013 +0.979 +0.980 pen 0.0000 counts [1225    0    0]
+F 200 t 3.350 mj +1.012 +0.980 +0.977 proxy +1.012 +0.980 +0.977 pen 0.0000 counts [1263    0    0]
+F 205 t 3.433 mj +1.012 +0.981 +0.979 proxy +1.012 +0.981 +0.979 pen 0.0000 counts [1292    0    0]
+F 210 t 3.517 mj +1.015 +0.981 +0.981 proxy +1.015 +0.981 +0.981 pen 0.0000 counts [1305    0    0]
+F 215 t 3.600 mj +1.015 +0.981 +0.980 proxy +1.015 +0.981 +0.980 pen 0.0000 counts [1322    0    0]
+F 220 t 3.683 mj +1.013 +0.980 +0.978 proxy +1.013 +0.980 +0.978 pen 0.0000 counts [1338    0    0]
+F 225 t 3.767 mj +1.012 +0.980 +0.978 proxy +1.012 +0.980 +0.978 pen 0.0000 counts [1356    0    0]
+F 230 t 3.850 mj +1.012 +0.980 +0.977 proxy +1.012 +0.980 +0.977 pen 0.0000 counts [1367    0    0]
+F 235 t 3.933 mj +1.014 +0.980 +0.978 proxy +1.014 +0.980 +0.978 pen 0.0000 counts [1375    0    0]
+F 240 t 4.017 mj +1.015 +0.980 +0.979 proxy +1.015 +0.980 +0.979 pen 0.0000 counts [1378    0    0]
+F 245 t 4.100 mj +1.015 +0.979 +0.978 proxy +1.015 +0.979 +0.978 pen 0.0000 counts [1386    0    0]
+F 250 t 4.183 mj +1.014 +0.979 +0.978 proxy +1.014 +0.979 +0.978 pen 0.0000 counts [1394    0    0]
+F 255 t 4.267 mj +1.013 +0.979 +0.977 proxy +1.013 +0.979 +0.977 pen 0.0000 counts [1404    0    0]
+F 260 t 4.350 mj +1.013 +0.979 +0.977 proxy +1.013 +0.979 +0.977 pen 0.0000 counts [1416    0    0]
+F 265 t 4.433 mj +1.014 +0.979 +0.978 proxy +1.014 +0.979 +0.978 pen 0.0000 counts [1439    0    0]
+F 270 t 4.517 mj +1.015 +0.979 +0.979 proxy +1.015 +0.979 +0.979 pen 0.0000 counts [1447    0    0]
+F 275 t 4.600 mj +1.014 +0.979 +0.978 proxy +1.014 +0.979 +0.978 pen 0.0000 counts [1454    0    0]
+F 280 t 4.683 mj +1.014 +0.978 +0.977 proxy +1.014 +0.978 +0.977 pen 0.0000 counts [1473    0    0]
+F 285 t 4.767 mj +1.014 +0.978 +0.978 proxy +1.014 +0.978 +0.978 pen 0.0000 counts [1490    0    0]
+F 290 t 4.850 mj +1.014 +0.979 +0.978 proxy +1.014 +0.979 +0.978 pen 0.0000 counts [1500    0    0]
+F 295 t 4.933 mj +1.015 +0.979 +0.978 proxy +1.015 +0.979 +0.978 pen 0.0000 counts [1513    0    0]

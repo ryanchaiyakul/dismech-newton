@@ -3,6 +3,8 @@ contacts within the soft step (:class:`ProxyArm`), so a pinch holds at the sourc
 
 from types import SimpleNamespace
 
+import os
+
 import numpy as np
 import warp as wp
 from newton import BodyFlags, JointType, Model, State
@@ -85,7 +87,7 @@ class ProxyArm:
         wp.launch(_proxy_update_kernel, dim=self._body.shape[0],
                   inputs=[self._body, a.base, a.start, self.k, m.body_world, m.body_mass, m.body_inertia, m.body_com,
                           m.gravity, state.body_q, state.body_qd, state.body_f, self._last, self._valid,
-                          int(self.restart), h],
+                          int(self.restart), h, int(os.environ.get("DM_PROXY", "0"))],
                   outputs=[a.M, a.Minv, a.pred, a.com, self._q, self._qd, self._offset, self._start],
                   device=self.device)
         self.restart = False
@@ -146,7 +148,7 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
                          body_world: wp.array[wp.int32], mass: wp.array[float], inertia: wp.array[wp.mat33],
                          body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
                          body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
-                         last: wp.array[wp.transform], valid: wp.array[wp.int32], restart: int, h: float,
+                         last: wp.array[wp.transform], valid: wp.array[wp.int32], restart: int, h: float, opt: int,
                          M: wp.array3d[float], Minv: wp.array3d[float], pred: wp.array[float], com: wp.array[wp.vec3],
                          q_step: wp.array[wp.transform], qd_step: wp.array[wp.spatial_vector],
                          offset: wp.array[wp.spatial_vector], start_q: wp.array[wp.transform]):
@@ -172,6 +174,9 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     v, om = wp.spatial_top(body_qd[b]), wp.spatial_bottom(body_qd[b])
     f, tau = wp.spatial_top(body_f[b]), wp.spatial_bottom(body_f[b])
     g = gravity[wp.max(body_world[b], 0)]
+    if opt == 1:  # the offset is the lag's, not a motion: out of pred (and of the velocity out)
+        dc = wp.vec3()
+        dr = wp.vec3()
     dx = dc + h * v + h * h * (f / m + g)
     dth = dr + h * om + h * h * (Iinv * tau)
     for r in range(3):
@@ -188,6 +193,8 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     q_step[b] = q0
     qd_step[b] = wp.spatial_vector()
     offset[b] = wp.spatial_vector(dc, dr)
+    if opt == 2:  # harvest m (z - pred + dc) / h^2: the velocity out one more offset back
+        offset[b] = wp.spatial_vector(2.0 * dc, 2.0 * dr)
 
 
 @wp.kernel

@@ -40,7 +40,7 @@ EA = E * np.pi * A**2
 
 
 class Example(CableExample):
-    substeps = 32  # at 4, the end loop snaps through its neck within a step under load; at 16, F and M sit 2% off
+    substeps = 16  # at 4, the end loop snaps through its neck within a step under load (8 passes, but slower)
     length, slack = 0.5, 0.3
     t_push, t_settle = 2.0, 2.0
     measure_every = plot_every = 15  # frames
@@ -231,11 +231,14 @@ class Example(CableExample):
             f"(t {t[slip > 0.1][0]:.2f} s)")
         c = self.comparison()
         assert len(c["F"]) > 100, f"no plectoneme ({len(c['F'])} frames with a ply)"
-        for key, lo, hi in (("R", 0.97, 1.05), ("F", 0.93, 1.03), ("M", 0.97, 1.03)):
-            median = float(np.median(c[key]))
-            spread = float(np.percentile(np.abs(c[key] / median - 1.0), 90))
-            print(f"{key}: median {median:.3f}, 90% within {100 * spread:.1f}%")
-            assert lo < median < hi, f"{key} median {median:.3f} outside ({lo}, {hi})"
+        # every measured frame, not a median: a frozen or interpenetrated ply fails (16 substeps: R/a 1.019-1.027,
+        # F/F_th 0.97-1.03, M/M_th 0.98-1.01 throughout; 32: R/a 1.023-1.028, F/F_th 0.98-1.02, M/M_th 0.99-1.01)
+        for key, lo, hi in (("R", 1.0, 1.05), ("F", 0.93, 1.07), ("M", 0.93, 1.07)):
+            v = c[key]
+            print(f"{key}: median {np.median(v):.3f}, range {v.min():.3f}-{v.max():.3f}")
+            bad = (v <= lo) | (v >= hi)
+            assert not bad.any(), (f"{key} {v[bad][0]:.3f} outside ({lo}, {hi}) at {c['turns'][bad][0]:.2f} turns "
+                                   f"({bad.sum()} of {len(v)} frames)")
 
 
 # -- theory and topology --------------------------------------------------------------------------

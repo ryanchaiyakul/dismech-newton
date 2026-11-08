@@ -1,0 +1,42 @@
+== staggered iter 1
+        assert solver.solver("soft").pins.count == 1
+        assert dp < 1.0e-4, dp
+        assert dL < 4.0e-3, dL
+>       assert gap < 4.0e-4, gap
+E       AssertionError: np.float32(0.04340728)
+E       assert np.float32(0.04340728) < 0.0004
+tests\test_coupling.py:202: AssertionError
+        assert np.isfinite(x).all(), "non-finite positions"
+        assert x[:, 2].min() > self.surface, "the cable penetrated the table"
+        assert err < 0.01, f"cable placed {err * 100:.1f} cm from the target (Newton's test: < 1 cm)"
+>       assert np.allclose(h[held, 1], servo, rtol=0.02), f"grip {h[held, 1].min():.3f}-{h[held, 1].max():.3f} N, "                                                           f"servo {servo:.3f} N"
+E       AssertionError: grip 4.830-4.841 N, servo 5.000 N
+examples\newton\franka_cable_ik_pick_place.py:221: AssertionError
+        assert np.isfinite(x).all(), "non-finite positions"
+        assert self.cross == 0, f"the napkin passed through itself ({self.cross} crossings)"
+        assert (x[over, 2] > self.top).all(), "the napkin went into the table"
+        assert np.allclose(grip, self.servo, rtol=0.1), f"grip {grip.min():.3f}-{grip.max():.3f} N, servo " \
+            assert err < 0.02, f"corner laid {err * 100:.1f} cm from the napkin's far corner"
+>           assert ((flap > lo) & (flap < hi)).all(), f"the flap is not flat on the napkin: {flap.min(0)} {flap.max(0)}"
+E           AssertionError: the flap is not flat on the napkin: [0.5500865  0.21535154 0.30197757] [0.6356939  0.3195868  0.34331313]
+== staggered iter 2
+>       assert worst < 1.0e-4, worst
+E       AssertionError: np.float32(0.26723653)
+E       assert np.float32(0.26723653) < 0.0001
+tests\test_coupling.py:143: AssertionError
+        assert solver.solver("soft").pins.count == 1
+>       assert dp < 1.0e-4, dp
+E       AssertionError: np.float32(0.021019692)
+E       assert np.float32(0.021019692) < 0.0001
+tests\test_coupling.py:200: AssertionError
+        assert np.isfinite(x).all(), "non-finite positions"
+        assert x[:, 2].min() > self.surface, "the cable penetrated the table"
+        assert err < 0.01, f"cable placed {err * 100:.1f} cm from the target (Newton's test: < 1 cm)"
+>       assert np.allclose(h[held, 1], servo, rtol=0.02), f"grip {h[held, 1].min():.3f}-{h[held, 1].max():.3f} N, "                                                           f"servo {servo:.3f} N"
+E       AssertionError: grip 4.831-4.839 N, servo 5.000 N
+examples\newton\franka_cable_ik_pick_place.py:221: AssertionError
+____________________________ test_midas_axial_slip ____________________________
+    def test_midas_axial_slip():
+        sliding, the push is mu sum(N) (mean 2%, each frame 6%) and the rod's axial force the hand's push (1.5%)."""
+        ex = _load("midas_axial").Example(None, None)
+self = <midas_axial.Example object at 0x00000134A9CB2F90>

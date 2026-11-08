@@ -1,0 +1,98 @@
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\newton\_src\solvers\mujoco\solver_mujoco.py:4482: UserWarning: Joint order is not in depth-first topological order while converting Newton model to MuJoCo, this may lead to diverging kinematics between MuJoCo and Newton.
+  self._convert_to_mjc(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 1: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 2: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 4: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 5: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 7: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 8: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 10: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 11: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 13: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\ipc-contact\.venv\Lib\site-packages\mujoco_warp\_src\io.py:411: UserWarning: geom 14: friction[0] (0.0) < MJ_MINMU (1e-05) with condim=3 may cause NaN
+  warnings.warn(
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.4
+   Devices:
+     "cpu"      : "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD"
+     "cuda:0"   : "NVIDIA GeForce RTX 5070 Ti" (16 GiB, sm_120, mempool enabled)
+   Kernel cache:
+     \\?\C:\Users\12345\AppData\Local\NVIDIA\warp\Cache\1.17.0
+Module validate_and_correct_inertia_kernel_1ff2ac62 1ff2ac6 load on device 'cuda:0' took 0.94 ms  (cached)
+Module newton._src.geometry.bvh 58a3a49 load on device 'cuda:0' took 0.94 ms  (cached)
+Module newton._src.solvers.coupled.model_view a945984 load on device 'cuda:0' took 1.05 ms  (cached)
+Module newton._src.solvers.coupled.solver_coupled c3e4e36 load on device 'cuda:0' took 1.09 ms  (cached)
+Module newton._src.solvers.mujoco.kernels f77d9bf load on device 'cuda:0' took 7.99 ms  (cached)
+Module mujoco_warp._src.set_const 4f91db5 load on device 'cuda:0' took 1.96 ms  (cached)
+Module mujoco_warp._src.smooth 7937da7 load on device 'cuda:0' took 2.51 ms  (cached)
+Module _tile_cholesky_factorize_block__locals__kernel_0715ef8c c2bf57d load on device 'cuda:0' took 44.99 ms  (cached)
+Module _tile_cholesky_solve_block__locals__kernel_41317c8a d182187 load on device 'cuda:0' took 52.25 ms  (cached)
+Module dismech_newton.state 7e4b12c load on device 'cuda:0' took 1.11 ms  (cached)
+Module element_kernels__locals__measure_6c1fe513 6c1fe51 load on device 'cuda:0' took 1.11 ms  (cached)
+Module newton._src.solvers.coupled.interface 8695af3 load on device 'cuda:0' took 0.97 ms  (cached)
+Module newton._src.viewer.kernels 50484b9 load on device 'cuda:0' took 1.98 ms  (cached)
+Module __main__ 73df0dc load on device 'cuda:0' took 92.57 ms  (cached)
+Module _copy_if_kernel_5eb93af2 aece376 load on device 'cuda:0' took 5.10 ms  (cached)
+Module _copy_if_kernel_5eb93af2 4a0f453 load on device 'cuda:0' took 0.79 ms  (cached)
+Module _copy_if_kernel_5eb93af2 5ab96a3 load on device 'cuda:0' took 0.69 ms  (cached)
+Module _nxn_broadphase__locals__kernel_5424cb63 5424cb6 load on device 'cuda:0' took 0.66 ms  (cached)
+Module ccd_kernel_builder__locals__ccd_kernel_08605d4b 08605d4 load on device 'cuda:0' took 6.73 ms  (cached)
+Module _primitive_narrowphase__locals__primitive_narrowphase_c55bc0f0 c55bc0f load on device 'cuda:0' took 21.57 ms  (cached)
+Module mujoco_warp._src.constraint 8d4d513 load on device 'cuda:0' took 5.27 ms  (cached)
+Module _friction_dof__locals__kernel_febe3015 febe301 load on device 'cuda:0' took 1.08 ms  (cached)
+Module _limit_slide_hinge__locals__kernel_b1bbc842 b1bbc84 load on device 'cuda:0' took 1.19 ms  (cached)
+Module _efc_contact_init__locals__kernel_3a7c064e 3a7c064 load on device 'cuda:0' took 0.91 ms  (cached)
+Module _efc_contact_jac_dense__locals__kernel_b0c1fdf8 5fcbd59 load on device 'cuda:0' took 1.11 ms  (cached)
+Module _efc_contact_update__locals__kernel_efb3ac6e efb3ac6 load on device 'cuda:0' took 0.88 ms  (cached)
+Module mujoco_warp._src.passive 0de6fd1 load on device 'cuda:0' took 1.73 ms  (cached)
+Module _qfrc_passive_kernel__locals__kernel_976399dd 976399d load on device 'cuda:0' took 0.87 ms  (cached)
+Module _qfrc_smooth__locals__kernel_8b823980 8b82398 load on device 'cuda:0' took 0.82 ms  (cached)
+Module mujoco_warp._src.support 770ef7d load on device 'cuda:0' took 0.72 ms  (cached)
+Module _tile_cholesky_factorize_solve_block__locals__kernel_5e87e26e b8fb111 load on device 'cuda:0' took 60.39 ms  (cached)
+Module _solve_init_dof__locals__kernel_60896b56 60896b5 load on device 'cuda:0' took 0.85 ms  (cached)
+Module mujoco_warp._src.solver a33a125 load on device 'cuda:0' took 1.17 ms  (cached)
+Module _solve_init_jaref_kernel__locals__kernel_8efe95c8 8efe95c load on device 'cuda:0' took 7.04 ms  (cached)
+Module mul_m_kernel__locals___mul_m_f3de1cc7 f3de1cc load on device 'cuda:0' took 0.92 ms  (cached)
+Module _update_constraint_efc__locals__kernel_0539aa50 0539aa5 load on device 'cuda:0' took 0.70 ms  (cached)
+Module _update_constraint_init_qfrc_constraint_dense__locals__kernel_bd7ca2ec bd7ca2e load on device 'cuda:0' took 0.69 ms  (cached)
+Module _update_gradient_zero_grad_dot__locals__kernel_b20934d7 b20934d load on device 'cuda:0' took 0.63 ms  (cached)
+Module _update_gradient_grad__locals__kernel_c876081d c876081 load on device 'cuda:0' took 0.63 ms  (cached)
+Module _update_gradient_JTDAJ_dense_tiled__locals__kernel_4106c18c f5509db load on device 'cuda:0' took 6.80 ms  (cached)
+Module _update_gradient_cholesky__locals__kernel_4812a685 2e65238 load on device 'cuda:0' took 61.69 ms  (cached)
+Module _linesearch_iterative_kernel__locals__kernel_d9f402bf 1f3b0f6 load on device 'cuda:0' took 1.16 ms  (cached)
+Module _update_constraint_efc__locals__kernel_e953547e e953547 load on device 'cuda:0' took 0.79 ms  (cached)
+Module _update_constraint_init_qfrc_constraint_dense__locals__kernel_d92a3413 d92a341 load on device 'cuda:0' took 0.77 ms  (cached)
+Module _update_gradient_zero_grad_dot__locals__kernel_e9f8c963 e9f8c96 load on device 'cuda:0' took 0.68 ms  (cached)
+Module _update_gradient_grad__locals__kernel_87959044 8795904 load on device 'cuda:0' took 0.66 ms  (cached)
+Module _update_gradient_cholesky__locals__kernel_a73bb894 3c1b827 load on device 'cuda:0' took 59.85 ms  (cached)
+Module _solve_done__locals__kernel_a46fb74d a46fb74 load on device 'cuda:0' took 0.91 ms  (cached)
+Module mujoco_warp._src.derivative 73aac08 load on device 'cuda:0' took 1.76 ms  (cached)
+Module mujoco_warp._src.forward fa7fa28 load on device 'cuda:0' took 1.19 ms  (cached)
+Module _next_time_builder__locals___next_time_bc454e15 bc454e1 load on device 'cuda:0' took 0.75 ms  (cached)
+Module newton._src.sim.articulation cc479e3 load on device 'cuda:0' took 3.39 ms  (cached)
+Module newton._src.solvers.coupled.proxy_utils 390346f load on device 'cuda:0' took 1.31 ms  (cached)
+Module dismech_newton.coupling 53c0c4a load on device 'cuda:0' took 2.38 ms  (cached)
+Module element_kernels__locals__previous_f5fce056 f5fce05 load on device 'cuda:0' took 0.76 ms  (cached)
+Module element_kernels__locals__penalty_acf9c50c acf9c50 load on device 'cuda:0' took 0.67 ms  (cached)
+Module dismech_newton.contact 1aade4f load on device 'cuda:0' took 7.55 ms  (cached)
+Module dismech_newton.collide 3afd44b load on device 'cuda:0' took 8.68 ms  (cached)
+Module probe 4765546 load on device 'cuda:0' took 0.97 ms  (cached)
+Module dismech_newton.solver 882f06a load on device 'cuda:0' took 2.42 ms  (cached)
+Module element_kernels__locals__energy_cbbd6a80 cbbd6a8 load on device 'cuda:0' took 0.92 ms  (cached)
+Module element_kernels__locals__grad_a17d3946 a17d394 load on device 'cuda:0' took 0.98 ms  (cached)
+Module element_kernels__locals__assemble_33d93db6 33d93db load on device 'cuda:0' took 1.30 ms  (cached)
+Module dismech_newton.linear 1a50abe load on device 'cuda:0' took 0.72 ms  (cached)
+Module dismech_newton.linear b392c73 load on device 'cuda:0' took 0.70 ms  (cached)
+Module element_kernels__locals__commit_dbd25592 dbd2559 load on device 'cuda:0' took 1.05 ms  (cached)
+Module dismech_newton.linear e0e4c90 load on device 'cuda:0' took 0.66 ms  (cached)
+Module dismech_newton.rod 655b4ad load on device 'cuda:0' took 1.00 ms  (cached)
+LIFT examples/newton/cable_cross_slide_table.py: start/other lifted 0 deepest 0.988, start/proxy lifted 0 deepest 0.967

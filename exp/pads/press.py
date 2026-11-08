@@ -5,6 +5,7 @@ import sys
 
 import newton
 import numpy as np
+import warp as wp
 
 sys.path[:0] = ["tests", "examples"]
 from rollouts import cloth, grid  # noqa: E402
@@ -16,7 +17,7 @@ R, H, KH, TOP = 0.005, 0.003, 3.0e7, 0.05  # rod radius, pad thickness, kh [N/m^
 
 def pad(builder):
     cfg = newton.ModelBuilder.ShapeConfig(mu=0.5, margin=H, is_hydroelastic=True, kh=KH)
-    builder.add_shape_box(-1, xform=newton.transform((0.0, 0.0, TOP / 2), newton.quat_identity()), hx=0.3, hy=0.3,
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, TOP / 2), wp.quat_identity()), hx=0.3, hy=0.3,
                           hz=TOP / 2, cfg=cfg)
 
 

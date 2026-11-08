@@ -92,3 +92,12 @@ Grip trace (3.6-3.7 s, per finger |grip|, servo 5 N):
 Body/diag drop the cross term: squeeze mass 0.33 > 0.196 -> slope 1 - 0.33/0.196 = -0.7: alternation, as seen.
 The view mass underestimates (slope +0.56: passes converge monotonically, x1 steady). Full needed; eps .01 gives
 arm masses ~550 kg in rigid directions (float32 energies).
+
+Probe noise is not the cause (full, eps .1, passes 1): delta 0.1 / 10 N, refresh every 1 / 60 / 600 steps all
+[4.56-4.70, 5.28-5.32]; delta 0.01 loses the cable. Rewind by the unregularized Minv_s (`DM_SCHUR_REWIND=s`):
+eps .03 / .1 / .3 x1 [4.55, 5.31] / [4.63, 5.26] / [4.70, 5.15], x2 [4.70, 5.33] / [4.72, 5.28] / [4.75, 5.14]
+(eps .3 mean 4.95); proxy - MuJoCo drift grows with eps (35 / 50 / 100 um). Per-pass slope with full Schur ~ -0.25
+(was +0.46), but the converged force still jumps +-0.4 N step to step: the jitter is in the converged answer, not
+the passes. Open: is a +-0.3 N grip chatter physical with a stiff (true-impedance) finger on a moving cable
+(monolithic reference, idea 7), and the drift. View-mass x1 (5.00 +- 0.01) may be smooth because a light, lagged
+proxy filters.

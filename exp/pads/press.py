@@ -6,7 +6,7 @@ import sys
 import newton
 import numpy as np
 
-sys.path.insert(0, "tests")
+sys.path[:0] = ["tests", "examples"]
 from rollouts import cloth, grid  # noqa: E402
 
 from dismech_newton import SolverDiSMech, flatten_state  # noqa: E402

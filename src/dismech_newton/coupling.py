@@ -185,7 +185,10 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     acc = f / m + g
     alpha = Iinv * tau
     if extrap != 0:  # staggered: the source's own acceleration over its last step (its velocity change less our wrench)
-        if valid[b] != 0:
+        if extrap == 2:  # gravity alone
+            acc = g
+            alpha = wp.vec3()
+        elif valid[b] != 0:
             acc = (v - wp.spatial_top(vprev[b])) / h - wp.spatial_top(fprev[b]) / m
             alpha = (om - wp.spatial_bottom(vprev[b])) / h - Iinv * wp.spatial_bottom(fprev[b])
         else:

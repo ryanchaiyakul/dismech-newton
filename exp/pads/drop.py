@@ -1,5 +1,5 @@
 """Gate 4: a rod thrown flat at a pad (no gravity) at v_i rebounds at v_o: Hunt-Crossley's F = k delta^n (1 + d v)
-gives d v_i - ln(1 + d v_i) = d v_o + ln(1 - d v_o) (m v dv / (1 + d v) = -k delta^n d delta, over approach and
+gives d v_o + ln(1 - d v_o) = -(d v_i - ln(1 + d v_i)) (m v dv / (1 + d v) = -k delta^n d delta, over approach and
 rebound), whatever k and n. Sweep d [s/m] (DM_PAD_HC on a Newton hydroelastic pad)."""
 import os
 import sys
@@ -16,7 +16,7 @@ def exact(d):
     if d == 0.0:
         return VI
     lhs = d * VI - np.log1p(d * VI)
-    return brentq(lambda v: d * v + np.log1p(-d * v) - lhs, 1.0e-9, (1.0 - 1.0e-12) / d)
+    return brentq(lambda v: d * v + np.log1p(-d * v) + lhs, 1.0e-9, (1.0 - 1.0e-12) / d)
 
 
 def sim():

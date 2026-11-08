@@ -126,3 +126,27 @@ F = F_ref + K (x0 + h v(F) - x_ref), v(F) = v_base + R (F - F0) (R from the prob
 
 Robin x1 grip 4.917: servo 1000 N/m x (5 mm - gap): the finger rests 83 um into the barrier's 100 um margin
 (SMOOTH 0.02 x radius), MuJoCo pose == proxy pose at steady state; today's 5.00 carries the lagged offset.
+
+### Round 5 gates (branch exp/proxy-robin; proxy-impact worktree was taken over by another session at 13:03)
+
+Probe-free Robin (`DM_ROBIN=2`, in our harvest): v_free = 2 v1 - v0 - h Minv F_app (the source's own acceleration
+carried over; the first try v1 - h Minv F_app was wrong at impacts: rebound 1.07). K from the step's last factorized
+matrix (`DM_ROBIN_K=chord`) == end reassembly (bounce 0.21, grip 5.006 +- .003): k back-solves, no extra factor.
+Closed form: F = (M/h^2) [h X M (2 v1 - v0) - (pred - z) - h (2 v1 - v0)], X = (A^-1)_zz (no inverse).
+
+| gate | Robin + probes | Robin probe-free | Robin probe-free + debt |
+|---|---|---|---|
+| bounce ratio | 0.21 | 0.21 | 0.39 |
+| pick-place grip | 4.917 +- .002 | 5.006 +- .003 | 4.998 +- .004 |
+| momentum (1e-4) | 1.03 | 1.03 | 0.20 |
+| pin dp (1e-4) | 0.785 | 0.787 | 0.021 |
+| napkin fold grip (2 N) | pass | 1.81-2.20 fail | - |
+| MIDAS | NaN | push/mu 0.54 (-0.29..2.6) | - |
+| trampoline | 0/4 | 3/4 (body 2: known) | - |
+| impact, static, pick-place, cross-slide | pass | pass | - |
+| suite | 75 + 2 failed (momentum, pin) | same | - |
+| Franka swap | capture error (experiment's host numpy) | same | - |
+
+Momentum: Robin hands the source a prediction of the next contact force; prediction errors accumulate (no
+telescoping). Debt (D += F_app - F_ref, source gets R - D) bounds the imbalance to the last step's error (20% of p0
+at the rod impact) and costs impact (0.39).

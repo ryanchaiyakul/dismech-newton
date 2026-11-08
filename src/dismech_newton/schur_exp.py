@@ -92,9 +92,18 @@ def _select(S):
 
 
 def install():
+    from newton.solvers.experimental.coupled import SolverCoupledProxy
+
+    if os.environ.get("DM_PASSES"):  # every coupler's passes (examples included)
+        init = SolverCoupledProxy.Config.__init__
+
+        def _init(self, *a, **kw):
+            init(self, *a, **kw)
+            object.__setattr__(self, "iterations", int(os.environ["DM_PASSES"]))
+
+        SolverCoupledProxy.Config.__init__ = _init
     if not MODE:
         return
-    from newton.solvers.experimental.coupled import SolverCoupledProxy
 
     from . import coupling
     from .solver import SolverDiSMech

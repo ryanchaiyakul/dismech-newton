@@ -497,3 +497,123 @@ def test_rod_on_shape(shape):
     assert overflow(solver) == 0
     assert min(gaps) > 0.85 * r
     assert abs(gaps[-1] - r) < 0.1 * r  # resting on it
+
+
+# -- hydroelastic pads (Elandt et al. 2019): an elastic foundation, pressure kh per depth ---------------------------
+
+PAD_KH, PAD_R, PAD_TOP = 3.0e7, 0.005, 0.05  # pad's kh [N/m^3], rod radius, the pad's top
+
+
+def _pad_scene(g: float):
+    """A static pad (box, top at ``PAD_TOP``) flagged hydroelastic: its pressure starts at its offset surface."""
+    from utils.common import pads  # noqa: PLC0415
+
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -g))
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, PAD_TOP / 2), wp.quat_identity()), hx=0.3, hy=0.3,
+                          hz=PAD_TOP / 2, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    return builder, lambda model: pads(model, [-1], PAD_KH)
+
+
+def _pad_rod(builder, n: int, bend: float = 1.0):
+    pts = np.column_stack([np.linspace(-0.2, 0.2, n), np.zeros(n), np.full(n, PAD_TOP + PAD_R + 1.0e-4)])
+    SolverDiSMech.add_rod(builder, rod=newton.Rod(pts, radius=PAD_R), stretch_stiffness=1.0e5, bend_stiffness=bend,
+                          twist_stiffness=bend, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.5))
+
+
+def _settle(model, steps: int, dt: float, force=None):
+    solver = SolverDiSMech(model, iterations=30)
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    for _ in range(steps):
+        if force is not None:
+            s0.particle_f.assign(force)
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+    return s0
+
+
+@pytest.mark.parametrize("g", [98.1, 981.0])
+def test_pad_rest_depth(g):
+    """A rod and a sheet resting on a pad sink as Winkler's foundation says: a cylinder's line load
+    ``kh (4/3) sqrt(2R) delta^(3/2)``, a sheet's pressure ``kh delta`` (the pad's points along rod edges, over
+    triangles). 1.0000 over 1-300 g (2026-11-08)."""
+    builder, flag = _pad_scene(g)
+    _pad_rod(builder, 21)
+    model = builder.finalize()
+    flag(model)
+    x = _settle(model, 480, 1.0 / 240.0).particle_q.numpy()
+    w = model.particle_mass.numpy().sum() * g / 0.4
+    exact = (3.0 * w / (4.0 * PAD_KH * np.sqrt(2.0 * PAD_R))) ** (2.0 / 3.0)
+    assert np.allclose(PAD_TOP + PAD_R - x[:, 2], exact, rtol=1.0e-3)
+    builder, flag = _pad_scene(g)
+    v, f = grid(11, 11, 0.2, 0.2)
+    v += [-0.1, -0.1, PAD_TOP + 0.002 + 1.0e-4]
+    cloth(builder, v, f, density=0.5, tri_ke=1.0e3, tri_ka=1.0e3, edge_ke=1.0e-3, particle_radius=0.002,
+          damping=1.0e-2)
+    model = builder.finalize()
+    model.particle_mu = 0.5
+    flag(model)
+    x = _settle(model, 480, 1.0 / 240.0).particle_q.numpy()
+    exact = model.particle_mass.numpy().sum() * g / 0.04 / PAD_KH
+    assert np.allclose(PAD_TOP + 0.002 - x[:, 2], exact, rtol=1.0e-3)
+
+
+def test_pad_tilt():
+    """A stiff rod on a pad with an off-centre load ``P`` tilts as the foundation's force and moment balance says
+    (``delta = delta0 + theta s``, Winkler's line load integrated exactly): delta0 within 1%, theta 3% (the rod's own
+    bending, 9 um, is the rest: n = 11 / 21 / 41 err 1.0e-2 each, 2026-11-08)."""
+    from scipy.optimize import fsolve  # noqa: PLC0415
+
+    g, P, n = 98.1, 2.0, 21
+    builder, flag = _pad_scene(g)
+    _pad_rod(builder, n, bend=50.0 / (0.4 / (n - 1)))
+    model = builder.finalize()
+    flag(model)
+    s = np.linspace(-0.2, 0.2, n)
+    j = int(np.argmin(np.abs(s - 0.15)))
+    force = np.zeros((n, 3), np.float32)
+    force[j, 2] = -P
+    x = _settle(model, 720, 1.0 / 240.0, force).particle_q.numpy()
+    th, d0 = np.polyfit(x[:, 0], PAD_TOP + PAD_R - x[:, 2], 1)
+    w = model.particle_mass.numpy().sum() * g / 0.4
+    k = PAD_KH * 4.0 / 3.0 * np.sqrt(2.0 * PAD_R)
+    t = np.linspace(-0.2, 0.2, 20001)
+
+    def balance(y):
+        p = k * np.maximum(y[0] + y[1] * t, 0.0) ** 1.5
+        return [np.trapezoid(p, t) / (0.4 * w + P) - 1.0, np.trapezoid(t * p, t) / (P * s[j]) - 1.0]
+
+    e0, et = fsolve(balance, [1.0e-4, 1.0e-4], xtol=1.0e-13)
+    assert abs(d0 / e0 - 1.0) < 0.01, (d0, e0)
+    assert abs(th / et - 1.0) < 0.03, (th, et)
+
+
+@pytest.mark.parametrize("d", [0.0, 2.0])
+def test_pad_rebound(d):
+    """A rod thrown flat at a pad at ``v_i`` rebounds as Hunt-Crossley's ``F = k delta^n (1 + d v)`` says, whatever
+    ``k``, ``n``: ``d v_o + ln(1 - d v_o) = -(d v_i - ln(1 + d v_i))`` (``v_o = v_i`` at ``d = 0``), less backward
+    Euler's own loss: sim / exact 0.965 at d 0, 0.967-0.974 over d 0.5-4 (dt 5e-5, 2026-11-08)."""
+    from scipy.optimize import brentq  # noqa: PLC0415
+    from utils.common import pads  # noqa: PLC0415
+
+    vi, dt = 0.5, 5.0e-5
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, PAD_TOP / 2), wp.quat_identity()), hx=0.3, hy=0.3,
+                          hz=PAD_TOP / 2, cfg=newton.ModelBuilder.ShapeConfig(mu=0.0))
+    _pad_rod(builder, 21)
+    model = builder.finalize()
+    pads(model, [-1], 3.0e6, dissipation=d)
+    solver = SolverDiSMech(model, iterations=30)
+    s0, s1 = model.state(), model.state()
+    s0.particle_qd.assign(np.tile([0.0, 0.0, -vi], (21, 1)).astype(np.float32))
+    flatten_state(s0)
+    flatten_state(s1)
+    vo = 0.0
+    for _ in range(1200):
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+        vo = max(vo, float(s0.particle_qd.numpy()[:, 2].mean()))
+    lhs = d * vi - np.log1p(d * vi)
+    exact = vi if d == 0.0 else brentq(lambda v: d * v + np.log1p(-d * v) + lhs, 1.0e-9, (1.0 - 1.0e-12) / d)
+    assert 0.95 < vo / exact < 0.99, (vo, exact)

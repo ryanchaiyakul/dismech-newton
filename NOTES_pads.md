@@ -142,3 +142,13 @@ the MJCF capsules off, a back capsule shifted/shrunk 5 mm (none of it outside th
 fingertip domes in the hand's renders are part of the visual DIP meshes (contype 0): the collider was the capsule.
 MIDAS axial slip with the sensors (`exp/pads/midas_tactile.py`, sci6000): test_final passes (travel 28.1 mm, rod
 shift 0.22 mm). Data local only ($PAXINI; copied to sci6000's scratch/paxini).
+
+## PaXini readout (2026-11-09)
+
+`utils.tactile.Tactile`: device kernel per contact slot on a sensor shape (contact_force at the step's end, sensor
+frame at the step's start), shared over taxels within 1.25 spacings and the 45-degree cone (normalized weights),
+per coupled step committed (last pass), sampled per 12 ms frame = 6 x 2 ms steps = one CUDA graph.
+MIDAS slip (`exp/pads/midas_readout.py`, 225 frames): taxel sums = sensor force to 4e-7; test passes (28.2 mm);
+fingers N max 9.1 / 5.9 / 9.6 N, <= 11 taxels lit (the rod meets the tips' top rows), thumb untouched in this scene;
+104 ms wall per 12 ms frame. Sensor-frame x-y > -z on the domed tip: the sensor's z is not the contact normal there
+(a mu N check needs the contacts' own normal / friction split).

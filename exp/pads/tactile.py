@@ -24,9 +24,14 @@ TP, TR = np.array(tax["positions"]) * 1.0e-3, np.array(tax["frames"])
 mesh = np.load(f"{D}/S2015_mesh.npz")
 
 builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-builder.add_shape_mesh(-1, mesh=newton.Mesh(mesh["vertices"] * 1.0e-3, mesh["faces"].ravel()),
-                       cfg=newton.ModelBuilder.ShapeConfig(mu=MU))
 top = mesh["vertices"][np.abs(mesh["vertices"][:, 0]) < 0.3][:, 2].max() * 1.0e-3  # the crest
+if os.environ.get("BOX"):  # debug: a box with the crest's top instead of the mesh
+    import warp as wp
+    builder.add_shape_box(-1, xform=wp.transform((0.0, 0.009, top - 0.005), wp.quat_identity()), hx=0.0075, hy=0.011,
+                          hz=0.005, cfg=newton.ModelBuilder.ShapeConfig(mu=MU))
+else:
+    builder.add_shape_mesh(-1, mesh=newton.Mesh(mesh["vertices"] * 1.0e-3, mesh["faces"].ravel()),
+                           cfg=newton.ModelBuilder.ShapeConfig(mu=MU))
 n = 15
 ys = np.linspace(0.002, 0.016, n)
 SolverDiSMech.add_rod(builder, rod=newton.Rod(np.column_stack([np.zeros(n), ys, np.full(n, top + R + 2.0e-4)]),
@@ -91,6 +96,11 @@ def report(tag, fz, fy):
     return local, raw
 
 
+if os.environ.get("DBG"):
+    for k in range(5):
+        run(1, P, 0.0)
+        print("step", k, "rod z [mm]", (s0.particle_q.numpy()[[0, n // 2, -1], 2] * 1e3).round(3), "active",
+              int(solver.contact.s.active.numpy().sum()), flush=True)
 run(600, P, 0.0)
 press = report("press", P, 0.0)
 run(600, P, T)

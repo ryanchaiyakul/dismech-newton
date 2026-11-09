@@ -93,3 +93,19 @@ pad: the cable slips out (settle ~0). Next: quadrature along rod edges / over sh
 
 (Detached-HEAD incident: something checked out 92886a1 in this worktree mid-session; content was intact, moved back
 onto the branch as c9f4848. The first "new quadrature" press/tilt numbers were from the old code on sci6000.)
+
+### Gate 7 with the new pads (DM_PADS on the 12 Franka finger shapes; pick-place servo 5 N, fold servo 2 N)
+
+| variant | kh | grip lift / carry / settle | pick (rtol 2%) | fold (rtol 10%) | fold time |
+|---|---|---|---|---|---|
+| Robin x3 | 1e9 | 4.871 +- .000 / 4.870 +- .000 / 4.874 +- .003 | 4.870-4.880 | 1.86-2.50 | 1066 s |
+| Robin x1 | 1e9 | 4.871 +- .000 / 4.871 +- .000 / 4.873 +- .003 | 4.869-4.873 | 1.84-2.52 | 479 s |
+| lagged x1 | 1e9 | 4.871 +- .000 / 4.870 +- .000 / 4.874 +- .003 | 4.868-4.872 | 1.85-2.48 | 86 s |
+| lagged x1 | 1e8 | 4.374 +- .000 / 4.374 +- .001 / 4.374 +- .002 | 4.374-4.375 | **pass** | 80 s |
+| (no pads, Robin x3, A1) | - | 5.05 +- .23 / .28 / .27 | | | |
+
+The grip is steady in every variant, even lagged x1 (the "flips" fraction is meaningless at +- 0.000). Its offset from
+the servo is the pad's sink: a position servo (1000 N/m) on a compliant fingertip loses k_servo delta, delta from
+Winkler (cable R 5 mm, ~2 cm in the pad): kh 1e9 delta ~0.14 mm -> 0.13 N; 1e8 ~0.65 mm -> 0.63 N, as measured.
+The tests assume a rigid stop. Fold at kh 1e9: the napkin's grip spreads 1.85-2.5 (sheet points); passes at 1e8.
+MIDAS (no padded shapes) flaky on both branches: 5/6 pass here, 5/6 on b45a3ff. Suite = b45a3ff.

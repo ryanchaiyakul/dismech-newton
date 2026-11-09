@@ -41,7 +41,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import CableExample, grid
+from utils.common import CableExample, grid, pads
 
 from dismech_newton import SolverDiSMech
 
@@ -92,6 +92,7 @@ class Example(CableExample):
         self.ids, self.nx, self.ny = ids, nx, ny
         builder.add_ground_plane()
         model = builder.finalize()
+        pads(model, [b for b, label in enumerate(model.body_label) if "finger" in label])  # grip pads
         model.particle_mu = self.mu
         model.shape_material_mu.fill_(self.mu)
         self.control = model.control()

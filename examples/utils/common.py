@@ -59,6 +59,24 @@ def cached(name: str, config: dict, compute, fresh: bool = False) -> dict[str, n
 # -- prescribed motion of clamped segments ------------------------------------------------
 
 
+PAD_KH = 1.0e8  # a grip pad's pressure per depth [N/m^3] (an elastomer's E over its depth; Drake's 1e5-1e7 Pa / mm)
+
+
+def pads(model, bodies, kh: float = PAD_KH, dissipation: float = 0.0) -> int:
+    """Make the shapes of ``bodies`` (indices) hydroelastic grip pads in our contact (``SolverDiSMech``): Newton's
+    ``HYDROELASTIC`` flag and ``kh``, set on the finalized model (Newton's builder would ask the shapes for SDFs,
+    which our contact does not use), and Hunt-Crossley's ``dissipation`` [s/m]. Before the solver is built; returns
+    the shapes padded."""
+    from newton import ShapeFlags  # noqa: PLC0415
+
+    on = np.isin(model.shape_body.numpy(), list(bodies))
+    flags, k = model.shape_flags.numpy(), model.shape_material_kh.numpy()
+    model.shape_flags.assign(np.where(on, flags | int(ShapeFlags.HYDROELASTIC), flags).astype(flags.dtype))
+    model.shape_material_kh.assign(np.where(on, kh, k).astype(k.dtype))
+    model.shape_pad_dissipation = np.where(on, dissipation, 0.0)
+    return int(on.sum())
+
+
 def segment_dofs(model, body: int, twist_only: bool = False) -> list[int]:
     """DOFs ``[x0, x1, theta]`` (or ``[theta]``) of the segment whose proxy is ``body``."""
     der = model.dismech

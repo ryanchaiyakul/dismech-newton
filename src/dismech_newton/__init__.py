@@ -14,7 +14,3 @@ __all__ = [
     "register_custom_attributes",
     "suspended_tape",
 ]
-
-from .schur_exp import install as _schur_install  # EXPERIMENT (DM_SCHUR)
-
-_schur_install()

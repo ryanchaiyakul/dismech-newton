@@ -36,7 +36,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import SIM, THEORY, CableExample, inset
+from utils.common import SIM, THEORY, CableExample, inset, pads
 
 from dismech_newton import SolverDiSMech
 
@@ -85,6 +85,7 @@ class Example(CableExample):
                               collide=True)
         builder.add_ground_plane(height=self.surface, cfg=newton.ModelBuilder.ShapeConfig(mu=1.0))
         model = builder.finalize()
+        pads(model, [b for b, label in enumerate(model.body_label) if "finger" in label])  # grip pads
         self.control = model.control()
         def mujoco(m):
             return SolverMuJoCo(m, solver="newton", integrator="implicitfast", cone="elliptic", iterations=100,

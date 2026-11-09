@@ -24,7 +24,7 @@ import numpy as np
 import warp as wp
 from newton.solvers import SolverMuJoCo
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
-from utils.common import CACHE, SIM, THEORY, CableExample, inset
+from utils.common import CACHE, SIM, THEORY, CableExample, inset, pads
 
 from dismech_newton import SolverDiSMech
 
@@ -81,6 +81,7 @@ class Example(CableExample):
                                                                                                   mu=self.mu))
         SolverDiSMech.fix_segment(builder, bodies[0])
         model = builder.finalize()
+        pads(model, set(range(model.body_count)) - set(model.dismech.edge_body.numpy().tolist()))  # the hand: pads
         self.ea = self.youngs * np.pi * self.radius**2
         self.h = (self.clamp - self.free) / self.segments
         self.control = model.control()

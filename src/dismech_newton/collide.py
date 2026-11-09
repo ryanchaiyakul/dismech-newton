@@ -11,8 +11,6 @@ node and an edge decide their shared boundary with the same :func:`_ahead`. A bo
 a rod's node only if its edges lead away from the body, else the edge meets it at its interior's closest point.
 """
 
-import os
-
 import numpy as np
 import scipy.sparse as sp
 import warp as wp
@@ -318,16 +316,11 @@ def _bodies(model: Model, device) -> Bodies:
     b.kind, b.scale, b.source = model.shape_type, model.shape_scale, model.shape_source_ptr
     b.xform, b.body = model.shape_transform, model.shape_body
     b.margin, b.mu = model.shape_margin, model.shape_material_mu
+    # hydroelastic pads: Newton's flag and kh; Hunt-Crossley's d (Newton has none: ``model.shape_pad_dissipation``)
     pad = (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
     kh = model.shape_material_kh.numpy() if pad.any() else np.zeros(len(kind))
-    hc = np.full(len(kind), float(os.environ.get("DM_PAD_HC", 0.0)))  # EXPERIMENT: Newton has no such property
-    if os.environ.get("DM_PADS"):  # EXPERIMENT: DM_PADS=kh,pattern pads the shapes of bodies labelled *pattern*
-        kp, pat, *hcp = os.environ["DM_PADS"].split(",")  # EXPERIMENT: ,d Hunt-Crossley's [s/m]
-        labels = list(model.body_label)
-        sel = np.array([bb >= 0 and pat in labels[bb] for bb in body])
-        pad, kh = pad | sel, np.where(sel, float(kp), kh)
-        hc = np.where(sel, float(hcp[0]) if hcp else 0.0, hc)
-        print(f"DM_PADS: {sel.sum()} shapes padded: kh {kp}", flush=True)
+    hc = getattr(model, "shape_pad_dissipation", None)
+    hc = np.zeros(len(kind)) if hc is None else np.asarray(hc, dtype=float)
     b.kh = wp.array(np.where(pad, kh, 0.0), dtype=float, device=device)
     b.hc = wp.array(np.where(pad, hc, 0.0), dtype=float, device=device)
     # the cull sphere about the shape's origin; Newton's mesh radius is about its AABB's centre: a mesh's from its

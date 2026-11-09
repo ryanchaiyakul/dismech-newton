@@ -3,8 +3,6 @@ contacts within the soft step (:class:`ProxyArm`), so a pinch holds at the sourc
 
 from types import SimpleNamespace
 
-import os
-
 import numpy as np
 import warp as wp
 from newton import BodyFlags, JointType, Model, State
@@ -81,15 +79,13 @@ class ProxyArm:
         """The arm at the step from ``state`` (step ``h``); returns the body poses and velocities for the step: the
         proxies' at their own start, still."""
         m, a = self.model, self._arm
-        if os.environ.get("DM_SYNC") == "1" and not self.restart:  # EXPERIMENT: start at the synced pose
-            self._valid.zero_()
         wp.copy(self._was_valid, self._valid)
         wp.copy(self._q, state.body_q)
         wp.copy(self._qd, state.body_qd)
         wp.launch(_proxy_update_kernel, dim=self._body.shape[0],
                   inputs=[self._body, a.base, a.start, self.k, m.body_world, m.body_mass, m.body_inertia, m.body_com,
                           m.gravity, state.body_q, state.body_qd, state.body_f, self._last, self._valid,
-                          int(self.restart), h, int(os.environ.get("DM_NODC", "0"))],
+                          int(self.restart), h],
                   outputs=[a.M, a.Minv, a.pred, a.com, self._q, self._qd, self._offset, self._start],
                   device=self.device)
         self.restart = False
@@ -150,7 +146,7 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
                          body_world: wp.array[wp.int32], mass: wp.array[float], inertia: wp.array[wp.mat33],
                          body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
                          body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
-                         last: wp.array[wp.transform], valid: wp.array[wp.int32], restart: int, h: float, nodc: int,
+                         last: wp.array[wp.transform], valid: wp.array[wp.int32], restart: int, h: float,
                          M: wp.array3d[float], Minv: wp.array3d[float], pred: wp.array[float], com: wp.array[wp.vec3],
                          q_step: wp.array[wp.transform], qd_step: wp.array[wp.spatial_vector],
                          offset: wp.array[wp.spatial_vector], start_q: wp.array[wp.transform]):
@@ -176,9 +172,6 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     v, om = wp.spatial_top(body_qd[b]), wp.spatial_bottom(body_qd[b])
     f, tau = wp.spatial_top(body_f[b]), wp.spatial_bottom(body_f[b])
     g = gravity[wp.max(body_world[b], 0)]
-    if nodc != 0:  # EXPERIMENT: the offset out of pred and the velocity out
-        dc = wp.vec3()
-        dr = wp.vec3()
     dx = dc + h * v + h * h * (f / m + g)
     dth = dr + h * om + h * h * (Iinv * tau)
     for r in range(3):

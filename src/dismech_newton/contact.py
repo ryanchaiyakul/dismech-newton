@@ -832,8 +832,9 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
     if approach > 0.0 and d > 0.0:
         th = s.thickness[i]
         k = s.stiffness[i]
-        if s.pad[i][0] > 0.0 and d > th + s.pad[i][2]:  # outside its pad: Newton did not see the pad, so to its surface
-            wp.atomic_min(t, s.world[i], (d - th - s.pad[i][2]) / approach)
+        if s.pad[i][0] > 0.0 and d > th + s.pad[i][2]:  # outside its pad: Newton did not see it, so its step holds
+            # only to the depth A holds it from (PAD_FLOOR h: a point just outside does not stall the step)
+            wp.atomic_min(t, s.world[i], (d - th - (1.0 - PAD_FLOOR) * s.pad[i][2]) / approach)
         elif barrier(d, th, k, s.lam[i])[2] == 0.0:  # untouched: Newton did not see it, so its step holds only to
             # the ramp's end, where the barrier is at full curvature (th + lam / k: past it, the multiplier's force)
             wp.atomic_min(t, s.world[i], (d - th - s.lam[i] / k) / approach)

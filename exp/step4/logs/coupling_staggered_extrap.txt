@@ -1,7 +1,0 @@
-E   AssertionError: np.float32(0.043407533)
-C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\tests\test_coupling.py:202: AssertionError: np.float32(0.043407533)
-E   AssertionError: grip 4.815-5.028 N, servo 5.000 N
-C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\newton\franka_cable_ik_pick_place.py:221: AssertionError: grip 4.815-5.028 N, servo 5.000 N
-E   AssertionError: the hand travelled nan mm
-C:\Users\12345\Documents\Dev\dismech-newton\.claude\worktrees\proxy-impact\examples\midas_axial.py:173: AssertionError: the hand travelled nan mm
-3 failed, 6 passed, 11 warnings in 125.50s (0:02:05)

@@ -1,6 +1,7 @@
 """Rods and shells as the destination of Newton's ``SolverCoupledProxy``: the source's proxy bodies yield to the
 contacts within the soft step (:class:`ProxyArm`), so a pinch holds at the source's servo force."""
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -53,6 +54,9 @@ class ProxyArm:
         self._offset = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)  # synced pose - start
         self._start = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the step began at
         self._valid = wp.zeros(nb, dtype=wp.int32, device=self.device)  # per body: it has a last pose
+        self._v_now = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)  # exp: the synced velocity
+        self._v_prev = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)  # exp: the last step's
+        self.ahead = int(os.environ.get("DM_AHEAD", "0"))  # exp: predict the source's next step (1; 2: + its forces)
         self._was_valid = wp.zeros_like(self._valid)  # the step's: its start pose is the last step's end
         self._last_grad = None  # the last recorded step's adjoint of its end poses (snapshot)
         self.restart = False  # the next step repeats the last (a coupler's iteration restart): from its start
@@ -85,8 +89,8 @@ class ProxyArm:
         wp.launch(_proxy_update_kernel, dim=self._body.shape[0],
                   inputs=[self._body, a.base, a.start, self.k, m.body_world, m.body_mass, m.body_inertia, m.body_com,
                           m.gravity, state.body_q, state.body_qd, state.body_f, self._last, self._valid,
-                          int(self.restart), h],
-                  outputs=[a.M, a.Minv, a.pred, a.com, self._q, self._qd, self._offset, self._start],
+                          int(self.restart), h, self.ahead, self._v_prev],
+                  outputs=[a.M, a.Minv, a.pred, a.com, self._q, self._qd, self._offset, self._start, self._v_now],
                   device=self.device)
         self.restart = False
         return self._q, self._qd
@@ -117,6 +121,7 @@ class ProxyArm:
         wp.launch(_proxy_finish_kernel, dim=self._body.shape[0],
                   inputs=[self._body, a.base, z, a.com, m.body_com, self._q, self._offset, dt, h],
                   outputs=[state_out.body_q, state_out.body_qd, self._last], device=self.device)
+        wp.copy(self._v_prev, self._v_now)
         self._valid.fill_(1)
 
 
@@ -147,9 +152,11 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
                          body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
                          body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
                          last: wp.array[wp.transform], valid: wp.array[wp.int32], restart: int, h: float,
+                         ahead: int, v_prev: wp.array[wp.spatial_vector],
                          M: wp.array3d[float], Minv: wp.array3d[float], pred: wp.array[float], com: wp.array[wp.vec3],
                          q_step: wp.array[wp.transform], qd_step: wp.array[wp.spatial_vector],
-                         offset: wp.array[wp.spatial_vector], start_q: wp.array[wp.transform]):
+                         offset: wp.array[wp.spatial_vector], start_q: wp.array[wp.transform],
+                         v_now: wp.array[wp.spatial_vector]):
     p = wp.tid()
     b = body[p]
     i = base[b] - start
@@ -174,6 +181,19 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     g = gravity[wp.max(body_world[b], 0)]
     dx = dc + h * v + h * h * (f / m + g)
     dth = dr + h * om + h * h * (Iinv * tau)
+    ox, oth = dc, dr  # the velocity out: (z - o) / h, so the harvest is M (z - pred) / h^2
+    v_now[b] = body_qd[b]
+    if ahead != 0:
+        # the source's next step without the coupling force (it applies the pending one, F_old = -f - m g, in this
+        # one: x1 = synced + h v): from x1, at v + h g (1), or with its other forces held at last step's (2)
+        ax, ath = h * g, wp.vec3(0.0)
+        if ahead == 2 and valid[b] != 0 and restart == 0:
+            ax = v - wp.spatial_top(v_prev[b]) + h * (f / m + g)
+            ath = om - wp.spatial_bottom(v_prev[b]) + h * (Iinv * tau)
+        ox = dc + h * v + h * (v + ax) - dx + dc
+        oth = dr + h * om + h * (om + ath) - dth + dr
+        dx = dc + h * v + h * (v + ax)
+        dth = dr + h * om + h * (om + ath)
     for r in range(3):
         pred[i + r] = dx[r]
         pred[i + 3 + r] = dth[r]
@@ -187,7 +207,7 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     com[b] = c0
     q_step[b] = q0
     qd_step[b] = wp.spatial_vector()
-    offset[b] = wp.spatial_vector(dc, dr)
+    offset[b] = wp.spatial_vector(ox, oth)
 
 
 @wp.kernel

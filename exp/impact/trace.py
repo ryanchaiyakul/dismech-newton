@@ -28,8 +28,8 @@ def impact():
         s0.clear_forces(); pipeline.collide(s0, contacts); solver.step(s0, s1, None, contacts, h); s0, s1 = s1, s0
         rows.append((s0.body_q.numpy()[body, 2] - rest, s0.body_qd.numpy()[body, 2], fb.numpy()[body, 2]))
     rows = np.array(rows)
-    vin = -rows[:, 1].min(); k0 = int(np.argmin(rows[:, 1]))
-    print(f"P={P} impact {vin:.3f} rebound {rows[k0:, 1].max():.3f} ratio {rows[k0:, 1].max() / vin:.2f}  m {m:.4f} "
+    k0 = int(np.argmax(rows[:, 2] > 0)); vin = -rows[k0 - 1, 1]
+    print(f"P={P} AHEAD={os.environ.get('DM_AHEAD', '0')} impact {vin:.3f} rebound {rows[k0:, 1].max():.3f} ratio {rows[k0:, 1].max() / vin:.2f}  m {m:.4f} "
           f"mV/h {m * vin / h:.2f} N")
     # the model, started at the same height above the contact onset with the same speed
     first = int(np.argmax(rows[:, 2] > 0))

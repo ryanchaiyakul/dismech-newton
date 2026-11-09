@@ -111,7 +111,7 @@ if os.environ.get("DBG"):
         F = readout()[0]
         print("pull t", k, "mean x [mm]", (s0.particle_q.numpy().mean(0) * 1e3).round(3), "mean v", s0.particle_qd.numpy().mean(0).round(4),
               "sum F", F.sum(0).round(3), "counts", solver.counts.numpy(), flush=True)
-run(600, P, T)
+run(120, P, T)  # 0.2 s: held (friction's smoothing below SLIP_SPEED lets a held contact creep ~4 mm/s)
 pull = report("pull ", P, T)
 np.savez(os.environ.get("OUT", "exp/pads/logs/tactile.npz"), taxels=TP, press=press[0], pull=pull[0],
          press_raw=press[1], pull_raw=pull[1], rod=s0.particle_q.numpy())

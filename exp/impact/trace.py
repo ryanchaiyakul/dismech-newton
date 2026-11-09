@@ -5,6 +5,7 @@ import os, sys
 sys.path.insert(0, os.path.join(os.environ.get("ROOT", "."), "tests"))
 sys.path.insert(0, os.path.dirname(__file__))
 import newton, numpy as np, warp as wp
+wp.config.quiet = True
 from test_coupling import _proxy_scene
 import model1d
 
@@ -18,7 +19,7 @@ def impact():
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, rest + drop), wp.quat_identity()))
     builder.add_shape_box(body, hx=hx, hy=hx, hz=hx, cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.5))
     model, solver, pipeline, s0, s1 = _proxy_scene(builder, body, rod, 0.5, fixed=True)
-    solver._coupling.iterations = P
+    object.__setattr__(solver._coupling, "iterations", P)
     contacts = pipeline.contacts()
     fb = solver._proxy_mappings[0].coupling_forces
     m, h = float(model.body_mass.numpy()[body]), 2e-3
@@ -51,7 +52,7 @@ def momentum():
     n, r = 41, 0.005
     rod = newton.Rod(np.column_stack([np.zeros(n), np.linspace(-0.2, 0.2, n), np.zeros(n)]), radius=r)
     model, solver, pipeline, s0, s1 = _proxy_scene(builder, body, rod, 0.3, rigid_contacts=False)
-    solver._coupling.iterations = P
+    object.__setattr__(solver._coupling, "iterations", P)
     contacts = pipeline.contacts()
     qd = s0.particle_qd.numpy(); qd[:, 0] = 1.0; s0.particle_qd.assign(qd)
     m, mb, dt = model.particle_mass.numpy()[:, None], float(model.body_mass.numpy()[body]), 1.0e-3

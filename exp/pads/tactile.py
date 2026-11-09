@@ -105,6 +105,12 @@ if os.environ.get("DBG"):
               int(solver.contact.s.active.numpy().sum()), flush=True)
 run(600, P, 0.0)
 press = report("press", P, 0.0)
+if os.environ.get("DBG"):
+    for k in range(6):
+        run(20 if k < 3 else 100, P, T)
+        F = readout()[0]
+        print("pull t", k, "mean x [mm]", (s0.particle_q.numpy().mean(0) * 1e3).round(3), "mean v", s0.particle_qd.numpy().mean(0).round(4),
+              "sum F", F.sum(0).round(3), "counts", solver.counts.numpy(), flush=True)
 run(600, P, T)
 pull = report("pull ", P, T)
 np.savez(os.environ.get("OUT", "exp/pads/logs/tactile.npz"), taxels=TP, press=press[0], pull=pull[0],

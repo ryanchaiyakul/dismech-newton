@@ -41,3 +41,10 @@ step ahead of MuJoCo (its end pose = the source's next end pose).
 Pin gap is measured to MuJoCo's pose, a step behind the proxy now (by construction); trampoline penetration is also
 measured against MuJoCo's poses. AHEAD=1's MIDAS / swap failures = the servo's force left out of the prediction
 (like staggered's grip -3.4%).
+
+## Decision (user, 2026-11-08): parked
+
+Accepted as a known limit for now (lagged x1, test_proxy_impact xfail); the tactile sensor first. DM_AHEAD lives in
+commit d562640 (src reverted after). Before RL / sim2real with fast impacts: log contact-onset normal speed and onset force
+overshoot in rollouts; if onsets reach tens of cm/s, develop AHEAD=2 (pin / trampoline measured vs the proxy, MIDAS
+0.968, the adjoint's pred).

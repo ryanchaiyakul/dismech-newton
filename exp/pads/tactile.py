@@ -114,3 +114,17 @@ if os.environ.get("DBG"):
     print("rod z [mm]", (s0.particle_q.numpy()[:, 2] * 1e3).round(3), "top", top * 1e3)
     print("active", int(s.active.numpy().sum()), "pad", int(((s.pad.numpy()[:, 0] > 0) & (s.active.numpy() > 0)).sum()),
           "shape flags", model.shape_flags.numpy(), "kh", model.shape_material_kh.numpy())
+if os.environ.get("DBG"):
+    print("max |v| [m/s]", float(np.abs(s0.particle_qd.numpy()).max()), "mean v", s0.particle_qd.numpy().mean(0).round(5))
+    s = solver.contact.s
+    act, pad = s.active.numpy().astype(bool), s.pad.numpy()
+    i = np.flatnonzero(act & (pad[:, 0] > 0.0))
+    x = s0.particle_q.numpy()
+    pair, w = s.pair.numpy()[i], s.w.numpy()[i]
+    pt = np.einsum("pk,pkc->pc", w, x[np.maximum(pair, 0)] * (pair >= 0)[..., None])
+    nrm, anchor, th = s.normal.numpy()[i], s.anchor.numpy()[i], s.thickness.numpy()[i]
+    d = np.einsum("pc,pc->p", nrm, pt - anchor)
+    delta = th + pad[i, 2] - d
+    fn = pad[i, 1] * pad[i, 0] * np.maximum(delta, 0) ** (pad[i, 1] - 1.0)
+    print("pad pairs", len(i), "loaded", int((delta > 0).sum()), "sum normal on sheet", (fn[:, None] * nrm).sum(0).round(4),
+          "delta max [um]", float(delta.max() * 1e6), "rho sum", float(s.rho.numpy()[i].sum()), "w sums", np.unique(w.sum(1).round(3)))

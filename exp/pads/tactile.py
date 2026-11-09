@@ -10,7 +10,7 @@ import sys
 import newton
 import numpy as np
 
-sys.path[:0] = ["examples"]
+sys.path[:0] = ["examples", "tests"]
 from utils.common import pads  # noqa: E402
 
 from dismech_newton import SolverDiSMech, flatten_state  # noqa: E402
@@ -32,13 +32,15 @@ if os.environ.get("BOX"):  # debug: a box with the crest's top instead of the me
 else:
     builder.add_shape_mesh(-1, mesh=newton.Mesh(mesh["vertices"] * 1.0e-3, mesh["faces"].ravel()),
                            cfg=newton.ModelBuilder.ShapeConfig(mu=MU))
-n = 15
-ys = np.linspace(0.002, 0.016, n)
-SolverDiSMech.add_rod(builder, rod=newton.Rod(np.column_stack([np.zeros(n), ys, np.full(n, top + R + 2.0e-4)]),
-                                              radius=R),
-                      stretch_stiffness=1.0e5, bend_stiffness=50.0, twist_stiffness=50.0,
-                      cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=MU))
+from rollouts import cloth, grid  # noqa: E402
+
+v, f = grid(31, 31, 0.03, 0.03)  # a 30 mm sheet over the fingertip, its centre over the crest's middle
+v += [-0.015, -0.006, top + 0.001 + 2.0e-4]
+cloth(builder, v, f, density=0.2, tri_ke=1.0e3, tri_ka=1.0e3, edge_ke=1.0e-4, particle_radius=0.001, damping=1.0e-2)
+n = len(v)
+ys = v[:, 1]
 model = builder.finalize()
+model.particle_mu = MU
 pads(model, [-1], KH)
 solver = SolverDiSMech(model, iterations=30)
 s0, s1 = model.state(), model.state()

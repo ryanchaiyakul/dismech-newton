@@ -17,7 +17,8 @@ from dismech_newton import SolverDiSMech, flatten_state  # noqa: E402
 from dismech_newton.contact import SLIP_SPEED  # noqa: E402
 
 D = os.environ.get("PAXINI", "../../../scratch/paxini")
-KH, R, P, T, MU, DT = float(os.environ.get("KH", 5.0e8)), 0.003, 5.0, 1.0, 0.5, 1.0 / 600.0
+KH, R, MU, DT = float(os.environ.get("KH", 5.0e8)), 0.003, 0.5, 1.0 / 600.0
+P, T = float(os.environ.get("P", 5.0)), float(os.environ.get("T", 1.0))
 tax = json.load(open(f"{D}/S2015.json"))
 TP, TR = np.array(tax["positions"]) * 1.0e-3, np.array(tax["frames"])
 mesh = np.load(f"{D}/S2015_mesh.npz")

@@ -181,13 +181,15 @@ class Example(CableExample):
     def step(self):
         super().step()
         f = self.soft.body_reaction.numpy()[self.fingers, :3]  # the last substep's, (force, torque) rows; our view's
-        self.history.append((self.sim_time, float(np.mean(np.abs(f[:, 1]))), float(-f[:, 2].sum())))
+        q = self.state_0.joint_q.numpy()[7:9]  # the fingers' openings: MuJoCo's servo pulls each with k (q - target)
+        self.history.append((self.sim_time, float(np.mean(np.abs(f[:, 1]))), float(-f[:, 2].sum()),
+                             GRIP_STIFFNESS * (float(q.mean()) - GRIP_HOLD)))
 
     def image(self, size: tuple[int, int] = (800, 400)) -> np.ndarray:
         """Each finger's grip against its servo force, and the lift (faint: each frame's last substep; solid: its
         0.1 s running mean, the cable swings) against the cable's weight, over time (the hold shaded), as an RGBA
         image (see :func:`utils.common.inset`)."""
-        h = np.array(self.history) if self.history else np.zeros((1, 3))
+        h = np.array(self.history) if self.history else np.zeros((1, 4))
         n = max(1, round(0.1 * self.fps))
         mean = np.convolve(np.pad(h[:, 2], (n // 2, n - 1 - n // 2), mode="edge"), np.ones(n) / n, mode="valid")
         servo = GRIP_STIFFNESS * (self.radius - GRIP_HOLD)
@@ -217,8 +219,10 @@ class Example(CableExample):
         assert err < 0.01, f"cable placed {err * 100:.1f} cm from the target (Newton's test: < 1 cm)"
         h = np.array(self.history)
         held = (h[:, 0] > 3.25) & (h[:, 0] < 4.75)  # lifted clear of the table, carried
-        servo = GRIP_STIFFNESS * (self.radius - GRIP_HOLD)
-        assert np.allclose(h[held, 1], servo, rtol=0.02), f"grip {h[held, 1].min():.3f}-{h[held, 1].max():.3f} N, "                                                           f"servo {servo:.3f} N"
+        servo = h[held, 3]  # at the fingers' openings (a compliant pad: the finger sinks, the servo eases)
+        assert np.allclose(h[held, 1], servo, rtol=0.02), (
+            f"grip {h[held, 1].min():.3f}-{h[held, 1].max():.3f} N, servo {servo.min():.3f}-{servo.max():.3f} N")
+        assert h[held, 1].std() < 0.01 * servo.mean(), f"grip +- {h[held, 1].std():.3f} N: chatter"
         lift = h[held, 2].mean()  # the cable swings: its mean
         assert abs(lift - self.weight) < 0.2 * self.weight, f"lift {lift:.4f} N, weight {self.weight:.4f} N"
 

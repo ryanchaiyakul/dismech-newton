@@ -216,7 +216,9 @@ class Example(CableExample):
         f = self.soft.body_reaction.numpy()[self.fingers, :3]  # the last substep's, its pads' normal component
         q = self.state_0.body_q.numpy()[self.hand, 3:]  # the hand's (x, y, z, w): its y the fingers' axis
         closing = np.array(wp.quat_rotate(wp.quat(*q), wp.vec3(0.0, 1.0, 0.0)))
-        self.history.append((self.sim_time, float(np.mean(np.abs(f @ closing)))))
+        qf = self.state_0.joint_q.numpy()[7:9]  # the fingers' openings: the servo's k (q - target) at them
+        self.history.append((self.sim_time, float(np.mean(np.abs(f @ closing))),
+                             GRIP_STIFFNESS * (float(qf.mean()) - GRIP_HOLD)))
         self.cross = max(self.cross, self.crossings(self.state_0.particle_q))
 
     def corner(self) -> np.ndarray:
@@ -232,8 +234,9 @@ class Example(CableExample):
         h = np.array(self.history)
         held = (h[:, 0] > self.hold[0]) & (h[:, 0] < self.hold[1])
         grip = h[held, 1]
-        assert np.allclose(grip, self.servo, rtol=0.1), f"grip {grip.min():.3f}-{grip.max():.3f} N, servo " \
-                                                        f"{self.servo:.3f} N"
+        servo = h[held, 2]  # at the fingers' openings (a compliant pad: the finger sinks, the servo eases)
+        assert np.allclose(grip, servo, rtol=0.1), (
+            f"grip {grip.min():.3f}-{grip.max():.3f} N, servo {servo.min():.3f}-{servo.max():.3f} N")
         if self.sim_time > self.release + 1.0:  # folded in half: the hem on the far edge, the flap flat on the rest
             err = float(np.linalg.norm(self.corner()[:2] - self.target))
             assert err < 0.02, f"corner laid {err * 100:.1f} cm from the napkin's far corner"

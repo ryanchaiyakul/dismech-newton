@@ -133,3 +133,12 @@ each pad point's force on the sensor to its nearest taxel, in the taxel's frame,
 - Fix found here: an untouched pad pair now holds the line search to PAD_FLOOR h deep (to its surface stalled a
   draped sheet: thousands of points just outside, t -> 0). Pad tests still pass.
 - A rod indenter rolls off the crest (nothing holds it sideways): the sheet is the stable load for now.
+
+## PaXini on MIDAS: mounting (2026-11-09)
+
+Sensor poses from the CAD mounting holes (S2015 on *_dip_link, +x pad face, 0.01 mm; M2826 on thumb_dip, 0.013 mm);
+`examples/utils/tactile.py: mount()` puts the sensor surfaces on as the fingertip shapes (massless, the capsule's mu),
+the MJCF capsules off, a back capsule shifted/shrunk 5 mm (none of it outside the sensor on its side). The black
+fingertip domes in the hand's renders are part of the visual DIP meshes (contype 0): the collider was the capsule.
+MIDAS axial slip with the sensors (`exp/pads/midas_tactile.py`, sci6000): test_final passes (travel 28.1 mm, rod
+shift 0.22 mm). Data local only ($PAXINI; copied to sci6000's scratch/paxini).

@@ -29,7 +29,7 @@ from typing import Any
 import warp as wp
 from newton import State
 
-from .collide import FLAT, OPEN, Bodies, _closest_st, _edge_scan, _shape_gap
+from .collide import FLAT, OPEN, Bodies, _closest_st, _edge_scan, _shape_gap, _shape_pose
 from .contact import (
     LIFT,
     SIDES,
@@ -39,9 +39,9 @@ from .contact import (
     _barrier_assemble_kernel,
     arm_body,
     arm_flexibility,
-    arm_jacobian,
     arm_move,
     barrier,
+    body_flexibility,
     contact_force,
     contact_hessian,
     contact_point,
@@ -52,7 +52,7 @@ from .contact import (
     slot_map,
     slot_roll,
 )
-from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, _rotvec
+from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, proxy_step
 from .linear import _convert, sparse_solver
 from .state import (
     Dofs,
@@ -529,9 +529,7 @@ def _contact_residual_kernel(
         moved = c.c0[i] - contact_point(q_in0, pair, w, c.anchor[i]) - slot_roll(q_in0, c, i)  # the anchor's (the
         # start's surface turn is ``c0``'s, below)
         sk = shape_of(c.key[i], key0)
-        X = b.xform[sk]
-        if b.body[sk] >= 0:  # (``poses``: ``b.body_q``, with its adjoint)
-            X = wp.transform_multiply(poses[b.body[sk]], b.xform[sk])
+        X = _shape_pose(b, sk, poses)  # (``poses``: ``b.body_q``, with its adjoint)
         w = weights[i]
         x = contact_point(q_in, pair, w, wp.vec3(0.0))
         dist, n = _shape_gap(b, sk, X, x, 1.0e6)
@@ -550,7 +548,7 @@ def _contact_residual_kernel(
     aflex = float(0.0)
     if body >= 0:  # the anchor moved by its body's DOFs, about its centre of mass (``com``: the start pose's)
         lever = wp.where(c.key[i] >= key0, anchor + lever_off[i], c.anchor[i]) - com[body]
-        aflex = _arm_flexibility(arm, Minv, body, n, lever)
+        aflex = body_flexibility(arm, Minv, body, n, lever)
     k = c.stiffness[i] * wp.max(flexibility(pair, c.w[i], mass0, fixed) + arm_flexibility(arm, c, i), 1.0e-30) / wp.max(
         flexibility(pair, w, mass, fixed) + aflex, 1.0e-30)
     rho = -barrier(wp.dot(n, c0), th, k, c.lam[i])[1]
@@ -583,10 +581,7 @@ def _scan_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], key0: int, 
     if c.key[i] >= key0 and c.pair[i][1] >= 0:
         sk = shape_of(c.key[i], key0)
         if c.key[i] != key0 + SIDES * sk:
-            X = b.xform[sk]
-            if b.body[sk] >= 0:
-                X = wp.transform_multiply(poses[b.body[sk]], b.xform[sk])
-            t0[i] = _edge_scan(b, sk, X, node(q, c.pair[i][0]), node(q, c.pair[i][1]), 1.0e6)[0]
+            t0[i] = _edge_scan(b, sk, _shape_pose(b, sk, poses), node(q, c.pair[i][0]), node(q, c.pair[i][1]), 1.0e6)[0]
 
 
 @wp.kernel(module="unique")
@@ -598,12 +593,8 @@ def _weights_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], poses0: 
     w = c.w[i]
     if c.key[i] >= key0 and c.pair[i][1] >= 0:
         sk = shape_of(c.key[i], key0)
-        X = b.xform[sk]
-        X0 = b.xform[sk]
-        if b.body[sk] >= 0:
-            X = wp.transform_multiply(poses[b.body[sk]], b.xform[sk])
-            X0 = wp.transform_multiply(poses0[b.body[sk]], b.xform[sk])
-        w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, X, X0, c.key[i] != key0 + SIDES * sk, t0[i])
+        w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, _shape_pose(b, sk, poses), _shape_pose(b, sk, poses0),
+                                c.key[i] != key0 + SIDES * sk, t0[i])
     out[i] = w
 
 
@@ -716,19 +707,6 @@ def _edge_shape_weights(q: wp.array[float], q0: wp.array[float], pair: wp.vec4i,
 
 
 @wp.func
-def _arm_flexibility(arm: Arm, Minv: wp.array3d[float], b: int, n: wp.vec3, r: wp.vec3) -> float:
-    """:func:`~.contact.arm_flexibility` along ``n`` at the lever ``r``, ``Minv`` with its adjoint."""
-    w = (arm.base[b] - arm.start) // arm.k
-    o = arm.base[b] - arm.start - w * arm.k
-    flex = float(0.0)
-    for m in range(6):
-        pm = wp.dot(n, arm_jacobian(m, r))
-        for m2 in range(6):
-            flex += pm * Minv[w, o + m, o + m2] * wp.dot(n, arm_jacobian(m2, r))
-    return flex
-
-
-@wp.func
 def _arm_scatter(r: wp.array[float], arm: Arm, body: int, x: wp.vec3, g: wp.vec3):
     """``r -= P^T g`` (:func:`~.contact.arm_scatter` into the residual)."""
     i = arm.base[body]
@@ -775,28 +753,8 @@ def _arm_pred_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: 
     i = base[b] - start
     w = i // k
     i0 = i - w * k
-    start_q = q0[b]
-    R = wp.quat_to_matrix(wp.transform_get_rotation(start_q))
-    m = wp.max(mass[b], 1.0e-12)
-    I = R * inertia[b] * wp.transpose(R)
-    Iinv = wp.mat33(0.0)
-    if wp.determinant(inertia[b]) > 0.0:  # (a shapeless proxy may have none)
-        Iinv = R * wp.inverse(inertia[b]) * wp.transpose(R)
-    dc = wp.transform_point(body_q[b], body_com[b]) - wp.transform_point(start_q, body_com[b])
-    dr = _rotvec(wp.transform_get_rotation(body_q[b]) * wp.quat_inverse(wp.transform_get_rotation(start_q)))
-    v, om = wp.spatial_top(body_qd[b]), wp.spatial_bottom(body_qd[b])
-    f, tau = wp.spatial_top(body_f[b]), wp.spatial_bottom(body_f[b])
-    g = gravity[wp.max(body_world[b], 0)]
-    dx = dc + h * v + h * h * (f / m + g)
-    dth = dr + h * om + h * h * (wp.inverse(I) * tau)
-    for a in range(3):
-        pred[i + a] = dx[a]
-        pred[i + 3 + a] = dth[a]
-        for c in range(3):
-            M[w, i0 + a, i0 + c] = wp.where(a == c, m, 0.0)
-            M[w, i0 + 3 + a, i0 + 3 + c] = I[a, c]
-            Minv[w, i0 + a, i0 + c] = wp.where(a == c, 1.0 / m, 0.0)
-            Minv[w, i0 + 3 + a, i0 + 3 + c] = Iinv[a, c]
+    proxy_step(q0[b], body_q[b], body_qd[b], body_f[b], mass[b], inertia[b], body_com[b],
+               gravity[wp.max(body_world[b], 0)], h, w, i, i0, pred, M, Minv)
 
 
 @wp.kernel

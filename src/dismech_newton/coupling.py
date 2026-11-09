@@ -141,6 +141,34 @@ def _turn(v: wp.vec3, q: wp.quat) -> wp.quat:
     return q
 
 
+@wp.func
+def proxy_step(q0: wp.transform, synced: wp.transform, qd: wp.spatial_vector, f: wp.spatial_vector, mass: float,
+               inertia: wp.mat33, com: wp.vec3, g: wp.vec3, h: float, w: int, i: int, i0: int, pred: wp.array[float],
+               M: wp.array3d[float], Minv: wp.array3d[float]):
+    """A proxy's own move over the step from its start ``q0`` (its synced pose ``synced`` moved by
+    ``h qd + h^2 (f / m + g, I^-1 tau)``) into ``pred[i:i+6]`` and its inertia ``diag(m, R I R^T)`` about ``q0`` into
+    world ``w``'s ``M``, ``Minv`` at ``i0``; returns the synced pose's offset from ``q0`` (``dc``, ``dr``)."""
+    R = wp.quat_to_matrix(wp.transform_get_rotation(q0))
+    m = wp.max(mass, 1.0e-12)
+    I = R * inertia * wp.transpose(R)
+    Iinv = wp.mat33(0.0)
+    if wp.determinant(inertia) > 0.0:  # (a shapeless proxy may have none)
+        Iinv = R * wp.inverse(inertia) * wp.transpose(R)
+    dc = wp.transform_point(synced, com) - wp.transform_point(q0, com)
+    dr = _rotvec(wp.transform_get_rotation(synced) * wp.quat_inverse(wp.transform_get_rotation(q0)))
+    dx = dc + h * wp.spatial_top(qd) + h * h * (wp.spatial_top(f) / m + g)
+    dth = dr + h * wp.spatial_bottom(qd) + h * h * (Iinv * wp.spatial_bottom(f))
+    for a in range(3):
+        pred[i + a] = dx[a]
+        pred[i + 3 + a] = dth[a]
+        for c in range(3):
+            M[w, i0 + a, i0 + c] = wp.where(a == c, m, 0.0)
+            M[w, i0 + 3 + a, i0 + 3 + c] = I[a, c]
+            Minv[w, i0 + a, i0 + c] = wp.where(a == c, 1.0 / m, 0.0)
+            Minv[w, i0 + 3 + a, i0 + 3 + c] = Iinv[a, c]
+    return dc, dr
+
+
 @wp.kernel
 def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: int, k: int,
                          body_world: wp.array[wp.int32], mass: wp.array[float], inertia: wp.array[wp.mat33],
@@ -162,29 +190,9 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     elif valid[b] != 0:
         q0 = last[b]
     start_q[b] = q0
-    R = wp.quat_to_matrix(wp.transform_get_rotation(q0))
-    m = wp.max(mass[b], 1.0e-12)
-    I = R * inertia[b] * wp.transpose(R)
-    Iinv = wp.inverse(I)
-    c0 = wp.transform_point(q0, body_com[b])
-    dc = wp.transform_point(synced, body_com[b]) - c0
-    dr = _rotvec(wp.transform_get_rotation(synced) * wp.quat_inverse(wp.transform_get_rotation(q0)))
-    v, om = wp.spatial_top(body_qd[b]), wp.spatial_bottom(body_qd[b])
-    f, tau = wp.spatial_top(body_f[b]), wp.spatial_bottom(body_f[b])
-    g = gravity[wp.max(body_world[b], 0)]
-    dx = dc + h * v + h * h * (f / m + g)
-    dth = dr + h * om + h * h * (Iinv * tau)
-    for r in range(3):
-        pred[i + r] = dx[r]
-        pred[i + 3 + r] = dth[r]
-        for c in range(3):
-            M[w, i0 + r, i0 + c] = float(0.0)
-            Minv[w, i0 + r, i0 + c] = float(0.0)
-            M[w, i0 + 3 + r, i0 + 3 + c] = I[r, c]
-            Minv[w, i0 + 3 + r, i0 + 3 + c] = Iinv[r, c]
-        M[w, i0 + r, i0 + r] = m
-        Minv[w, i0 + r, i0 + r] = 1.0 / m
-    com[b] = c0
+    dc, dr = proxy_step(q0, synced, body_qd[b], body_f[b], mass[b], inertia[b], body_com[b],
+                        gravity[wp.max(body_world[b], 0)], h, w, i, i0, pred, M, Minv)
+    com[b] = wp.transform_point(q0, body_com[b])
     q_step[b] = q0
     qd_step[b] = wp.spatial_vector()
     offset[b] = wp.spatial_vector(dc, dr)

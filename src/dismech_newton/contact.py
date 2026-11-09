@@ -211,20 +211,25 @@ def arm_assemble(vals: wp.array[wp.float64], indptr: wp.array[wp.int32], indices
 
 
 @wp.func
+def body_flexibility(arm: Arm, Minv: wp.array3d[float], b: int, n: wp.vec3, r: wp.vec3) -> float:
+    """``n P M^-1 P^T n``: body ``b``'s flexibility along ``n`` at its point ``com + r`` (``Minv``: the arm's)."""
+    w = (arm.base[b] - arm.start) // arm.k
+    o = arm.base[b] - arm.start - w * arm.k  # the body's DOFs in its world's
+    flex = float(0.0)
+    for m in range(6):
+        pm = wp.dot(n, arm_jacobian(m, r))
+        for m2 in range(6):
+            flex += pm * Minv[w, o + m, o + m2] * wp.dot(n, arm_jacobian(m2, r))
+    return flex
+
+
+@wp.func
 def arm_flexibility(arm: Arm, s: Slots, i: int) -> float:
-    """``n P M^-1 P^T n``: the pair's yielding body's part of its flexibility along its normal."""
+    """The pair's yielding body's part of its flexibility along its normal (:func:`body_flexibility`)."""
     b = arm_body(arm, s, i)
     if b < 0:
         return 0.0
-    w = (arm.base[b] - arm.start) // arm.k
-    o = arm.base[b] - arm.start - w * arm.k  # the body's DOFs in its world's
-    r = s.anchor[i] - arm.com[b]
-    flex = float(0.0)
-    for m in range(6):
-        pm = wp.dot(s.normal[i], arm_jacobian(m, r))
-        for m2 in range(6):
-            flex += pm * arm.Minv[w, o + m, o + m2] * wp.dot(s.normal[i], arm_jacobian(m2, r))
-    return flex
+    return body_flexibility(arm, arm.Minv, b, s.normal[i], s.anchor[i] - arm.com[b])
 
 
 @wp.func
@@ -334,7 +339,6 @@ class BarrierBlock:
         self.s = _slots(size, self.device)
         nw, self.stride = int(dof_world.max(initial=0)) + 1, stride  # the worlds; per-world sums a[w stride + k]
         self.num_worlds = nw
-        self.world = self.s.world
         self.touching = wp.zeros(1, dtype=wp.int32, device=self.device)  # a pair has curvature at the last grad's q
         self.scale = wp.ones(max(model.particle_count, 1), dtype=float, device=self.device)  # nodes' load scales
         self.lam = wp.zeros(size, dtype=float, device=self.device)  # per pair, the multiplier kept for the next
@@ -363,7 +367,7 @@ class BarrierBlock:
             self.lam.zero_()
             self.scale.fill_(1.0)
             return
-        self._launch(_forget_kernel, [self.world, mask, self.lam])
+        self._launch(_forget_kernel, [self.s.world, mask, self.lam])
         wp.launch(_unscale_kernel, dim=self.scale.shape[0], inputs=[node_world, mask, self.scale], device=self.device)
 
     def begin_step(self, state_in: State, dt: float, mass: wp.array, unsettled: wp.array) -> None:
@@ -631,7 +635,7 @@ def _slip(c: wp.vec3, c0: wp.vec3, n: wp.vec3) -> wp.vec3:
 
 @wp.func
 def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float,
-                  pad: wp.vec4, damp: float = 0.0):
+                  pad: wp.vec4, damp: float):
     """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, friction
     ``mu rho = mu_rho``), and its barrier's and friction's curvatures."""
     e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad) + pad_damping(

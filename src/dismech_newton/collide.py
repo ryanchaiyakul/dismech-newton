@@ -407,11 +407,11 @@ def _other_world(m: Mesh, a: int, b: int) -> bool:
 
 
 @wp.func
-def _shape_pose(b: Bodies, k: int) -> wp.transform:
-    """Shape ``k``'s frame in the world at the step's start."""
+def _shape_pose(b: Bodies, k: int, poses: wp.array[wp.transform]) -> wp.transform:
+    """Shape ``k``'s frame in the world, its body at ``poses`` (``b.body_q``: the step's start)."""
     if b.body[k] < 0:
         return b.xform[k]
-    return wp.transform_multiply(b.body_q[b.body[k]], b.xform[k])
+    return wp.transform_multiply(poses[b.body[k]], b.xform[k])
 
 
 @wp.func
@@ -814,7 +814,7 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
     x2 = node(q, tri[2])
     if jj < _shape_count(b, m.world[a0]):
         k = _shape_at(b, m.world[a0], jj)
-        X = _shape_pose(b, k)
+        X = _shape_pose(b, k, b.body_q)
         c = wp.transform_get_translation(X)
         th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
         reach = REACH * th + _sweep(b, k)
@@ -893,7 +893,7 @@ def _edge_shape(sc: Scene, e: int, jj: int, at: int):
     xb = node(q, a1)
     if jj < _shape_count(b, m.world[a0]):
         k = _shape_at(b, m.world[a0], jj)
-        X = _shape_pose(b, k)
+        X = _shape_pose(b, k, b.body_q)
         th = 0.5 * (m.radius[a0] + m.radius[a1]) + b.margin[k]
         reach = REACH * th
         _ya, da = _anchor(b, k, xa)
@@ -957,7 +957,7 @@ def _node_shape(sc: Scene, i: int, jj: int, at: int):
     xv = node(q, i)
     if jj < _shape_count(b, m.world[i]):
         k = _shape_at(b, m.world[i], jj)
-        X = _shape_pose(b, k)
+        X = _shape_pose(b, k, b.body_q)
         th = m.radius[i] + b.margin[k]
         y, dy = _anchor(b, k, xv)
         reach = REACH * th + wp.length(dy) + _sweep(b, k)  # and the body's motion

@@ -9,15 +9,18 @@ from rollouts import cloth, grid
 
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import shell as S
+from dismech_newton import solver as solver_module
 
 
-def simulate(model, solver, steps: int, dt: float, every: int = 0):
-    """The last state, and the positions every ``every`` steps."""
+def simulate(model, solver, steps: int, dt: float, every: int = 0, force=None):
+    """The last state, and the positions every ``every`` steps (``force``: on the nodes every step)."""
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
     flatten_state(s1)
     frames = []
     for k in range(steps):
+        if force is not None:
+            s0.particle_f.assign(force)
         solver.step(s0, s1, None, None, dt)
         s0, s1 = s1, s0
         if every and k % every == 0:
@@ -233,11 +236,12 @@ def test_plate_strip_bends_along_its_weave():
     assert abs(ratios[1] / ratios[0] - 1.0) < 0.05, ratios
 
 
-def test_woven_sheet_is_frame_invariant(rng):
+def test_woven_sheet_is_frame_invariant(rng, monkeypatch):
     """A woven sheet clamped along one edge, sagging and twisting under gravity at an angle; then the same with
     mesh and gravity turned by a random rotation, the panel the same: the motion turns with them. Solved far below
     the default tolerance (to the budget or float32's floor): at it, a step one rotation stops one iteration short of
     the other leaves a 5% of tolerance gap that persists."""
+    monkeypatch.setattr(solver_module, "TOLERANCE", 1.0e-6)
     v, f = grid(8, 6, 0.3, 0.2, rng, jitter=0.3)
     uv = _panel(v, 0.4)
     Q = np.linalg.qr(rng.normal(size=(3, 3)))[0]
@@ -251,7 +255,7 @@ def test_woven_sheet_is_frame_invariant(rng):
             builder.particle_flags[ids[k]] &= ~newton.ParticleFlags.ACTIVE
         model = builder.finalize()
         model.set_gravity(tuple(R @ g))
-        x = simulate(model, SolverDiSMech(model, iterations=10, tolerance=1.0e-6), 50, 0.01)[0].particle_q.numpy()
+        x = simulate(model, SolverDiSMech(model, iterations=10), 50, 0.01)[0].particle_q.numpy()
         out.append(x @ R)
     sag = np.abs(out[0] - v).max()
     assert sag > 0.02
@@ -521,16 +525,7 @@ def _pad_rod(builder, n: int, bend: float = 1.0):
 
 
 def _settle(model, steps: int, dt: float, force=None):
-    solver = SolverDiSMech(model, iterations=30)
-    s0, s1 = model.state(), model.state()
-    flatten_state(s0)
-    flatten_state(s1)
-    for _ in range(steps):
-        if force is not None:
-            s0.particle_f.assign(force)
-        solver.step(s0, s1, None, None, dt)
-        s0, s1 = s1, s0
-    return s0
+    return simulate(model, SolverDiSMech(model, iterations=30), steps, dt, force=force)[0]
 
 
 @pytest.mark.parametrize("g", [98.1, 981.0])

@@ -104,7 +104,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
     when a node has moved half of it). The line search's longest step stops where a pair's barrier changes the
     Newton model (:meth:`~.contact.BarrierBlock.impact`): a touching pair's impact, an untouched pair's onset.
     With contacts the step iterates until its Newton step moves no node (nor a pair's force, nor a midedge angle's
-    offset midpoint) more than ``tolerance`` (:data:`TOLERANCE`) radii and the nodes' net force is within it of their
+    offset midpoint) more than :data:`TOLERANCE` radii and the nodes' net force is within it of their
     loads, or the line search stalls, at most ``iterations`` times.
 
     Each world's step is its own solve: its line search, convergence and failure (a world that has converged takes
@@ -131,14 +131,13 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
-        tolerance: float | None = None,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
             raise ValueError(f"theta must be in [1/2, 1], got {theta}")
         self.theta = float(theta)
         self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
-        self.tolerance = float(TOLERANCE if tolerance is None else tolerance)
+        self.tolerance = TOLERANCE  # (read here: tests set the module's)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
@@ -224,7 +223,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._unbalanced = wp.zeros(W, dtype=float, device=dev)  # per world, max |residual| / its tolerance
         self._load = wp.zeros(n, dtype=float, device=dev)  # per DOF, the loads it carries (the tolerance's scale)
         self._floor = wp.zeros(n, dtype=float, device=dev)
-        self._net = wp.zeros(6 * W, dtype=wp.float64, device=dev)  # per world: net force, load, floor, anchor floor²
+        self._net = wp.zeros(_N * W, dtype=wp.float64, device=dev)  # per world: net force, load, floors (_NET...)
         self._impact = wp.ones(W, dtype=float, device=dev)  # per world, the line search's longest step (impact)
         self._stalled = wp.zeros(W, dtype=wp.int32, device=dev)
         self._failed = wp.zeros(W, dtype=wp.int32, device=dev)  # the step's Newton step was not finite
@@ -540,7 +539,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         def step():  # one CG step (``alpha``), then the next direction unless it stopped
             wp.copy(Bp, Ap)
             self.contact.correction(q, p, Bp, self._cg_some)
-            wp.launch(_ncg_dot_kernel, dim=n, inputs=[p, Bp, Ap, Ax, self._b, wd, 1], outputs=[c], device=dev)
+            wp.launch(_ncg_pdots_kernel, dim=n, inputs=[p, Bp, Ap, Ax, self._b, wd], outputs=[c], device=dev)
             go[W:].zero_()
             wp.launch(_ncg_alpha_kernel, dim=W, inputs=[wd, self._cg_j, self._radius, self._cg_some],
                       outputs=[c, go], device=dev)
@@ -555,7 +554,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         n, dev, W, wd = self.num_dofs, self.device, self.num_worlds, self.worlds
         x, r, z, p, Ap, Bp, Ax = self._cg
         self._linear.solve(r, z)
-        wp.launch(_ncg_dot_kernel, dim=n, inputs=[r, z, z, z, z, wd, 2], outputs=[self._cgs], device=dev)
+        wp.launch(_ncg_rz_kernel, dim=n, inputs=[r, z, wd], outputs=[self._cgs], device=dev)
         self._cg_go[W:].zero_()
         wp.launch(_ncg_beta_kernel, dim=W, inputs=[wd], outputs=[self._cgs, self._cg_go], device=dev)
         wp.launch(_ncg_dir_kernel, dim=n, inputs=[self._cgs, z, r, wd], outputs=[p, Ap], device=dev)
@@ -743,21 +742,25 @@ def _ncg_eta_kernel(wd: Worlds, c: wp.array[wp.float64], go: wp.array[wp.int32])
 
 
 @wp.kernel
-def _ncg_dot_kernel(a: wp.array[wp.float64], b0: wp.array[wp.float64], b1: wp.array[wp.float64],
-                    b2: wp.array[wp.float64], b3: wp.array[wp.float64], wd: Worlds, mode: int,
-                    c: wp.array[wp.float64]):
-    """Per running world, ``mode`` 1: ``p.Bp, p.Ap, p.Ax, p.b`` (``a = p``); 2: ``r.z``."""
+def _ncg_pdots_kernel(p: wp.array[wp.float64], bp: wp.array[wp.float64], ap: wp.array[wp.float64],
+                      ax: wp.array[wp.float64], b: wp.array[wp.float64], wd: Worlds, c: wp.array[wp.float64]):
+    """Per running world ``p.Bp, p.Ap, p.Ax, p.b``."""
     i = wp.tid()
     o = wd.of[i] * _S
-    if c[o + _STOP] != wp.float64(0.0):
-        return
-    if mode == 1:
-        wp.atomic_add(c, o + _PBP, a[i] * b0[i])
-        wp.atomic_add(c, o + _PAP, a[i] * b1[i])
-        wp.atomic_add(c, o + _PAX, a[i] * b2[i])
-        wp.atomic_add(c, o + _PB, a[i] * b3[i])
-    else:
-        wp.atomic_add(c, o + _RZN, a[i] * b0[i])
+    if c[o + _STOP] == wp.float64(0.0):
+        wp.atomic_add(c, o + _PBP, p[i] * bp[i])
+        wp.atomic_add(c, o + _PAP, p[i] * ap[i])
+        wp.atomic_add(c, o + _PAX, p[i] * ax[i])
+        wp.atomic_add(c, o + _PB, p[i] * b[i])
+
+
+@wp.kernel
+def _ncg_rz_kernel(r: wp.array[wp.float64], z: wp.array[wp.float64], wd: Worlds, c: wp.array[wp.float64]):
+    """Per running world ``r.z``."""
+    i = wp.tid()
+    o = wd.of[i] * _S
+    if c[o + _STOP] == wp.float64(0.0):
+        wp.atomic_add(c, o + _RZN, r[i] * z[i])
 
 
 @wp.kernel
@@ -1031,6 +1034,9 @@ def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[flo
     wp.atomic_max(dq_max, wd.of[offset + h], 0.5 * thickness[h] * wp.abs(dq[offset + h]))
 
 
+_NET, _LOAD, _FLOOR, _ANCHOR2, _N = 0, 3, 4, 5, 6  # a world's net force (3), load, floor, anchor floor²
+
+
 @wp.kernel
 def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
                        load: wp.array[float], anchor: wp.array[float], wd: Worlds, net: wp.array[wp.float64]):
@@ -1051,15 +1057,15 @@ def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: 
     r = wp.vec3(q[i] - q_pred[i], q[i + 1] - q_pred[i + 1], q[i + 2] - q_pred[i + 2])
     ext = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
     k = f.mass[i] * f.inv_dt2
+    o = _N * w
     for c in range(3):
-        wp.atomic_add(net, 6 * w + c, b[i + c])
+        wp.atomic_add(net, o + _NET + c, b[i + c])
     x = wp.vec3(q[i], q[i + 1], q[i + 2])
-    wp.atomic_add(net, 6 * w + 3, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
+    wp.atomic_add(net, o + _LOAD, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
     a = wp.vec3(anchor[i], anchor[i + 1], anchor[i + 2])
     s = EPS32 * wp.length(a) * wp.length(x)
-    wp.atomic_add(net, 6 * w + 5, wp.float64(s * s))
-    floor = k * ULP * (wp.length(x) + wp.length(r))
-    wp.atomic_add(net, 6 * w + 4, wp.float64(floor))
+    wp.atomic_add(net, o + _ANCHOR2, wp.float64(s * s))
+    wp.atomic_add(net, o + _FLOOR, wp.float64(k * ULP * (wp.length(x) + wp.length(r))))
 
 
 @wp.kernel
@@ -1077,10 +1083,10 @@ def _arm_unbalanced_kernel(b: wp.array[wp.float64], load: wp.array[float], floor
 @wp.kernel
 def _net_kernel(net: wp.array[wp.float64], tolerance: float, unbalanced: wp.array[float]):
     """Per world, the nodes' net force against ``tolerance`` of their loads (plus float32's floor)."""
-    w = wp.tid()
-    u = wp.sqrt(net[6 * w] * net[6 * w] + net[6 * w + 1] * net[6 * w + 1] + net[6 * w + 2] * net[6 * w + 2])
-    tol = wp.float64(tolerance) * net[6 * w + 3] + net[6 * w + 4] + wp.sqrt(net[6 * w + 5]) + wp.float64(1.0e-30)
-    unbalanced[w] = wp.max(unbalanced[w], float(u / tol))
+    o = _N * wp.tid()
+    u = wp.sqrt(net[o] * net[o] + net[o + 1] * net[o + 1] + net[o + 2] * net[o + 2])
+    tol = wp.float64(tolerance) * net[o + _LOAD] + net[o + _FLOOR] + wp.sqrt(net[o + _ANCHOR2]) + wp.float64(1.0e-30)
+    unbalanced[wp.tid()] = wp.max(unbalanced[wp.tid()], float(u / tol))
 
 
 @wp.kernel

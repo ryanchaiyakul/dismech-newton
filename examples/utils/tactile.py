@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from dismech_newton.collide import Bodies
+from dismech_newton.collide import Bodies, _shape_pose
 from dismech_newton.contact import Arm, Slots, contact_force, pair_point, shape_of
 
 PAXINI = Path(os.environ.get("PAXINI", Path(__file__).resolve().parents[2] / "scratch" / "paxini"))
@@ -31,11 +31,11 @@ def mount(builder, root: Path = PAXINI) -> dict[str, int]:
     poses = json.loads((root / "mount" / "mount.json").read_text())
     backs = json.loads((root / "mount" / "dorsal.json").read_text())
     body_of = {label.split("/")[-1]: b for b, label in enumerate(builder.body_label)}
-    shape_of = {label.split("/")[-1]: s for s, label in enumerate(builder.shape_label)}
+    shapes = {label.split("/")[-1]: s for s, label in enumerate(builder.shape_label)}
     collide = int(ShapeFlags.COLLIDE_SHAPES) | int(ShapeFlags.COLLIDE_PARTICLES)
     out = {}
     for link, capsule in CAPSULES.items():
-        p, body, old = poses[link], body_of[link], shape_of[capsule]
+        p, body, old = poses[link], body_of[link], shapes[capsule]
         builder.shape_flags[old] &= ~collide
         cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=builder.shape_material_mu[old])
         mesh = np.load(root / f"{p['sensor']}_mesh.npz")
@@ -123,20 +123,14 @@ class Tactile:
 
     def commit(self, dt: float) -> None:
         """Add the coupled step's forces (its last pass's) over ``dt``."""
-        dev = self.acc.device
-        wp.launch(_commit_kernel, dim=self.count, inputs=[self.cur, dt], outputs=[self.acc], device=dev)
-        wp.launch(_commit_kernel, dim=self.total.shape[0], inputs=[self.cur_total, dt], outputs=[self.total_acc],
-                  device=dev)
-        wp.launch(_time_kernel, dim=1, inputs=[dt], outputs=[self.time], device=dev)
+        wp.launch(_commit_kernel, dim=self.count, inputs=[self.cur, self.cur_total, dt],
+                  outputs=[self.acc, self.total_acc, self.time], device=self.acc.device)
 
     def sample(self) -> None:
         """The readings since the last sample into ``force``, ``raw`` and ``total``; restart the accumulation."""
-        dev = self.acc.device
-        wp.launch(_sample_kernel, dim=self.count, inputs=[self.acc, self.time, self.frame],
-                  outputs=[self.force, self.raw], device=dev)
-        wp.launch(_total_kernel, dim=self.total.shape[0], inputs=[self.total_acc, self.time], outputs=[self.total],
-                  device=dev)
-        wp.launch(_reset_kernel, dim=1, outputs=[self.time], device=dev)
+        wp.launch(_sample_kernel, dim=self.count, inputs=[self.acc, self.total_acc, self.time, self.frame],
+                  outputs=[self.force, self.raw, self.total], device=self.acc.device)
+        self.time.zero_()  # (after: every taxel's thread reads it)
 
     def readings(self, link: str) -> tuple[np.ndarray, np.ndarray]:
         """``link``'s last sample (host): taxel forces [N] (shear x, y, normal) and counts."""
@@ -171,11 +165,7 @@ def _taxel_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int,
                              s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps, s.pad[i], s.damp[i])
     if wp.length(g) == 0.0:
         return
-    X = b.xform[shape]  # the sensor's frame: in its body at the step's start (the world's for a static one)
-    j = b.body[shape]
-    if j >= 0:
-        X = b.body_q[j] * X
-    inv = wp.transform_inverse(X)
+    inv = wp.transform_inverse(_shape_pose(b, shape, b.body_q))  # the sensor's frame at the step's start
     x = wp.transform_point(inv, s.anchor[i])
     f = wp.transform_vector(inv, g)  # the force on the sensor
     n = wp.transform_vector(inv, s.normal[i])  # outward from the sensor
@@ -197,35 +187,28 @@ def _taxel_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int,
 
 
 @wp.kernel
-def _commit_kernel(cur: wp.array[wp.vec3], dt: float, acc: wp.array[wp.vec3]):
-    t = wp.tid()
+def _commit_kernel(cur: wp.array[wp.vec3], cur_total: wp.array[wp.vec3], dt: float, acc: wp.array[wp.vec3],
+                   total: wp.array[wp.vec3], time: wp.array[float]):
+    t = wp.tid()  # (a thread per taxel; the first few take the sensors' totals and the time)
     acc[t] = acc[t] + dt * cur[t]
+    if t < total.shape[0]:
+        total[t] = total[t] + dt * cur_total[t]
+    if t == 0:
+        time[0] += dt
 
 
 @wp.kernel
-def _time_kernel(dt: float, time: wp.array[float]):
-    time[0] += dt
-
-
-@wp.kernel
-def _sample_kernel(acc: wp.array[wp.vec3], time: wp.array[float], frame: wp.array[wp.mat33],
-                   force: wp.array[wp.vec3], raw: wp.array[wp.vec3i]):
+def _sample_kernel(acc: wp.array[wp.vec3], total_acc: wp.array[wp.vec3], time: wp.array[float],
+                   frame: wp.array[wp.mat33], force: wp.array[wp.vec3], raw: wp.array[wp.vec3i],
+                   total: wp.array[wp.vec3]):
     t = wp.tid()
-    f = frame[t] * (acc[t] / wp.max(time[0], 1.0e-30))
+    span = wp.max(time[0], 1.0e-30)
+    f = frame[t] * (acc[t] / span)
     f = wp.vec3(f[0], f[1], -f[2])  # pressing in (the force on the sensor against its normal) reads positive
     force[t] = f
     raw[t] = wp.vec3i(wp.clamp(int(wp.round(f[0] / LSB)), -128, 127), wp.clamp(int(wp.round(f[1] / LSB)), -128, 127),
                       wp.clamp(int(wp.round(f[2] / LSB)), 0, 255))
     acc[t] = wp.vec3(0.0)
-
-
-@wp.kernel
-def _total_kernel(acc: wp.array[wp.vec3], time: wp.array[float], total: wp.array[wp.vec3]):
-    k = wp.tid()
-    total[k] = acc[k] / wp.max(time[0], 1.0e-30)
-    acc[k] = wp.vec3(0.0)
-
-
-@wp.kernel
-def _reset_kernel(time: wp.array[float]):
-    time[0] = 0.0
+    if t < total.shape[0]:
+        total[t] = total_acc[t] / span
+        total_acc[t] = wp.vec3(0.0)

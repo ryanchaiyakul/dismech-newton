@@ -121,3 +121,15 @@ MIDAS (no padded shapes) flaky on both branches: 5/6 pass here, 5/6 on b45a3ff. 
 - tests/test_shell.py: test_pad_rest_depth[98.1, 981], test_pad_tilt, test_pad_rebound[0, 2]: pass, 12 s.
 - User chose lagged one pass: fixture uses the coupler's default (1 pass); test_proxy_impact xfail (strict) with the
   ~2x rebound as lagged's known limit. Suite: 81 passed, 4 xfailed. Coupling incl. slow: 9 passed, 1 xfailed.
+
+## Tactile preview (exp/pads/tactile.py, tactile_plot.py; vendor data local in scratch/paxini)
+
+S2015 fingertip: its STEP's outer surface (OCP tessellation, 7248 triangles) as a static pad, kh 5e8 (estimate: E ~1
+MPa over ~2 mm). A 30 mm sheet pressed on it with P = 2 N, then pulled along y with T = 0.5 N (mu 0.5). Readout:
+each pad point's force on the sensor to its nearest taxel, in the taxel's frame, 0.1 N LSB.
+- press: sum F on sensor (0, 0, -2.000) N = applied; 19 taxels loaded, max Fz 0.19 N; quantized sum 2.1 N.
+- pull (0.2 s in): (0, +0.5, -2.0) N = applied; held, but friction's smoothing below SLIP_SPEED lets it creep ~4 mm/s
+  and over 1 s it slides off the rounded tip.
+- Fix found here: an untouched pad pair now holds the line search to PAD_FLOOR h deep (to its surface stalled a
+  draped sheet: thousands of points just outside, t -> 0). Pad tests still pass.
+- A rod indenter rolls off the crest (nothing holds it sideways): the sheet is the stable load for now.

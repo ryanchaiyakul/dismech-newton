@@ -119,3 +119,5 @@ MIDAS (no padded shapes) flaky on both branches: 5/6 pass here, 5/6 on b45a3ff. 
   passes); trampoline 1/2 (no pads; body 2 through, known flaky).
 - Passes: 1 pass -> momentum/pin pass, test_proxy_impact rebounds ~2x; 2 passes -> impact 0.15, momentum/pin fail.
 - tests/test_shell.py: test_pad_rest_depth[98.1, 981], test_pad_tilt, test_pad_rebound[0, 2]: pass, 12 s.
+- User chose lagged one pass: fixture uses the coupler's default (1 pass); test_proxy_impact xfail (strict) with the
+  ~2x rebound as lagged's known limit. Suite: 81 passed, 4 xfailed. Coupling incl. slow: 9 passed, 1 xfailed.

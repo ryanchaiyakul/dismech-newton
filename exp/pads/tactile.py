@@ -9,7 +9,6 @@ import sys
 
 import newton
 import numpy as np
-import warp as wp
 
 sys.path[:0] = ["examples"]
 from utils.common import pads  # noqa: E402
@@ -97,3 +96,8 @@ run(600, P, T)
 pull = report("pull ", P, T)
 np.savez(os.environ.get("OUT", "exp/pads/logs/tactile.npz"), taxels=TP, press=press[0], pull=pull[0],
          press_raw=press[1], pull_raw=pull[1], rod=s0.particle_q.numpy())
+if os.environ.get("DBG"):
+    s = solver.contact.s
+    print("rod z [mm]", (s0.particle_q.numpy()[:, 2] * 1e3).round(3), "top", top * 1e3)
+    print("active", int(s.active.numpy().sum()), "pad", int(((s.pad.numpy()[:, 0] > 0) & (s.active.numpy() > 0)).sum()),
+          "shape flags", model.shape_flags.numpy(), "kh", model.shape_material_kh.numpy())

@@ -109,3 +109,13 @@ the servo is the pad's sink: a position servo (1000 N/m) on a compliant fingerti
 Winkler (cable R 5 mm, ~2 cm in the pad): kh 1e9 delta ~0.14 mm -> 0.13 N; 1e8 ~0.65 mm -> 0.63 N, as measured.
 The tests assume a rigid stop. Fold at kh 1e9: the napkin's grip spreads 1.85-2.5 (sheet points); passes at 1e8.
 MIDAS (no padded shapes) flaky on both branches: 5/6 pass here, 5/6 on b45a3ff. Suite = b45a3ff.
+
+## Clean build (c5206e7 + tests): ipc-contact src + pads, no Robin / switches; grip pads in the examples
+
+- src vs ipc-contact: +141 / -27 (contact, collide, adjoint). Pads: Newton's HYDROELASTIC flag + kh,
+  `model.shape_pad_dissipation` (Hunt-Crossley). Examples: `utils.common.pads` (Franka fingers, MIDAS hand), kh 1e8.
+- Gates: slow 20/21 (overhand_knot: PIL missing on sci6000) incl. pick-place / fold / MIDAS with pads; suite 75 + 3
+  xfailed + momentum/pin (the fixture's 2 passes: 0.258 / 0.021, as b45a3ff); grip 4.374 +- 0.000; bounce 0.15 (2
+  passes); trampoline 1/2 (no pads; body 2 through, known flaky).
+- Passes: 1 pass -> momentum/pin pass, test_proxy_impact rebounds ~2x; 2 passes -> impact 0.15, momentum/pin fail.
+- tests/test_shell.py: test_pad_rest_depth[98.1, 981], test_pad_tilt, test_pad_rebound[0, 2]: pass, 12 s.

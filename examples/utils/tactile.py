@@ -1,9 +1,8 @@
 """PaXini PX-6AX GEN3 tactile fingertips on the MIDAS hand: the sensors' outer surfaces as the fingertips' contact
 shapes (hydroelastic pads in our contact, :func:`utils.common.pads`), the MJCF's fingertip capsules moved behind them.
 
-The vendor's data stays local (the repo is public): ``PAXINI`` (default ``scratch/paxini``) holds per sensor its
-taxel map (``S2015.json``, ``M2826.json``: positions [mm], frames), its meshed STEP (``*_mesh.npz``, mm) and
-``mount/mount.json`` (each link's sensor and its pose, fitted to the mounting holes) and ``mount/dorsal.json`` (the
+``PAXINI`` (default ``examples/utils/paxini``) holds per sensor its taxel map (``S2015.json``, ``M2826.json``:
+positions [mm], frames), its meshed STEP (``*_mesh.npz``, mm) and ``mount/mount.json`` (each link's sensor and its pose, fitted to the mounting holes) and ``mount/dorsal.json`` (the
 capsule left on the finger's back)."""
 
 import json
@@ -16,9 +15,11 @@ import warp as wp
 from dismech_newton.collide import Bodies, _shape_pose
 from dismech_newton.contact import Arm, Slots, contact_force, pair_point, shape_of
 
-PAXINI = Path(os.environ.get("PAXINI", Path(__file__).resolve().parents[2] / "scratch" / "paxini"))
+PAXINI = Path(os.environ.get("PAXINI", Path(__file__).resolve().parent / "paxini"))
 CAPSULES = {"index_dip_link": "index_fingertip_contact", "middle_dip_link": "middle_fingertip_contact",
             "ring_dip_link": "ring_fingertip_contact", "thumb_dip": "thumb_dip_contact"}
+COLORS = {"index_dip_link": "#3987e5", "middle_dip_link": "#38ad7a", "ring_dip_link": "#a83265", "thumb_dip": "#c98500"}
+"""Each sensor's colour, in the viewer (:func:`mount`) and in plots."""
 
 
 def mount(builder, root: Path = PAXINI) -> dict[str, int]:
@@ -33,15 +34,20 @@ def mount(builder, root: Path = PAXINI) -> dict[str, int]:
     body_of = {label.split("/")[-1]: b for b, label in enumerate(builder.body_label)}
     shapes = {label.split("/")[-1]: s for s, label in enumerate(builder.shape_label)}
     collide = int(ShapeFlags.COLLIDE_SHAPES) | int(ShapeFlags.COLLIDE_PARTICLES)
-    out = {}
+    out, meshes = {}, {}
     for link, capsule in CAPSULES.items():
         p, body, old = poses[link], body_of[link], shapes[capsule]
         builder.shape_flags[old] &= ~collide
         cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=builder.shape_material_mu[old])
-        mesh = np.load(root / f"{p['sensor']}_mesh.npz")
+        if p["sensor"] not in meshes:  # its SDF (our contact samples it): out past a thick rod's reach
+            mesh = np.load(root / f"{p['sensor']}_mesh.npz")
+            meshes[p["sensor"]] = newton.Mesh(mesh["vertices"] * 1.0e-3, mesh["faces"].ravel())
+            meshes[p["sensor"]].build_sdf(narrow_band_range=SDF_BAND, target_voxel_size=SDF_VOXEL,
+                                          margin=SDF_BAND[1])
         q = wp.quat_from_matrix(wp.mat33(*np.asarray(p["R"], dtype=np.float32).ravel()))
+        rgb = tuple(int(COLORS[link][i:i + 2], 16) / 255.0 for i in (1, 3, 5))
         out[link] = builder.add_shape_mesh(body, xform=wp.transform(wp.vec3(*p["t"]), q), cfg=cfg, label=f"{link}_paxini",
-                                           mesh=newton.Mesh(mesh["vertices"] * 1.0e-3, mesh["faces"].ravel()))
+                                           mesh=meshes[p["sensor"]], color=rgb)
         b = backs[link]
         w, x, y, z = b["quat"]  # MJCF (w, x, y, z); the capsule's axis its +Z, as MuJoCo's
         builder.add_shape_capsule(body, xform=wp.transform(wp.vec3(*b["pos"]), wp.quat(x, y, z, w)), radius=b["radius"],
@@ -49,6 +55,7 @@ def mount(builder, root: Path = PAXINI) -> dict[str, int]:
     return out
 
 
+SDF_BAND, SDF_VOXEL = (-0.005, 0.04), 0.5e-3  # [m]
 SPACING = 1.25  # the receptive radius in taxel spacings (the median nearest-neighbour distance)
 CONE = wp.constant(0.7071)  # a taxel takes a contact whose normal is within 45 degrees of its own (HydroelasticTouch)
 LSB = wp.constant(0.1)  # [N] per count: Fx, Fy int8, Fz uint8 (the manual's)

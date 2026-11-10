@@ -291,12 +291,14 @@ def test_franka_pick_place():
 @pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda")
 def test_midas_axial_slip():
-    """Our MIDAS hand example, whole (162 frames): the hand grips the clamped rod and pushes it 3 cm along its axis;
-    sliding, the push is mu sum(N) (mean 2%, each frame 6%) and the rod's axial force the hand's push (1.5%)."""
+    """Our MIDAS hand example, whole (475 frames): the clamped rod's sag is Euler-Bernoulli's (2.5%); the fingers' pads
+    press it into the palm, the hand lifts it, ring and index let go and take it again, and it pushes it along its
+    axis; sliding, the push is mu sum(N) (mean 2%, each frame 6%) and the rod's axial force the hand's push (1.5%);
+    the PaXini taxels' forces sum to their sensors' contact forces."""
     from test_examples import _load  # noqa: PLC0415
 
     ex = _load("midas_axial").Example(None, None)
-    for _ in range(162):
+    for _ in range(475):
         ex.step()
     ex.test_final()
 

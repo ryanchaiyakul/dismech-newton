@@ -43,6 +43,7 @@ _NOISE = 1.0e-5  # a rise of the objective within its float32 rounding
 CG = 8  # Newton-CG's conjugate-gradient steps per iteration at most (Eisenstat-Walker stops them sooner)
 LINESEARCH = 4  # step lengths tried per iteration, halving from 1 (1: the full chord step)
 FINISH = 3  # a step's last iterations, after its multipliers are updated whether it has converged or not
+NEST = 8  # iterations nested per conditional chain (:meth:`SolverDiSMech.step`)
 # the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
 # force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
 TOLERANCE = 0.01
@@ -476,12 +477,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._go.fill_(1)
         self._radius.fill_(1.0)  # each step starts at the majorizer's
         self._cgs.zero_()
-        for it in range(self.iterations):
+        def iteration(it):
             self._room = it < self.iterations - 2  # a multiplier update leaves the solve an iteration
-            if self.contact.count and it == self.iterations - FINISH and it > 0:  # the multipliers updated,
-                # converged or not, if one moved: the last iterations solve from there
-                self.contact.update(q, self._tol, self._dq_max, self._pick, self._go, self._all, converged=False)
-                wp.capture_if(self.contact.any_moved, on_true=partial(self._regrad, q))
             if it == 0 or (self.exact and self.cap == 0.0):  # the chord matrix at the prediction (every iterate:
                 self._assemble(q, f)  # Gauss-Newton)
                 self._linear.invalidate()
@@ -489,10 +486,32 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                 wp.launch(_refresh_kernel, dim=1, inputs=[self._go[W:], self.contact.touching, int(self.exact)],
                           outputs=[self._refresh], device=dev)
                 wp.capture_if(self._refresh, on_true=partial(self._refactor, q, f))
-            if self.cap > 0.0 and it > 0:  # converged: the rest of the step skipped
-                wp.capture_if(self._go[W:], on_true=partial(self._iterate, state_in, q, f))
-            else:
-                self._iterate(state_in, q, f)
+            self._iterate(state_in, q, f)
+
+        def chain(it, stop):  # iterations it..stop-1, each nested in the last's go: converged, one node skips the rest
+            iteration(it)
+            if it + 1 < stop:
+                wp.capture_if(self._go[W:], on_true=partial(chain, it + 1, stop))
+
+        def chains(start, stop, first):  # NEST at a time, each run behind go (shallow nesting at 3000 iterations)
+            for a in range(start, stop, NEST):
+                if a == start and first:
+                    chain(a, min(a + NEST, stop))
+                else:
+                    wp.capture_if(self._go[W:], on_true=partial(chain, a, min(a + NEST, stop)))
+
+        finish = self.iterations - FINISH
+        if self.cap == 0.0:
+            for it in range(self.iterations):
+                iteration(it)
+        elif self.contact.count and finish > 0:
+            chains(0, finish, True)
+            # the multipliers updated, converged or not, if one moved: the last iterations solve from there
+            self.contact.update(q, self._tol, self._dq_max, self._pick, self._go, self._all, converged=False)
+            wp.capture_if(self.contact.any_moved, on_true=partial(self._regrad, q))
+            chains(finish, self.iterations, False)
+        else:
+            chains(0, self.iterations, True)
         self.contact.end_step()
         if self.cap > 0.0:
             wp.launch(_count_kernel, dim=W, inputs=[self._go, self._stalled, self._failed, self.counts], device=dev)

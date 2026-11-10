@@ -16,6 +16,7 @@ import scipy.sparse as sp
 import warp as wp
 from newton import GeoType, Model, ShapeFlags, State
 from newton._src.geometry import kernels as G  # its shape SDFs; triangle_...: exact zeros off the closest feature
+from newton._src.geometry.sdf_texture import TextureSDFData, create_empty_texture_sdf_data, texture_sample_sdf_grad
 from scipy.sparse.csgraph import maximum_bipartite_matching
 
 from .builder import _P
@@ -289,6 +290,8 @@ class Bodies:
     scale: wp.array[wp.vec3]
     source: wp.array[wp.uint64]
     props: wp.array[wp.int32]
+    sdf: wp.array[wp.int32]  # a mesh's in ``sdfs`` (Newton's texture SDF, Mesh.build_sdf), -1: its BVH
+    sdfs: wp.array[TextureSDFData]
     xform: wp.array[wp.transform]
     body: wp.array[wp.int32]
     margin: wp.array[float]
@@ -332,6 +335,11 @@ def _bodies(model: Model, device) -> Bodies:
         radius[i] = np.linalg.norm(np.asarray(v) * scale[i], axis=1).max() if v is not None and len(v) else 1.0e30
     b.radius = wp.array(radius, dtype=float, device=device)
     b.props = props if props is not None else wp.zeros(len(kind), dtype=wp.int32, device=device)
+    index, tables = getattr(model, "_shape_sdf_index", None), getattr(model, "_texture_sdf_data", None)
+    index = index.numpy() if index is not None and tables is not None else np.full(len(kind), -1)
+    b.sdf = wp.array(np.where(kind == int(GeoType.MESH), index, -1), dtype=wp.int32, device=device)
+    b.sdfs = tables if tables is not None else wp.array([create_empty_texture_sdf_data()], dtype=TextureSDFData,
+                                                        device=device)
     world = model.shape_world.numpy()
     ids = np.flatnonzero(on)
     ids = ids[np.argsort(world[ids], kind="stable")]  # the global shapes (-1), then world by world
@@ -423,6 +431,22 @@ def _shape_gap(b: Bodies, k: int, X: wp.transform, x: wp.vec3, reach: float):
 
 
 @wp.func
+def _gap(b: Bodies, k: int, X: wp.transform, x: wp.vec3, reach: float):
+    """:func:`_shape_gap`, a mesh with an SDF (Newton's texture SDF, ``Mesh.build_sdf``) by its trilinear value and
+    gradient: detection's (the adjoint keeps the mesh's exact surface: its backward of a texture lookup compiles for
+    hours)."""
+    j = b.sdf[k]
+    if j >= 0 and b.sdfs[j].coarse_texture.width > 0:
+        sdf = b.sdfs[j]
+        xl = wp.transform_point(wp.transform_inverse(X), x)
+        s = wp.where(sdf.scale_baked, 1.0, wp.min(wp.min(wp.abs(b.scale[k][0]), wp.abs(b.scale[k][1])),
+                                                  wp.abs(b.scale[k][2])))
+        d, g = texture_sample_sdf_grad(sdf, wp.where(sdf.scale_baked, xl, wp.cw_div(xl, b.scale[k])))
+        return d * s, wp.transform_vector(X, wp.normalize(g))
+    return _shape_gap(b, k, X, x, reach)
+
+
+@wp.func
 def _sweep(b: Bodies, k: int) -> float:
     """How far shape ``k``'s body has moved in the step so far (a yielding body at an iterate), else 0."""
     j = b.body[k]
@@ -507,7 +531,7 @@ def _edge_scan(b: Bodies, k: int, X: wp.transform, xa: wp.vec3, xb: wp.vec3, far
     nt = wp.vec3(0.0)
     for it in range(passes):
         u = wp.where(it == BISECT, t, 0.5 * (t0 + t1))
-        d, n = _shape_gap(b, k, X, wp.lerp(xa, xb, u), far)
+        d, n = _gap(b, k, X, wp.lerp(xa, xb, u), far)
         if it < BISECT:
             if wp.dot(n, xb - xa) < 0.0:
                 t0 = u
@@ -740,7 +764,7 @@ def _pad_points(sc: Scene, own: int, k: int, X: wp.transform, tri: wp.vec3i, th:
         for j in range(nq):
             u = (float(j) + 0.5) / float(nq)
             x = wp.lerp(node(q, tri[0]), node(q, tri[1]), u)
-            d, n = _shape_gap(b, k, X, x, far)
+            d, n = _gap(b, k, X, x, far)
             if d <= reach:
                 _keep_shape(sc, own, k, j, wp.vec4i(tri[0], tri[1], -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n,
                             n, th, c, 2.5)
@@ -760,7 +784,7 @@ def _pad_points(sc: Scene, own: int, k: int, X: wp.transform, tri: wp.vec3i, th:
         v = (float(wp.where(up, l, nq - 1 - l)) + o) / float(nq)
         wv = wp.vec4(1.0 - u - v, u, v, 0.0)
         x = wv[0] * node(q, tri[0]) + u * node(q, tri[1]) + v * node(q, tri[2])
-        d, n = _shape_gap(b, k, X, x, far)
+        d, n = _gap(b, k, X, x, far)
         if d <= reach:
             _keep_shape(sc, own, k, j, wp.vec4i(tri[0], tri[1], tri[2], -1), wv, x - d * n, n, th, c, 2.0)
 
@@ -837,7 +861,7 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
                 u = 0.0
             elif it == BISECT + 2:
                 u = 1.0
-            dj, nj = _shape_gap(b, k, X, wp.lerp(xa, xb, u), reach)
+            dj, nj = _gap(b, k, X, wp.lerp(xa, xb, u), reach)
             if it < BISECT:
                 if wp.dot(nj, xb - xa) < 0.0:
                     t0 = u
@@ -868,7 +892,7 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
                 p = x1
             elif it == FACE_PASSES + 3:
                 p = x2
-            dj, nj = _shape_gap(b, k, X, p, reach)
+            dj, nj = _gap(b, k, X, p, reach)
             if it < FACE_PASSES:
                 w = G.triangle_closest_point_barycentric(x0, x1, x2, p - dj * nj)
                 p = w[0] * x0 + w[1] * x1 + w[2] * x2
@@ -918,7 +942,7 @@ def _edge_shape(sc: Scene, e: int, jj: int, at: int):
             if u <= OPEN or u >= 1.0 - OPEN:
                 continue
             x = wp.lerp(xa, xb, u)
-            d, n = _shape_gap(b, k, X, x, far)
+            d, n = _gap(b, k, X, x, far)
             if d <= reach:
                 _found(sc, at + side, k, wp.vec4i(a0, a1, -1, -1), wp.vec4(1.0 - u, u, 0.0, 0.0), x - d * n, n, th)
 
@@ -963,7 +987,7 @@ def _node_shape(sc: Scene, i: int, jj: int, at: int):
         reach = REACH * th + wp.length(dy) + _sweep(b, k)  # and the body's motion
         if wp.length(xv - wp.transform_get_translation(X)) > b.radius[k] + reach:
             return
-        d, n = _shape_gap(b, k, X, xv, reach)
+        d, n = _gap(b, k, X, xv, reach)
         if d <= reach and not (m.rod[i] >= 0 and _edge_holds(q, m, b, k, X, i, n, reach)):
             _found(sc, at, k, wp.vec4i(i, -1, -1, -1), wp.vec4(1.0, 0.0, 0.0, 0.0), xv - d * n, n, th)
 

@@ -1,0 +1,108 @@
+{
+ "note": "sensor frame (vendor STEP/taxel frame, origin the bracket-tail dot) -> MIDAS link body frame: x_body = R x_sensor + t [m]; fitted from the mounting holes (scratch/paxini/tools/fit_mount.py, fit_thumb2.py)",
+ "index_dip_link": {
+  "sensor": "S2015",
+  "R": [
+   [
+    0.002058,
+    -0.209144,
+    0.977883
+   ],
+   [
+    -0.000347,
+    0.977884,
+    0.209145
+   ],
+   [
+    -0.999998,
+    -0.000769,
+    0.00194
+   ]
+  ],
+  "t": [
+   0.0070709,
+   0.0138367,
+   -0.0084782
+  ],
+  "hole_fit_mm": 0.01
+ },
+ "middle_dip_link": {
+  "sensor": "S2015",
+  "R": [
+   [
+    0.002058,
+    -0.209144,
+    0.977883
+   ],
+   [
+    -0.000347,
+    0.977884,
+    0.209145
+   ],
+   [
+    -0.999998,
+    -0.000769,
+    0.00194
+   ]
+  ],
+  "t": [
+   0.0070709,
+   0.0138367,
+   -0.0084782
+  ],
+  "hole_fit_mm": 0.01
+ },
+ "ring_dip_link": {
+  "sensor": "S2015",
+  "R": [
+   [
+    0.002058,
+    -0.209144,
+    0.977883
+   ],
+   [
+    -0.000347,
+    0.977884,
+    0.209145
+   ],
+   [
+    -0.999998,
+    -0.000769,
+    0.00194
+   ]
+  ],
+  "t": [
+   0.0070709,
+   0.0138367,
+   -0.0084782
+  ],
+  "hole_fit_mm": 0.01
+ },
+ "thumb_dip": {
+  "sensor": "M2826",
+  "R": [
+   [
+    0.531671,
+    -0.171954,
+    0.829312
+   ],
+   [
+    -0.069137,
+    0.967094,
+    0.244847
+   ],
+   [
+    -0.844125,
+    -0.187514,
+    0.502287
+   ]
+  ],
+  "t": [
+   0.0017769,
+   0.0157123,
+   -0.0122181
+  ],
+  "hole_fit_mm": 0.013,
+  "side": "palmar: the hole fit rotated 180 deg about its long axis through the tip capsule's centre"
+ }
+}

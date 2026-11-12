@@ -151,7 +151,7 @@ def _needs_media_check() -> bool:
             continue
         if remote_ref.startswith("refs/tags/v"):
             return True
-        if remote_sha != ZERO_SHA:
+        if remote_ref == "refs/heads/master" and remote_sha != ZERO_SHA:
             res = subprocess.run(
                 ["git", "show", f"{remote_sha}:pyproject.toml"],
                 cwd=ROOT,

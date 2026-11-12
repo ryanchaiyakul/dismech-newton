@@ -91,9 +91,12 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
     params_vec = wp.types.vector(2 * N, float)
     dofs_vec = wp.types.vector(D, wp.int32)
     xvec = wp.types.vector(D, float)
+    fwd = wp.get_module(f"{View.key}_fwd")
+    fwd.options.update({"enable_backward": False, "max_unroll": 8})
     # Loops over the DOFs unrolled: the adjoint kernels differentiate them. -O2: nvrtc -O3 builds a shell's strain
     # adjoint that faults (CUDA 700) on sm_120 (Warp 1.17).
-    unrolled = {"max_unroll": 32, "optimization_level": 2}
+    adj = wp.get_module(f"{View.key}_adj")
+    adj.options.update({"enable_backward": True, "max_unroll": 32, "optimization_level": 2})
 
     if material is None:
         @wp.func
@@ -135,12 +138,12 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             if fixed[d[k]] == 0:
                 wp.atomic_add(b, d[k], wp.float64(g[k]))
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def measure(q: wp.array[float], v: View, out: wp.array[vec]):
         i = wp.tid()
         out[i] = strain(local(q, v, i), v, i)
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def previous(stored: wp.array[vec], q: wp.array[float], v: View, out: wp.array[vec]):
         """The stored strains, measured at ``q`` where they are NaN (a state no step has written)."""
         i = wp.tid()
@@ -149,7 +152,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             s = strain(local(q, v, i), v, i)
         out[i] = s
 
-    @wp.kernel(module="unique")
+    @wp.kernel(module=fwd)
     def assemble(
         q: wp.array[float],
         v: View,
@@ -188,7 +191,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
                 if free[a] != free[c]:
                     wp.atomic_add(anchor, d[wp.where(free[a] != 0, a, c)], wp.abs(val))
 
-    @wp.kernel(module="unique")
+    @wp.kernel(module=fwd)
     def grad(
         q: wp.array[float],
         v: View,
@@ -202,7 +205,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         i = wp.tid()
         grad_into(q, v, i, params[i], rest[i], eps_prev[i], inv_dt, fixed, b)
 
-    @wp.kernel(module="unique")
+    @wp.kernel(module=fwd)
     def energy(
         q_cand: wp.array2d[float],
         v: View,
@@ -223,7 +226,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             e = wp.float64(w_e)
         world_sum(energy, w, k, wd.stride, e)
 
-    @wp.kernel(module="unique")
+    @wp.kernel(module=fwd)
     def commit(
         q: wp.array[float],
         v: View,
@@ -244,7 +247,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
 
     # -- the adjoint's: the step's residual per element, differentiated by Warp ----------------------------------
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def gather(q: wp.array[float], v: View, xs: wp.array[xvec]):
         i = wp.tid()
         xs[i] = local(q, v, i)
@@ -257,7 +260,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             sigma[j] = p[j] * (eps[j] - rest[j]) + p[N + j] / dt * (eps[j] - eps_prev[j])
         return wp.transpose(J) * sigma
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def forces(
         xs: wp.array[xvec],
         v: View,
@@ -271,7 +274,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         i = wp.tid()
         g[i] = force(xs[i], v, i, params[i], rest[i], eps_prev[i], dt)
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def forces_rows(
         xs: wp.array2d[xvec],
         v: View,
@@ -286,7 +289,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
         i, row = wp.tid()
         g[i, row] = force(xs[i, row], v, i, params[i], rest[i], eps_prev[i], dt)
 
-    @wp.kernel(module="unique", module_options=unrolled)
+    @wp.kernel(module=adj)
     def scatter(g: wp.array[xvec], v: View, fixed: wp.array[wp.int32], r: wp.array[float]):
         i = wp.tid()
         d = dofs(v, i)
@@ -295,7 +298,7 @@ def element_kernels(View, strain, jacobian, dofs, N: int, D: int, geometric=None
             if fixed[d[k]] == 0:
                 wp.atomic_add(r, d[k], gi[k])
 
-    @wp.kernel(module="unique")
+    @wp.kernel(module=fwd)
     def hessian_rows(
         h: wp.array2d[xvec],
         v: View,

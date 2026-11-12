@@ -23,6 +23,8 @@ from scipy.spatial import cKDTree
 
 from dismech_newton import flatten_state
 
+wp.set_module_options({"enable_backward": False})
+
 
 def smoothstep(t, t0: float, t1: float):
     """0 before ``t0``, 1 after ``t1``, cubic between (``t`` a scalar or an array)."""

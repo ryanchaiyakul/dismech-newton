@@ -4,7 +4,9 @@ capture."""
 import pytest
 import warp as wp
 from fd import assert_close
-from rollouts import ClampedRollout, JunctionRollout, ShellRollout
+from rollouts import ClampedRollout, JunctionRollout, PinRollout, ShellRollout
+
+from dismech_newton import solver
 
 # The differences: Gauss-Newton to convergence. No self-contact: a rollout's copies overlap.
 EXACT = {"exact": True, "iterations": 30, "self_contact": False}
@@ -73,3 +75,12 @@ def test_dahl_adjoint_matches_finite_differences(rng, options):
     across steps by the exact law, and its adjoint with it, so gradients reach the stiffness through ``sigma_max``
     too. Over 16 seeds within 1e-3 (2026-11-01); an adjoint that holds the stresses frozen fails."""
     DahlRollout(rng).check(options, fd_options=EXACT)
+
+
+def test_proxy_pin_adjoint_matches_finite_differences(rng, monkeypatch):
+    """A rod pinned by a ball joint (:class:`~dismech_newton.coupling.ProxyPins`) to a free 6-DOF proxy body
+    (:class:`~dismech_newton.coupling.ProxyArm`), chained across multiple steps: gradients wrt rod parameters, states,
+    external force, and initial proxy body twist ``body_qd``."""
+    monkeypatch.setattr(solver, "TOLERANCE", 1.0e-6)
+    opts = {**EXACT, "iterations": 200}
+    PinRollout(rng).check(opts, fd_options=opts)

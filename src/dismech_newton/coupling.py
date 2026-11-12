@@ -196,7 +196,7 @@ def proxy_step(q0: wp.transform, synced: wp.transform, qd: wp.spatial_vector, f:
     return dc, dr
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: int, k: int,
                          body_world: wp.array[wp.int32], mass: wp.array[float], inertia: wp.array[wp.mat33],
                          body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
@@ -225,7 +225,7 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
     offset[b] = wp.spatial_vector(dc, dr)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _proxy_reset_kernel(body: wp.array[wp.int32], body_world: wp.array[wp.int32], mask: wp.array[wp.bool],
                         valid: wp.array[wp.int32]):
     b = body[wp.tid()]
@@ -252,7 +252,7 @@ def _proxy_finish_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], z: 
     qd_out[b] = wp.spatial_vector((dx - wp.spatial_top(offset[b])) / h, (dth - wp.spatial_bottom(offset[b])) / h)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _proxy_free_kernel(body: wp.array[wp.int32], body_world: wp.array[wp.int32], mass: wp.array[float],
                        gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform], body_qd: wp.array[wp.spatial_vector],
                        body_f: wp.array[wp.spatial_vector], dt: float, q_out: wp.array[wp.transform],
@@ -350,14 +350,14 @@ def _pin_gap(q: wp.array[float], p: Pins, i: int, arm: Arm) -> wp.vec3:
     return node(q, p.node[i]) - p.point[i] - arm_move(q, arm, b, p.point[i] - arm.com[b])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _pin_begin_kernel(p: Pins, body_q: wp.array[wp.transform], mass: wp.array[float], scale: float):
     i = wp.tid()
     p.point[i] = wp.transform_point(body_q[p.body[i]], p.local[i])
     p.k[i] = scale * mass[3 * p.node[i]]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _pin_grad_kernel(q: wp.array[float], p: Pins, arm: Arm, fixed: wp.array[wp.int32], b: wp.array[wp.float64]):
     i = wp.tid()
     g = p.k[i] * _pin_gap(q, p, i, arm)
@@ -365,7 +365,7 @@ def _pin_grad_kernel(q: wp.array[float], p: Pins, arm: Arm, fixed: wp.array[wp.i
     arm_scatter(b, arm, p.body[i], p.point[i] - arm.com[p.body[i]], g)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _pin_energy_kernel(q_cand: wp.array2d[float], p: Pins, arm: Arm, count: int, world: wp.array[wp.int32],
                        stride: int, energy: wp.array[wp.float64]):
     j, i = wp.tid()
@@ -378,7 +378,7 @@ def _pin_energy_kernel(q_cand: wp.array2d[float], p: Pins, arm: Arm, count: int,
     world_sum(energy, w, j, stride, e)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _pin_assemble_kernel(p: Pins, arm: Arm, fixed: wp.array[wp.int32], indptr: wp.array[wp.int32],
                          indices: wp.array[wp.int32], vals: wp.array[wp.float64]):
     """``k [I, -P; -P^T, P^T P]`` into the upper CSR (all in the pattern: a node and its world's arm)."""
@@ -393,7 +393,7 @@ def _pin_assemble_kernel(p: Pins, arm: Arm, fixed: wp.array[wp.int32], indptr: w
     arm_assemble(vals, indptr, indices, fixed, arm, body, r, k * eye, -1, eye)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _pin_reaction_kernel(q: wp.array[float], p: Pins, arm: Arm, body_f: wp.array[wp.spatial_vector]):
     i = wp.tid()
     f = p.k[i] * _pin_gap(q, p, i, arm)  # pulls the body toward the node

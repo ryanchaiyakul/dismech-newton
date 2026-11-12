@@ -38,6 +38,8 @@ from .state import (
     world_sum,
 )
 
+wp.set_module_options({"enable_backward": False})
+
 _C1 = 1.0e-4  # Armijo's sufficient decrease
 _NOISE = 1.0e-5  # a rise of the objective within its float32 rounding
 CG = 2  # SPD PCG sweeps on two-sided contacts (m = 0 scales A^-1 b; m = 1..CG-1 add CG-1 back-solves)
@@ -301,6 +303,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         arm = None
         if self._proxy_arm is not None:  # the proxies' step, held for its adjoint
             inputs += [state_in.body_q, state_in.body_qd]
+            outputs += [state_out.body_q, state_out.body_qd]
             arm = self._proxy_arm.snapshot(self._qw[self.num_state_dofs:], state_in, self.pins)
         arrays = [a for a in (*inputs, *outputs) if a is not None and a.requires_grad]
         tape.record_func(lambda: self.vjp(state_in, state_out, dt, contacts, arm), arrays)

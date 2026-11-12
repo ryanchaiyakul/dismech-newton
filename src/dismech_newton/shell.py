@@ -15,6 +15,8 @@ from newton import Model
 from .builder import _P, vec6f
 from .element import element_kernels, rest_strains
 
+wp.set_module_options({"enable_backward": False})
+
 vec9i = wp.types.vector(9, wp.int32)
 vec21i = wp.types.vector(21, wp.int32)
 vec21f = wp.types.vector(21, float)

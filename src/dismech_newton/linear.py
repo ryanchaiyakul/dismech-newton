@@ -16,6 +16,8 @@ try:
 except ImportError:
     cudss = None
 
+wp.set_module_options({"enable_backward": False})
+
 _CUDA_R_32F, _CUDA_R_64F, _CUDA_R_32I = 0, 1, 10  # cudaDataType codes
 
 
@@ -224,3 +226,7 @@ def sparse_solver(A: SymmetricCSR, single: bool = False, spd: bool = False) -> C
 def _convert(src: wp.array[Any], dst: wp.array[Any]):
     i = wp.tid()
     dst[i] = type(dst[i])(src[i])
+
+
+wp.overload(_convert, [wp.array(dtype=wp.float64), wp.array(dtype=wp.float32)])
+wp.overload(_convert, [wp.array(dtype=wp.float32), wp.array(dtype=wp.float64)])

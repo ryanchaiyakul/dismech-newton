@@ -18,7 +18,7 @@ RADIUS = 0.01
 ONSET = 1.0 + SMOOTH  # contacts start this many thicknesses apart: at the barrier's onset, no normal force yet
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _drive(fixed: wp.array[wp.int32], num_node_dofs: int, dz: float, q: wp.array[float]):
     i = wp.tid()
     if i < num_node_dofs and i % 3 == 2 and fixed[i] != 0:
@@ -29,6 +29,43 @@ def _drive(fixed: wp.array[wp.int32], num_node_dofs: int, dz: float, q: wp.array
 def _dot(x: wp.array[float], w: wp.array[float], out: wp.array[float]):
     i = wp.tid()
     wp.atomic_add(out, 0, x[i] * w[i])
+
+
+def simulate(model, solver, steps: int, dt: float, every: int = 0, force=None, state=None, on_step=None):
+    """Step ``solver`` ``steps`` times; returns ``(final_state, frames)`` (positions every ``every`` steps)."""
+    s0, s1 = (model.state() if state is None else state), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    frames = []
+    for k in range(steps):
+        if force is not None:
+            s0.particle_f.assign(force)
+        solver.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+        if every and k % every == 0:
+            frames.append(s0.particle_q.numpy().copy())
+        if on_step is not None:
+            on_step(k, s0)
+    return s0, frames
+
+
+def energies(model, solver, state) -> tuple[float, float, float]:
+    """``(kinetic, elastic, gravitational)`` energy [J] in float64 for an undamped rod/shell state."""
+    flatten_state(state)
+    mass = dof_constants(model)[0].numpy().astype(np.float64)
+    qd = state.dismech.qd.numpy().astype(np.float64)
+    kinetic = 0.5 * float(mass @ (qd * qd))
+    elastic = 0.0
+    for e in solver.elements:
+        e.store(state.dismech)
+        eps = getattr(state.dismech, e.stored).numpy().astype(np.float64)
+        k = e.params.numpy().astype(np.float64)[:, : eps.shape[1]]
+        rest = e.rest.numpy().astype(np.float64)
+        elastic += 0.5 * float(np.sum(k * (eps - rest) ** 2))
+    pm = model.particle_mass.numpy().astype(np.float64)
+    pq = state.particle_q.numpy().astype(np.float64)
+    grav = model.gravity.numpy()[0].astype(np.float64)
+    return kinetic, elastic, -float(((pm[:, None] * pq) @ grav).sum())
 
 
 def cloth(builder, v, f, **kwargs):
@@ -273,6 +310,8 @@ class Rollout:
         grads = {key: a.grad.numpy().ravel().astype(np.float64) for key, a in run.arrays.items()}
         grads["q"], grads["qd"] = s0.q.grad.numpy()[run.dofs[0]], s0.qd.grad.numpy()[run.dofs[0]]
         grads["force"] = sum(state.particle_f.grad.numpy() for state in run.states[:-1]).ravel()
+        if hasattr(run, "boxes"):
+            grads["body_qd"] = run.states[0].body_qd.grad.numpy()[run.boxes[0]].astype(np.float64)
         return grads
 
     def along(self, grads: dict) -> dict:
@@ -488,13 +527,15 @@ class SheetContactRollout(ShellRollout):
     """
 
     colliding = True
-    spacing = 0.8
     thickness = 0.004  # the sheet's particle radius
     checks = {"ground": ("mass", "velocity", "position"), "sphere": ("mass", "speed", "shift"),
-              "foot": ("mass", "velocity", "position", "shift"), "edge": ("mass", "velocity", "shift")}
+              "foot": ("mass", "velocity", "shift"), "edge": ("mass", "velocity", "shift")}
 
     def __init__(self, rng, scene: str, mu: float):
         self.scene = scene
+        self.spacing = 0.8 if scene in ("foot", "edge") else 0.0
+        if scene != "ground":
+            self.dt = 3.0e-3  # < 0.5 * thickness / |v|, so pairs stay frozen from step start
         super().__init__(rng, mu)
 
     def _rod(self, o: np.ndarray):
@@ -510,6 +551,8 @@ class SheetContactRollout(ShellRollout):
         if self.scene == "ground":
             builder.add_ground_plane(cfg=_cfg(builder, self.mu))
         if self.scene == "sphere":
+            builder.add_shape_sphere(-1, xform=wp.transform((0.0, 0.0, -0.06), wp.quat_identity()),
+                                     radius=0.06, cfg=_cfg(builder, self.mu))
             v, f = grid(3, 3, 0.1, 0.1)
             v += (-0.05, -0.05, self.thickness * ONSET)
         else:
@@ -517,9 +560,6 @@ class SheetContactRollout(ShellRollout):
             v[:, 2] = self.thickness * ONSET if self.scene == "ground" else 0.0
         for c in range(copies):
             o = self.offset(c, copies)
-            if self.scene == "sphere":
-                builder.add_shape_sphere(-1, xform=wp.transform(o + (0.0, 0.0, -0.06), wp.quat_identity()),
-                                         radius=0.06, cfg=_cfg(builder, self.mu))
             ids = cloth(builder, v + o, f, particle_radius=self.thickness, **self.cloth_options)
             if self.scene in ("foot", "edge"):
                 for k in ids[: 2 * self.ny]:
@@ -539,8 +579,8 @@ class SheetContactRollout(ShellRollout):
         v = self._slide(rng, model, first)
         if axis:
             v[3 * first : nd : 3], v[3 * first + 1 : nd : 3] = 0.0, 0.3
-        if self.scene == "ground":  # stretching too: a rigid slide's mass derivative vanishes
-            v[:nd] += 0.1 * rng.normal(size=nd) * (np.arange(nd) % 3 != 2)
+        if self.scene in ("ground", "sphere"):  # stretching too: a rigid slide's mass derivative vanishes
+            v[:nd] += 0.15 * rng.normal(size=nd) * (np.arange(nd) % 3 != 2)
         return v
 
     def _directions(self, rng, model):
@@ -593,3 +633,80 @@ class SphereRollout(Rollout):
             "speed": (4.0e-2, {"qd": along}),  # random velocities tumble it from edge to edge
             "shift": (2.0e-3, {"q": along}),
         }
+
+
+class PinRollout(ClampedRollout):
+    """A rod pinned by a ball joint (:class:`~dismech_newton.coupling.ProxyPins`) to a free 6-DOF proxy box
+    (:class:`~dismech_newton.coupling.ProxyArm`), one world per copy so each proxy has its own 6-DOF block."""
+
+    rod_options = dict(ClampedRollout.rod_options, stretch_stiffness=1.0e3)
+
+    def __init__(self, rng, mu: float = 0.3):
+        self.box_v0 = 0.2 * rng.normal(size=6)
+        super().__init__(rng, mu)
+
+    def model(self, copies: int):
+        builder = newton.ModelBuilder()
+        half = 0.5 * 0.5 / self.segments
+        for _ in range(copies):
+            w = newton.ModelBuilder()
+            body = w.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, self.height), wp.quat_identity()))
+            w.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04,
+                            cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=self.mu))
+            rod = newton.Rod.create_straight((0.09, 0.0, self.height), (1.0, 0.0, 0.0), 0.5,
+                                             segment_count=self.segments, radius=RADIUS)
+            capsules, _ = SolverDiSMech.add_rod(w, rod=rod, cfg=_cfg(w, self.mu), **self.rod_options)
+            w.add_joint_ball(parent=body, child=capsules[0],
+                             parent_xform=wp.transform(wp.vec3(0.09, 0.0, 0.0), wp.quat_identity()),
+                             child_xform=wp.transform(wp.vec3(0.0, 0.0, -half), wp.quat_identity()))
+            builder.add_world(w)
+        model = builder.finalize()
+        eb = model.dismech.edge_body.numpy()
+        boxes = np.setdiff1d(np.arange(model.body_count), eb[eb >= 0])
+        flags = model.body_flags.numpy()
+        flags[boxes] |= int(newton.BodyFlags.PROXY)
+        model.body_flags.assign(flags)
+        return model
+
+    def _directions(self, rng, model):
+        d = super()._directions(rng, model)
+        del d["clamp"]
+        d["proxy velocity"] = (2.0e-2, {"body_qd": rng.normal(size=6)})
+        return d
+
+    def setup(self, options: dict, grad: bool, X: np.ndarray | None = None) -> SimpleNamespace:
+        run = super().setup(options, grad, X)
+        eb = run.model.dismech.edge_body.numpy()
+        run.boxes = np.setdiff1d(np.arange(run.model.body_count), eb[eb >= 0])
+        X_arr = np.zeros((1, len(self.directions))) if X is None else X
+        bqd = run.states[0].body_qd.numpy().astype(np.float64)
+        bqd[run.boxes] = self.box_v0 + X_arr @ self._matrix("body_qd", 6)
+        run.states[0].body_qd.assign(bqd)
+        return run
+
+
+class PadRollout(GroundRollout):
+    """A rod pressing and sliding on a hydroelastic Winkler pad with Hunt-Crossley damping."""
+
+    ground = False
+    colliding = True
+    height = 0.85 * RADIUS
+
+    def model(self, copies: int):
+        from utils.common import pads  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        builder.add_shape_box(-1, xform=wp.transform((0.0, 0.0, -0.05), wp.quat_identity()), hx=4.0, hy=4.0, hz=0.05,
+                              cfg=_cfg(builder, self.mu))
+        for c in range(copies):
+            rod = newton.Rod.create_straight(np.add((0.0, 0.0, self.height), self.offset(c, copies)), (1.0, 0.0, 0.0),
+                                             0.5, segment_count=self.segments, radius=RADIUS)
+            SolverDiSMech.add_rod(builder, rod=rod, cfg=_cfg(builder, self.mu), **self.rod_options)
+        model = builder.finalize()
+        pads(model, [-1], 5.0e5, dissipation=1.5)
+        return model
+
+    def _velocity(self, rng, model):
+        v = super()._velocity(rng, model)
+        v[2 : 3 * model.particle_count : 3] = -0.05
+        return v

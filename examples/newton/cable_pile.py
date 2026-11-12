@@ -51,9 +51,11 @@ class Example(CableExample):
 
     def test_final(self):
         z = self.state_0.particle_q.numpy()[:, 2]
-        assert np.isfinite(z).all(), "non-finite positions"
-        assert z.min() > -0.5, "cables penetrated the ground"
-        assert z.max() < self.layers * 2.0 * self.radius + 0.5, "pile too high"
+        v = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1)
+        assert np.isfinite(z).all() and np.isfinite(v).all(), "non-finite state"
+        assert z.min() > 0.5 * self.radius, f"cables penetrated the ground (min z {z.min():.4f} m)"
+        assert z.max() < (self.layers + 3) * 2.0 * self.radius, f"pile did not settle (max z {z.max():.4f} m)"
+        assert np.percentile(v, 95) < 0.25, f"pile still moving fast (95th speed {np.percentile(v, 95):.3f} m/s)"
 
 
 if __name__ == "__main__":

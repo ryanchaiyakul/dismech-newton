@@ -47,6 +47,7 @@ from .contact import (
     contact_point,
     flexibility,
     node_map,
+    pad_energy,
     roll_point,
     shape_of,
     slot_map,
@@ -113,12 +114,13 @@ class StepAdjoint:
             self.pred, self.M = grad(live.pred.shape[0]), wp.clone(live.M, requires_grad=True)
             self.Minv = wp.clone(live.Minv, requires_grad=True)
             self.end, self._com = grad(nb, wp.transform), grad(nb, wp.vec3)
-            self._end_qd = wp.zeros(nb, dtype=wp.spatial_vector, device=dev)
+            self._end_qd = grad(nb, wp.spatial_vector)
             self._end_last = wp.zeros(nb, dtype=wp.transform, device=dev)
-            self._offset = wp.zeros(nb, dtype=wp.spatial_vector, device=dev)
+            self._offset = grad(nb, wp.spatial_vector)
             self._com_end = wp.zeros(nb, dtype=wp.transform, device=dev)  # (a sink)
             self.pin_point = grad(max(s.pins.p.point.shape[0], 1), wp.vec3)
-            self._intermediates += [self.pred, self.M, self.Minv, self.end, self._com, self.pin_point]
+            self._intermediates += [self.pred, self.M, self.Minv, self.end, self._end_qd, self._offset, self._com,
+                                    self.pin_point]
 
     def vjp(self, state_in: State, state_out: State, dt: float, contacts: Slots | None = None, arm=None) -> None:
         """Accumulate the adjoints from ``state_out``'s ``.grad``; both states must still hold the step (``arm``: its
@@ -128,6 +130,10 @@ class StepAdjoint:
         seeds = {self.q: s_out.q.grad, self.qd: s_out.qd.grad, self.edge_d1: s_out.edge_d1_q.grad,
                  self.ref_twist: s_out.triplet_ref_twist_q.grad, self.dahl: s_out.triplet_dahl_q.grad,
                  **{e.strain: getattr(s_out, e.blk.stored).grad for e in self.elements}}
+        if arm is not None:
+            seeds[self.end] = arm.end_grad
+            if state_out.body_qd is not None and state_out.body_qd.grad is not None:
+                seeds[self._end_qd] = state_out.body_qd.grad
         seeds = {a: g for a, g in seeds.items() if g is not None}
         if not seeds:
             return
@@ -141,17 +147,20 @@ class StepAdjoint:
         with suspended_tape():
             for a in self._intermediates:
                 a.grad.zero_()
+            pa, m = s._proxy_arm, s.model
             if arm is not None:
                 wp.copy(self.q_star, arm.z, dest_offset=n)  # the arms' moves: the solve accounts for their inputs
-                seeds[self.end] = arm.end_grad
-            pa, m = s._proxy_arm, s.model
+                if state_out.body_q is not None and state_out.body_q.grad is not None:
+                    wp.launch(_seed_arm_kernel, dim=pa._body.shape[0],
+                              inputs=[pa._body, state_out.body_q.grad], outputs=[arm.end_grad], device=dev)
             tape = wp.Tape()
             with tape:
                 if arm is not None:
                     wp.launch(_arm_pred_kernel, dim=pa._body.shape[0],
                               inputs=[pa._body, self.arm.base, self.arm.start, self.arm.k, m.body_world, m.body_mass,
                                       m.body_inertia, m.body_com, m.gravity, state_in.body_q, state_in.body_qd,
-                                      arm.body_f, arm.poses, h], outputs=[self.pred, self.M, self.Minv], device=dev)
+                                      arm.body_f, arm.poses, h],
+                              outputs=[self.pred, self.M, self.Minv, self._offset], device=dev)
                     wp.launch(_arm_com_kernel, dim=pa._body.shape[0], inputs=[pa._body, m.body_com, arm.poses],
                               outputs=[self._com], device=dev)  # (before the solve: its lever arms use them)
                     if self.pins is not None:
@@ -308,8 +317,8 @@ class StepAdjoint:
                           inputs=[self.q_star, self.pred, self.M, arm], outputs=[self.residual], device=dev)
                 if self.pins is not None:
                     wp.launch(_pin_residual_kernel, dim=self.pins.node.shape[0],
-                              inputs=[self.q_star, self.pins, self.pin_point, arm, s.fixed], outputs=[self.residual],
-                              device=dev)
+                              inputs=[self.q_star, self.pins, self.pin_point, self.mass, _detached(self.mass), arm,
+                                      s.fixed], outputs=[self.residual], device=dev)
             for e in self.elements:
                 blk, k, v = e.blk, e.blk.k, e.blk.bind(state_in.dismech)
                 e.xs.grad.zero_()
@@ -333,7 +342,7 @@ class StepAdjoint:
                 # the lever arms from the step's anchors (a body's point, which its surface point at q_in can miss
                 # along the surface): their values, the surface point's derivative
                 inputs = [contacts, src.bodies, poses, weights, arm, src.shape_key0, s.fixed,
-                          s.contact.slip_speed * dt, self.q_star, q_in, _detached(q_in), self.mass,
+                          s.contact.slip_speed * dt, dt, self.q_star, q_in, _detached(q_in), self.mass,
                           _detached(self.mass), self._com if self.arm is not None else self._no_com,
                           self.Minv if self.arm is not None else arm.Minv]
                 off, anchors = (wp.zeros(n_c, dtype=wp.vec3, device=dev) for _ in range(2))
@@ -384,7 +393,7 @@ def _residual_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, r: wp
         wp.atomic_add(r, i, inertia_grad(f, i, q[i] - q_pred[i]))
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _rhs_kernel(fixed: wp.array[wp.int32], adj: wp.array[float], rhs: wp.array[float]):
     """``rhs = -adj`` on free DOFs, whose ``adj`` the solve takes over (a fixed DOF's goes on to ``q_in``)."""
     i = wp.tid()
@@ -395,14 +404,14 @@ def _rhs_kernel(fixed: wp.array[wp.int32], adj: wp.array[float], rhs: wp.array[f
         adj[i] = 0.0
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _unit_kernel(D: int, g: wp.array2d[float]):
     """``g[i D + row]``: the unit vector ``row``."""
     j, k = wp.tid()
     g[j, k] = wp.where(k == j % D, 1.0, 0.0)
 
 
-@wp.kernel(module="unique")  # generic
+@wp.kernel(module="unique", enable_backward=False)  # generic
 def _rows_kernel(xs: wp.array(dtype=Any), rows: wp.array2d(dtype=Any)):
     i, row = wp.tid()
     rows[i, row] = xs[i]
@@ -411,7 +420,7 @@ def _rows_kernel(xs: wp.array(dtype=Any), rows: wp.array2d(dtype=Any)):
 # -- contacts ------------------------------------------------------------------------------
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _spmv_kernel(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], vals: wp.array[wp.float64],
                  x: wp.array[wp.float64], y: wp.array[wp.float64]):
     """``y += A x``, ``A`` symmetric by its upper CSR."""
@@ -425,7 +434,7 @@ def _spmv_kernel(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], vals: 
     wp.atomic_add(y, i, acc)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _contact_matvec_kernel(q: wp.array[float], c: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
                            x: wp.array[wp.float64], y: wp.array[wp.float64]):
     """``y += J^T H_c J x`` on the free DOFs (``J``: :func:`~.contact.node_map` per node, ``-P`` on a yielding
@@ -464,7 +473,7 @@ def _contact_matvec_kernel(q: wp.array[float], c: Slots, arm: Arm, eps: float, f
                     wp.atomic_add(y, 3 * pair[j] + a, yj[a])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cg_step_kernel(dots: wp.array[wp.float64], p: wp.array[wp.float64], hp: wp.array[wp.float64],
                     x: wp.array[wp.float64], r: wp.array[wp.float64]):
     i = wp.tid()
@@ -473,19 +482,19 @@ def _cg_step_kernel(dots: wp.array[wp.float64], p: wp.array[wp.float64], hp: wp.
     r[i] = r[i] - alpha * hp[i]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cg_direction_kernel(dots: wp.array[wp.float64], z: wp.array[wp.float64], p: wp.array[wp.float64]):
     i = wp.tid()
     p[i] = z[i] + dots[2] / dots[0] * p[i]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _dot_kernel(a: wp.array[wp.float64], b: wp.array[wp.float64], slot: int, dots: wp.array[wp.float64]):
     i = wp.tid()
     wp.atomic_add(dots, slot, a[i] * b[i])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _cg_roll_kernel(dots: wp.array[wp.float64]):
     dots[0] = dots[2]
     dots[1] = wp.float64(0.0)
@@ -502,6 +511,7 @@ def _contact_residual_kernel(
     key0: int,
     fixed: wp.array[wp.int32],
     eps: float,
+    dt: float,
     q: wp.array[float],
     q_in: wp.array[float],
     q_in0: wp.array[float],
@@ -551,14 +561,16 @@ def _contact_residual_kernel(
         aflex = body_flexibility(arm, Minv, body, n, lever)
     k = c.stiffness[i] * wp.max(flexibility(pair, c.w[i], mass0, fixed) + arm_flexibility(arm, c, i), 1.0e-30) / wp.max(
         flexibility(pair, w, mass, fixed) + aflex, 1.0e-30)
-    rho = -barrier(wp.dot(n, c0), th, k, c.lam[i])[1]
+    d0 = wp.dot(n, c0)
+    pf = -pad_energy(d0, th, c.pad[i])[1]
+    rho = -barrier(d0, th, k, c.lam[i])[1] + pf
     roll, ta, tb = c.roll[i], c.ta[i], c.tb[i]  # the rods' surface turn, as the step froze it
     c0 = c0 + roll_point(q_in, pair, w, roll, n, ta, tb)
     cq = contact_point(q, pair, w, anchor) + roll_point(q, pair, w, roll, n, ta, tb)
     if body >= 0:
         cq -= arm_move(q, arm, body, lever)
     anchors[i] = anchor
-    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.damp[i])
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.pad[i][3] * pf / dt)
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)
@@ -578,7 +590,7 @@ def _scan_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], key0: int, 
     """A line contact's other end's closest point, as the step scanned it (:func:`~.collide._edge_scan`)."""
     i = wp.tid()
     t0[i] = 0.0
-    if c.key[i] >= key0 and c.pair[i][1] >= 0:
+    if c.key[i] >= key0 and c.pair[i][1] >= 0 and c.pair[i][2] < 0 and c.pad[i][0] == 0.0:
         sk = shape_of(c.key[i], key0)
         if c.key[i] != key0 + SIDES * sk:
             t0[i] = _edge_scan(b, sk, _shape_pose(b, sk, poses), node(q, c.pair[i][0]), node(q, c.pair[i][1]), 1.0e6)[0]
@@ -591,7 +603,7 @@ def _weights_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], poses0: 
     (:func:`_edge_shape_weights`; ``poses0``, ``q0``: ``poses``, ``q`` without adjoints)."""
     i = wp.tid()
     w = c.w[i]
-    if c.key[i] >= key0 and c.pair[i][1] >= 0:
+    if c.key[i] >= key0 and c.pair[i][1] >= 0 and c.pair[i][2] < 0 and c.pad[i][0] == 0.0:
         sk = shape_of(c.key[i], key0)
         w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, _shape_pose(b, sk, poses), _shape_pose(b, sk, poses0),
                                 c.key[i] != key0 + SIDES * sk, t0[i])
@@ -729,12 +741,14 @@ def _arm_residual_kernel(q: wp.array[float], pred: wp.array[float], M: wp.array3
 
 
 @wp.kernel
-def _pin_residual_kernel(q: wp.array[float], p: Pins, point: wp.array[wp.vec3], arm: Arm, fixed: wp.array[wp.int32],
-                         r: wp.array[float]):
+def _pin_residual_kernel(q: wp.array[float], p: Pins, point: wp.array[wp.vec3], mass: wp.array[float],
+                         mass0: wp.array[float], arm: Arm, fixed: wp.array[wp.int32], r: wp.array[float]):
     """``r += k (x - p - P z)`` on the node, ``-P^T`` of it on the body (``point``: ``p.point``, with its adjoint)."""
     i = wp.tid()
-    g = p.k[i] * (_pin_gap(q, p, i, arm) + p.point[i] - point[i])
-    scatter_node(r, fixed, p.node[i], g)
+    n = p.node[i]
+    k = p.k[i] * mass[3 * n] / wp.max(mass0[3 * n], 1.0e-30)
+    g = k * (_pin_gap(q, p, i, arm) + p.point[i] - point[i])
+    scatter_node(r, fixed, n, g)
     _arm_scatter(r, arm, p.body[i], p.point[i] - arm.com[p.body[i]], g)
 
 
@@ -744,7 +758,7 @@ def _arm_pred_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: 
                      body_com: wp.array[wp.vec3], gravity: wp.array[wp.vec3], body_q: wp.array[wp.transform],
                      body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
                      q0: wp.array[wp.transform], h: float, pred: wp.array[float], M: wp.array3d[float],
-                     Minv: wp.array3d[float]):
+                     Minv: wp.array3d[float], offset: wp.array[wp.spatial_vector]):
     """The proxies' own moves over the step and their rotational inertia, as
     :func:`~.coupling._proxy_update_kernel` has them, from the synced ``body_q``, ``body_qd`` and their start poses
     ``q0``."""
@@ -753,8 +767,15 @@ def _arm_pred_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: 
     i = base[b] - start
     w = i // k
     i0 = i - w * k
-    proxy_step(q0[b], body_q[b], body_qd[b], body_f[b], mass[b], inertia[b], body_com[b],
-               gravity[wp.max(body_world[b], 0)], h, w, i, i0, pred, M, Minv)
+    dc, dr = proxy_step(q0[b], body_q[b], body_qd[b], body_f[b], mass[b], inertia[b], body_com[b],
+                        gravity[wp.max(body_world[b], 0)], h, w, i, i0, pred, M, Minv)
+    offset[b] = wp.spatial_vector(dc, dr)
+
+
+@wp.kernel(enable_backward=False)
+def _seed_arm_kernel(body: wp.array[wp.int32], g: wp.array[wp.transform], end_grad: wp.array[wp.transform]):
+    b = body[wp.tid()]
+    end_grad[b] = end_grad[b] + g[b]
 
 
 @wp.kernel
@@ -771,7 +792,7 @@ def _pin_point_kernel(body: wp.array[wp.int32], local: wp.array[wp.vec3], q0: wp
     point[i] = wp.transform_point(q0[body[i]], local[i])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _route_kernel(body: wp.array[wp.int32], chained: wp.array[wp.int32], has_prev: int,
                   g: wp.array[wp.transform], prev: wp.array[wp.transform], synced: wp.array[wp.transform]):
     """A proxy's start pose's adjoint ``g``: to the last step's end (``prev``) if it started there, else to its synced

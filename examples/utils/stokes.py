@@ -15,6 +15,8 @@ import numpy as np
 import scipy.linalg
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})
+
 
 def _cusolver_library() -> ctypes.CDLL:
     """The cuSOLVER that CuPy loaded, called directly with buffers allocated once (CuPy's ``posv``

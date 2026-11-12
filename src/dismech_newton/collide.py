@@ -23,6 +23,8 @@ from .builder import _P
 from .contact import SIDES, Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
 from .state import node
 
+wp.set_module_options({"enable_backward": False})
+
 PAIRS = 8  # the pair list's places per feature (node or edge), shared: the scenes' peak is 1.7 (cloth_style3d)
 PAD_DEPTH = wp.constant(0.5)  # a pad holds the outer half of a pair's thickness, its core's barrier the rest
 REACH = 2.0  # pairs within this many thicknesses: the thickness, plus two move caps (a radius each)

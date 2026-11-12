@@ -145,7 +145,7 @@ def skin(model: Model, splats: Splats, q: wp.array, edge_d1: wp.array,
 # -- export -----------------------------------------------------------------------------------
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _proxy_pose_kernel(q: wp.array[float], edge_d1: wp.array[wp.vec3], edge_node0: wp.array[wp.int32],
                        edge_node1: wp.array[wp.int32], twist0: int, poses: wp.array[wp.transform]):
     """As ``pose_proxies_kernel``: the midpoint, local ``(x, y, z)`` along ``(m1, m2, t)``."""

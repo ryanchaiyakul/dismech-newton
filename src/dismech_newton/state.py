@@ -115,7 +115,7 @@ def dof_worlds(model: Model, n: int, stencils) -> np.ndarray:
     return out.astype(np.int32)
 
 
-@wp.kernel(module="unique")  # generic: an overload recompiles this, not the module
+@wp.kernel(module="unique", enable_backward=False)  # generic: an overload recompiles this, not the module
 def masked_copy_kernel(start: int, world: wp.array[wp.int32], mask: wp.array[wp.bool], src: wp.array(dtype=Any),
                        dst: wp.array(dtype=Any)):
     """``dst[i] = src[i]`` for the rows ``i`` (from ``start``) whose world ``mask`` selects."""
@@ -202,7 +202,7 @@ def predict_kernel(fixed: wp.array[wp.int32], q0: wp.array[float], v0: wp.array[
         q[i] = wp.where(fixed[i] != 0, q0[i], q_pred[i])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def diagonal_kernel(f: Dofs, indptr: wp.array[wp.int32], vals: wp.array[wp.float64]):
     """``A``'s diagonal: ``+= M / dt^2``, ``1`` on fixed DOFs."""
     i = wp.tid()

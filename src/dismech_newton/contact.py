@@ -16,6 +16,8 @@ from newton import Model, State
 from .linear import row_slot
 from .state import node, padded, scatter_node, world_sum
 
+wp.set_module_options({"enable_backward": False})
+
 SMOOTH = wp.constant(0.02)  # the barrier's activation margin above the thickness (in thicknesses): a pair resting at
 # its thickness already has curvature, so A sees it
 LOAD = wp.constant(0.25)  # a node's pairs are stiffened until they hold its load at most this many thicknesses deep

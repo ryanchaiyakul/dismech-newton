@@ -16,6 +16,7 @@ save
 # Cached example results (examples/utils/common.py: cached)
 .cache/
 
-# Experiment worktrees (CLAUDE.md)
+# Agentic tools
 .claude/worktrees/
 CLAUDE.md
+AGENTS.md

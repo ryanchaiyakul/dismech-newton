@@ -14,15 +14,13 @@ import warp as wp
 from fd import assert_derivative
 from newton import BodyFlags
 from newton._src.geometry import kernels as G
-from rollouts import CrossingRollout, GroundRollout, SheetContactRollout, SphereRollout
+from rollouts import CrossingRollout, GroundRollout, PadRollout, SheetContactRollout, SphereRollout
 
 from dismech_newton import SolverDiSMech, flatten_state, solver
 from dismech_newton.adjoint import _closest_weights
 
 # Converged: 12 step lengths, as a step from beyond the barrier's onset can need far shorter steps than 4 give.
 OPTIONS = {"iterations": 500}
-# A two-sided pair's majorized A converges the pair's common motion slowly.
-TWO_SIDED = pytest.mark.xfail(strict=True, reason="a two-sided pair's step converges too slowly for the differences")
 
 
 @pytest.fixture(autouse=True)
@@ -49,8 +47,8 @@ SLIDE = pytest.mark.parametrize("mu", [0.3], ids=["slide"])
 @SLIDE
 def test_rod_contact_adjoint_matches_finite_differences(rng, mu, monkeypatch):
     """Rod-rod (edge-edge): the closest points and normal the step takes from ``q_in`` recomputed from it. Half the
-    steps, so no node moves half a radius in one (the pairs found again mid-step), and converged further: the pair's
-    common motion converges slowly (:data:`TWO_SIDED`). Tilt and yaw turn the normal; a random position's stretching
+    steps, so no node moves half a radius in one (the pairs found again mid-step), and converged further: a two-sided
+    pair's common motion converges slowly. Tilt and yaw turn the normal; a random position's stretching
     is too stiff for the step's float32 convergence."""
     monkeypatch.setattr(solver, "TOLERANCE", 1.0e-7)
     r = CrossingRollout(rng, mu)
@@ -66,13 +64,23 @@ def test_shape_contact_adjoint_matches_finite_differences(rng, mu):
 
 
 @SLIDE
-@pytest.mark.parametrize("scene", ["ground", pytest.param("sphere", marks=TWO_SIDED),
-                                   pytest.param("foot", marks=TWO_SIDED), pytest.param("edge", marks=TWO_SIDED)])
-def test_sheet_contact_adjoint_matches_finite_differences(rng, scene, mu):
+def test_hydroelastic_pad_adjoint_matches_finite_differences(rng, mu, monkeypatch):
+    """A rod pressing and sliding on a Winkler hydroelastic pad with Hunt-Crossley dissipation."""
+    monkeypatch.setattr(solver, "TOLERANCE", 1.0e-7)
+    PadRollout(rng, (0.3, 0.1, -0.05), ("mass", "velocity", "position"), mu).check(
+        dict(OPTIONS, exact=True, self_contact=False))
+
+
+@SLIDE
+@pytest.mark.parametrize("scene", ["ground", "sphere", "foot", "edge"])
+def test_sheet_contact_adjoint_matches_finite_differences(rng, scene, mu, monkeypatch):
     """A sheet's vertex on the ground and on a sphere, a rod's node on a triangle, a rod's edge across the sheet's
     edge. Solved exactly: ADMM's elastic splitting leaves float32 noise that a light sheet's differences do not
     resolve."""
-    SheetContactRollout(rng, scene, mu).check(dict(OPTIONS, exact=True))
+    if scene != "ground":
+        monkeypatch.setattr(solver, "TOLERANCE", 1.0e-7)
+    iters = 500 if scene == "ground" else 2000
+    SheetContactRollout(rng, scene, mu).check(dict(OPTIONS, iterations=iters, exact=True, self_contact=False))
 
 
 def test_pinch_adjoint_matches_finite_differences(rng, monkeypatch):
@@ -144,7 +152,7 @@ def test_pinch_adjoint_matches_finite_differences(rng, monkeypatch):
     assert_derivative(adjoint, fd, abs(c[h] - c[h / 2]), 1.0e-2, "rod shift", scale=scale)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _weights_kernel(q: wp.array[float], pairs: wp.array[wp.vec4i], w: wp.array[wp.vec4], out: wp.array[wp.vec4],
                     bary: wp.array[wp.vec3]):
     i = wp.tid()

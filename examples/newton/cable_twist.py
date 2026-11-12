@@ -60,7 +60,11 @@ class Example(CableExample):
         assert np.isfinite(x).all(), "non-finite positions"
         stretch = np.linalg.norm(np.diff(x.reshape(len(self.rods), -1, 3), axis=1), axis=2) / self.segment_length
         assert np.abs(stretch - 1.0).max() < 0.1, "cable stretched by more than 10%"
-        assert x[:, 2].min() > -0.5, "cable penetrated the ground"
+        assert x[:, 2].min() > 0.5 * self.radius, f"cable penetrated the ground (min z {x[:, 2].min():.4f} m)"
+        if self.sim_time >= 1.0:
+            twists = np.abs(self.state_0.dismech.q.numpy()[3 * self.model.particle_count:]).reshape(len(self.rods), -1)
+            mean_twist = twists[:, 1:].mean(1)
+            assert mean_twist[0] < mean_twist[-1], f"stiffer cable did not carry twist further: {mean_twist}"
 
 
 if __name__ == "__main__":

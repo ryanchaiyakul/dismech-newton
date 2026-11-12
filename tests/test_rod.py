@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import warp as wp
 from fd import assert_close
+from rollouts import energies, simulate
 
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton.builder import vec5f
@@ -113,12 +114,12 @@ def _dahl_triplet(eps_max: float, tau: float):
     return model, SolverDiSMech(model, self_contact=False)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _tip_force(force: wp.array[float], i: int, f: wp.array[wp.vec3]):
     f[2] = wp.vec3(0.0, 0.0, force[i])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _record_kappa(strain: wp.array[vec5f], i: int, out: wp.array[float]):
     out[i] = -strain[0][2]
 
@@ -198,16 +199,7 @@ def test_dahl_off_is_elastic():
 def _run(builder, steps: int, dt: float) -> list:
     """The node positions after each step."""
     model = builder.finalize()
-    solver = SolverDiSMech(model, self_contact=False)
-    s0, s1 = model.state(), model.state()
-    flatten_state(s0)
-    flatten_state(s1)
-    out = []
-    for _ in range(steps):
-        solver.step(s0, s1, None, None, dt)
-        s0, s1 = s1, s0
-        out.append(s0.particle_q.numpy())
-    return out
+    return simulate(model, SolverDiSMech(model, self_contact=False), steps, dt, every=1)[1]
 
 
 def test_y_junction_arms_are_cantilevers():
@@ -263,3 +255,87 @@ def test_reversed_edges_reproduce_the_chain():
         paths.append(np.array(_run(builder, 100, 0.01)))
     assert np.abs(paths[0] - paths[0][0]).max() > 1.0
     np.testing.assert_allclose(paths[1], paths[0], atol=1.0e-5)
+
+
+def test_axial_extension_and_torsion_and_curved_rest():
+    """1) Axial Hooke's law ``dL = F L_free / EA``; 2) pure torsion between clamped ends ``theta_e = phi e / (n - 1)``
+    and stored energy ``GJ phi^2 / (2 L_free)``; 3) a semicircular curved rod at rest stays put with zero strain."""
+    L, n, EA, GJ, F, phi = 0.5, 20, 1.0e4, 2.0, 50.0, 0.8
+    h, L_free = L / n, L * (n - 1) / n
+    # 1. Axial extension (stretch_stiffness is per-edge EA / h [N/m])
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), L, segment_count=n, radius=0.005)
+    bodies, _ = SolverDiSMech.add_rod(b, rod=rod, stretch_stiffness=EA / h, stretch_damping=5.0, bend_stiffness=1.0,
+                                      twist_stiffness=1.0)
+    SolverDiSMech.fix_segment(b, bodies[0])
+    m = b.finalize()
+    force = np.zeros((n + 1, 3), dtype=np.float32)
+    force[-1, 0] = F
+    s_ext, _ = simulate(m, SolverDiSMech(m, exact=True, iterations=20, self_contact=False), 80, 0.01, force=force)
+    assert abs((s_ext.particle_q.numpy()[-1, 0] - L) / (F * L_free / EA) - 1.0) < 1.0e-3
+
+    # 2. Pure torsion: both end segments fixed, tip twist prescribed to phi -> linear twist & exact torsional energy
+    b2 = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    bodies2, _ = SolverDiSMech.add_rod(b2, rod=rod, stretch_stiffness=EA, bend_stiffness=1.0, twist_stiffness=GJ / h)
+    SolverDiSMech.fix_segment(b2, bodies2[0])
+    SolverDiSMech.fix_segment(b2, bodies2[-1])
+    m2 = b2.finalize()
+    sim2 = SolverDiSMech(m2, exact=True, iterations=20, self_contact=False)
+    s0 = m2.state()
+    flatten_state(s0)
+    q = s0.dismech.q.numpy()
+    q[-1] = phi
+    s0.dismech.q.assign(q)
+    s_tor, _ = simulate(m2, sim2, 40, 0.02, state=s0)
+    twists = s_tor.dismech.q.numpy()[3 * m2.particle_count:]
+    np.testing.assert_allclose(twists, phi * np.arange(n) / (n - 1), atol=5.0e-4)
+    assert abs(energies(m2, sim2, s_tor)[1] / (0.5 * GJ * phi**2 / L_free) - 1.0) < 1.0e-3
+
+    # 3. Curved semicircular rod at rest
+    ang = np.linspace(0.0, np.pi, 25)
+    arc = np.column_stack([0.2 * np.cos(ang), 0.2 * np.sin(ang), np.zeros_like(ang)])
+    b3 = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    SolverDiSMech.add_rod(b3, rod=newton.Rod(arc, radius=0.006), stretch_stiffness=1.0e4, bend_stiffness=1.0,
+                          twist_stiffness=1.0)
+    m3 = b3.finalize()
+    sim3 = SolverDiSMech(m3, self_contact=False)
+    s_arc, _ = simulate(m3, sim3, 20, 0.01)
+    assert np.abs(s_arc.particle_q.numpy() - arc).max() < 1.0e-6
+    assert energies(m3, sim3, s_arc)[1] < 1.0e-12
+
+
+@pytest.mark.parametrize("alpha", [2.0, 5.0])
+def test_nonlinear_elastica_cantilever(alpha):
+    """Large-deflection cantilever under vertical tip load ``F = alpha EI / L_eff^2`` (tip sag 49% and 71% of ``L``,
+    foreshortening 16% and 39%, where linear beam theory is off by 35% and 133%): matches exact Euler elastica BVP
+    within 2%."""
+    from scipy.integrate import solve_bvp  # noqa: PLC0415
+
+    L, n, EI, EA = 0.5, 40, 0.1, 1.0e5
+    h = L / n
+    L_eff = L - 0.5 * h
+    F = alpha * EI / (L_eff**2)
+    s_grid = np.linspace(0.0, L_eff, 200)
+    sol = solve_bvp(
+        lambda s, y: np.vstack([y[1], -(F / EI) * np.cos(y[0]), np.cos(y[0]), np.sin(y[0])]),
+        lambda ya, yb: np.array([ya[0], yb[1], ya[2], ya[3]]),
+        s_grid,
+        np.vstack([0.5 * s_grid / L_eff, np.zeros_like(s_grid), s_grid, 0.2 * s_grid]),
+        tol=1.0e-9,
+    )
+    assert sol.success
+    x_exact, z_exact = sol.sol(L_eff)[2], sol.sol(L_eff)[3]
+
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), L, segment_count=n, radius=0.005)
+    bodies, _ = SolverDiSMech.add_rod(b, rod=rod, stretch_stiffness=EA, bend_stiffness=EI / h, twist_stiffness=EI / h,
+                                      bend_damping=0.02, cfg=newton.ModelBuilder.ShapeConfig(density=200.0))
+    SolverDiSMech.fix_segment(b, bodies[0])
+    m = b.finalize()
+    force = np.zeros((n + 1, 3), dtype=np.float32)
+    force[-1, 2] = -F
+    out, _ = simulate(m, SolverDiSMech(m, exact=True, iterations=25, self_contact=False), 250, 0.01, force=force)
+    tip = out.particle_q.numpy()[-1]
+    sag, shorten = -float(tip[2]), float(L - tip[0])
+    assert abs(sag / z_exact - 1.0) < 0.02, (sag, z_exact)
+    assert abs(shorten / (L_eff - x_exact) - 1.0) < 0.02, (shorten, L_eff - x_exact)

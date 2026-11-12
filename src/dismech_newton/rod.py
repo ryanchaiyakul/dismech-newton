@@ -362,7 +362,7 @@ def proxy_joints(model: Model) -> np.ndarray:
     return out
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def pose_proxies_kernel(node_q: wp.array[wp.vec3], node_qd: wp.array[wp.vec3], edge_q: wp.array[float],
                         edge_d1: wp.array[wp.vec3], edge_node0: wp.array[wp.int32], edge_node1: wp.array[wp.int32],
                         edge_body: wp.array[wp.int32], edge_joint: wp.array[wp.vec2i], set_velocity: int,

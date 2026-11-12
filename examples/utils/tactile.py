@@ -15,6 +15,8 @@ import warp as wp
 from dismech_newton.collide import Bodies, _shape_pose
 from dismech_newton.contact import Arm, Slots, contact_force, pair_point, shape_of
 
+wp.set_module_options({"enable_backward": False})
+
 PAXINI = Path(os.environ.get("PAXINI", Path(__file__).resolve().parent / "paxini"))
 CAPSULES = {"index_dip_link": "index_fingertip_contact", "middle_dip_link": "middle_fingertip_contact",
             "ring_dip_link": "ring_fingertip_contact", "thumb_dip": "thumb_dip_contact"}

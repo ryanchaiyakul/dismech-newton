@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -120,24 +122,67 @@ def cmd_upload() -> int:
         return 1
 
     gh = shutil.which("gh")
-    if not gh:
+    if gh:
+        view = subprocess.run([gh, "release", "view", tag], cwd=ROOT, capture_output=True)
+        if view.returncode != 0:
+            subprocess.run(
+                [gh, "release", "create", tag, "--title", tag, "--notes", f"Release {tag} media assets"],
+                cwd=ROOT,
+                check=True,
+            )
+        subprocess.run([gh, "release", "upload", tag, "--clobber", *files], cwd=ROOT, check=True)
+        print(f"Uploaded {len(files)} .webp assets to GitHub Release {tag}")
+        return 0
+
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
         print(
-            f"gh CLI not found. Upload docs/*.webp to GitHub Release {tag} manually "
-            f"(or set SKIP_MEDIA=1 to bypass).",
+            f"Neither `gh` CLI nor GITHUB_TOKEN/GH_TOKEN found. Upload docs/*.webp to GitHub Release {tag} "
+            f"manually (or set SKIP_MEDIA=1 to bypass).",
             file=sys.stderr,
         )
         return 1
 
-    view = subprocess.run([gh, "release", "view", tag], cwd=ROOT, capture_output=True)
-    if view.returncode != 0:
-        subprocess.run(
-            [gh, "release", "create", tag, "--title", tag, "--notes", f"Release {tag} media assets"],
-            cwd=ROOT,
-            check=True,
-        )
-    subprocess.run([gh, "release", "upload", tag, "--clobber", *files], cwd=ROOT, check=True)
+    _upload_via_api(tag, [Path(f) for f in files], token)
     print(f"Uploaded {len(files)} .webp assets to GitHub Release {tag}")
     return 0
+
+
+def _api(url: str, token: str, method: str = "GET", data: bytes | None = None, ctype: str = "application/json") -> dict:
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": ctype,
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _upload_via_api(tag: str, files: list[Path], token: str) -> None:
+    try:
+        rel = _api(f"https://api.github.com/repos/{REPO}/releases/tags/{tag}", token)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        body = json.dumps({"tag_name": tag, "name": tag, "body": f"Release {tag} media assets"}).encode("utf-8")
+        rel = _api(f"https://api.github.com/repos/{REPO}/releases", token, method="POST", data=body)
+
+    existing = {a["name"]: a["id"] for a in rel.get("assets", [])}
+    upload_base = rel["upload_url"].split("{", 1)[0]
+    for path in files:
+        if path.name in existing:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{REPO}/releases/assets/{existing[path.name]}",
+                method="DELETE",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            )
+            urllib.request.urlopen(req).read()
+        _api(f"{upload_base}?name={path.name}", token, method="POST", data=path.read_bytes(), ctype="image/webp")
 
 
 def _needs_media_check() -> bool:

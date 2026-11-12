@@ -134,8 +134,7 @@ class Example(CableExample):
 
     @staticmethod
     def _proxy(model):
-        """MuJoCo's hand and carriage, our rod; the hand's bodies with contact shapes proxies in our solve, two
-        passes (one throws the closing fingers off the rod)."""
+        """MuJoCo's hand and carriage, our rod; the hand's bodies with contact shapes proxies in our solve."""
         capsules = sorted({int(b) for b in model.dismech.edge_body.numpy() if b >= 0})
         hand = [b for b in range(model.body_count) if b not in capsules]
         child = model.joint_child.numpy()
@@ -148,10 +147,10 @@ class Example(CableExample):
 
         return SolverCoupledProxy(model, entries=[
             SolverCoupled.Entry(name="mjc", solver=mujoco, bodies=hand, joints=joints),
-            SolverCoupled.Entry(name="soft", solver=lambda view: SolverDiSMech(view, iterations=30),
+            SolverCoupled.Entry(name="soft", solver=SolverDiSMech,
                                 particles=list(range(model.particle_count)), bodies=capsules,
                                 joints=[j for j in range(model.joint_count) if j not in joints]),
-        ], coupling=SolverCoupledProxy.Config(iterations=2, proxies=[SolverCoupledProxy.Proxy(
+        ], coupling=SolverCoupledProxy.Config(proxies=[SolverCoupledProxy.Proxy(
             source="mjc", destination="soft", bodies=[b for b in hand if b in shaped])]))
 
     def drive(self, t0, t1):

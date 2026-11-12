@@ -5,11 +5,38 @@ from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
-from newton import BodyFlags, JointType, Model, State
+from newton import BodyFlags, JointType, Model, State, StateFlags
+from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 from .contact import STIFFNESS, Arm, arm_assemble, arm_move, arm_scatter
 from .linear import row_slot
 from .state import node, padded, scatter_node, world_sum
+
+_lagged_step_coupled = SolverCoupledProxy._step_coupled
+
+
+def _rsr_step_coupled(self: SolverCoupledProxy, state_in: State, state_out: State, control, contacts, dt: float) -> None:
+    """Follow the 1-pass proxy solve with a rigid corrector step on the harvested ``F^n`` (``R-S-R``)."""
+    _lagged_step_coupled(self, state_in, state_out, control, contacts, dt)
+    if int(self._coupling.iterations) != 1:
+        return
+    for (src_name, dst_name), group in self._proxy_groups.items():
+        src, dst = self._entries[src_name], self._entries[dst_name]
+        if getattr(dst.solver, "_proxy_arm", None) is None:
+            continue
+        body_proxies = group["bodies"]
+        if not body_proxies or any(int(p.mode) != 0 for p in body_proxies):
+            continue
+        if src.has_body_force_input:
+            self._clear_body_force_input(src)
+            self._add_body_force_input(src, src.body_local_to_global, state_in.body_f)
+            for proxy in body_proxies:
+                self._add_body_force_input(src, proxy.source_local_to_proxy_global, proxy.coupling_forces)
+            self._notify_input_state_update(src, StateFlags.BODY_F, dt=dt)
+        self._step_entry(src, control, contacts, dt)
+
+
+SolverCoupledProxy._step_coupled = _rsr_step_coupled
 
 
 class ProxyArm:

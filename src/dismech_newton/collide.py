@@ -880,6 +880,7 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
             return
         # the triangle: FACE_PASSES alternations from its centroid, then its point and its three nodes
         thf = (m.radius[tri[0]] + m.radius[tri[1]] + m.radius[tri[2]]) / 3.0 + b.margin[k]
+        r = wp.where(b.kind[k] == GeoType.SPHERE or b.kind[k] == GeoType.CAPSULE, b.scale[k][0], 0.0)
         w = wp.vec3(1.0 / 3.0)
         p = (x0 + x1 + x2) / 3.0
         d = float(0.0)
@@ -894,7 +895,7 @@ def _shell_shape(sc: Scene, e: int, jj: int, at: int):
                 p = x2
             dj, nj = _gap(b, k, X, p, reach)
             if it < FACE_PASSES:
-                w = G.triangle_closest_point_barycentric(x0, x1, x2, p - dj * nj)
+                w = G.triangle_closest_point_barycentric(x0, x1, x2, p - (dj + r) * nj)
                 p = w[0] * x0 + w[1] * x1 + w[2] * x2
             elif it == FACE_PASSES:
                 d = dj

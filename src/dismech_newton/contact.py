@@ -340,6 +340,7 @@ class BarrierBlock:
         nw, self.stride = int(dof_world.max(initial=0)) + 1, stride  # the worlds; per-world sums a[w stride + k]
         self.num_worlds = nw
         self.touching = wp.zeros(1, dtype=wp.int32, device=self.device)  # a pair has curvature at the last grad's q
+        self.two_sided = wp.zeros(1, dtype=wp.int32, device=self.device)  # a two-sided pair has curvature there
         self.scale = wp.ones(max(model.particle_count, 1), dtype=float, device=self.device)  # nodes' load scales
         self.lam = wp.zeros(size, dtype=float, device=self.device)  # per pair, the multiplier kept for the next
         # detection and step; the list's sort (keys, places; twice the size: the radix sort's) and the last
@@ -410,17 +411,15 @@ class BarrierBlock:
                       outputs=[getattr(out, name)], device=self.device)
         return out
 
-    def update(self, q: wp.array, tol: float, dq_max: wp.array, pick: wp.array, go: wp.array, mask: wp.array,
-               converged: bool = True) -> None:
+    def update(self, q: wp.array, tol: float, dq_max: wp.array, pick: wp.array, go: wp.array, mask: wp.array) -> None:
         """At a converged ``q``: each pair's multiplier, the force its barrier holds there beyond what it holds at
         its thickness (kept by key for the next detection and step); if one moves its pair's rest by more than
         ``tol``, the solve converged (its last Newton step ``dq_max`` within ``tol`` and taken: not stalled) and the
-        step has updates left, the pairs take them and ``go`` is set: the solve goes on. Not ``converged``: at the
-        step's end, whether its solve converged or not. Per world, in the worlds of ``mask``; ``go[num_worlds]``: any
-        world goes on."""
+        step has updates left, the pairs take them and ``go`` is set: the solve goes on. Per world, in the worlds of
+        ``mask``; ``go[num_worlds]``: any world goes on."""
         self.moved.zero_()
         self._launch(_uzawa_kernel, [q, self.s, self.arm, mask, tol, self.lam, self.moved])
-        wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, pick, tol, int(converged), self.num_worlds,
+        wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, pick, tol, self.num_worlds,
                   mask, self.left, self.moved, go], device=self.device)
         self._launch(_apply_kernel, [self.moved, self.lam, self.s])
 
@@ -435,18 +434,18 @@ class BarrierBlock:
             wp.launch(_arm_assemble_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[self.arm, A.indptr,
                       A.indices, A.vals], device=self.device)
 
-    def correction(self, q: wp.array, p: wp.array, y: wp.array, some: wp.array) -> None:
-        """``y += D p``: the pairs' Hessian less ``A``'s: friction exact along the slip (``A``: its majorizer) and a
-        two-sided pair's cross terms (``A``: twice each side's own blocks, the pattern's); ``some[w]``: ``D != 0`` in
-        world ``w`` (not cleared)."""
-        self._launch(_correction_kernel, [q, self.s, self.arm, self.slip, self.fixed, p, y, some])
+    def two_sided_mul(self, q: wp.array, p: wp.array, y: wp.array) -> None:
+        """``y += delta_A_2side p``: per two-sided pair, ``-(C_a + C_b)^T H (C_a p_a + C_b p_b)`` so ``A`` plus this
+        is the exact majorized two-sided Hessian ``(C_a - C_b)^T H (C_a - C_b)``."""
+        self._launch(_two_sided_kernel, [q, self.s, self.arm, self.slip, self.fixed, p, y])
 
     def impact(self, q: wp.array, dq: wp.array, t: wp.array) -> None:
         """``t = min(t, ...)`` the line search's longest step along ``-dq`` (each pair's gap ``d`` is linear in it, on
         the frozen normal): :data:`IMPACT` of the length at which a touching pair's gap would reach the barrier's
-        zero (IPC's filter), or the length at which an untouched pair reaches its barrier's full curvature (the Newton
-        step, built without the pair's curvature, holds only that far)."""
-        self._launch(_impact_kernel, [q, dq, self.s, self.arm, t])
+        zero (IPC's filter), or the length at which an untouched pair reaches its barrier's full curvature (or a
+        sliding pair rewinding reaches its sticking ramp: the Newton step, built without that curvature, holds only
+        that far)."""
+        self._launch(_impact_kernel, [q, dq, self.s, self.arm, self.slip, t])
 
     def newton_size(self, q: wp.array, dq: wp.array, cap: float, size: wp.array) -> None:
         """``size = max(size, e''(d) |n . C dq| h^2 / m)`` over the pairs: the Newton step's change of each pair's
@@ -458,7 +457,9 @@ class BarrierBlock:
 
     def grad(self, q: wp.array, b: wp.array) -> None:
         self.touching.zero_()
-        self._launch(_barrier_grad_kernel, [q, self.s, self.arm, self.slip, self.fixed, b, self.touching])
+        self.two_sided.zero_()
+        self._launch(_barrier_grad_kernel, [q, self.s, self.arm, self.slip, self.fixed, b, self.touching,
+                                            self.two_sided])
         if self.arm.k:
             wp.launch(_arm_grad_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[q, self.arm, b],
                       device=self.device)
@@ -565,19 +566,26 @@ def _lift_kernel(q: wp.array[float], lift: float, s: Slots, arm: Arm):
     """A shape's pair (all weights positive: against its anchor) starting closer than ``lift`` thicknesses, or
     inside (a node in a body, or a body moving onto it over the step): its anchor sinks along the normal so the
     barrier starts that close (finite), and the body pushes it out over the next steps. At an iterate a yielding body
-    has moved by its DOFs in ``q`` (detection sees it at the step's start): the gap is to the moved body."""
+    is posed at ``q`` for detection, then its anchor is pulled back to the step's start."""
     i = wp.tid()
     if s.active[i] == 0 or wp.min(s.w[i]) < 0.0:
         return
     n = s.normal[i]
     c = contact_point(q, s.pair[i], s.w[i], s.anchor[i])
-    b = arm_body(arm, s, i)
-    if b >= 0 and q.shape[0] > arm.start:  # (the step's start: the state's DOFs only, the bodies not yet moved)
-        c -= arm_move(q, arm, b, s.anchor[i] - arm.com[b])
     o = wp.dot(n, c) - lift * s.thickness[i]
     if o < 0.0:
         s.anchor[i] = s.anchor[i] + o * n
         s.c0[i] = s.c0[i] - o * n
+    b = arm_body(arm, s, i)
+    if b >= 0 and q.shape[0] > arm.start:  # (the step's start: the state's DOFs only, the bodies not yet moved)
+        j = arm.base[b]
+        dx = wp.vec3(q[j], q[j + 1], q[j + 2])
+        dth = wp.vec3(q[j + 3], q[j + 4], q[j + 5])
+        y = s.anchor[i] - arm.com[b] - dx
+        r0 = (y - wp.cross(dth, y) + dth * wp.dot(dth, y)) / (1.0 + wp.dot(dth, dth))
+        move = dx + wp.cross(dth, r0)
+        s.anchor[i] = s.anchor[i] - move
+        s.c0[i] = s.c0[i] + move
 
 
 @wp.func
@@ -674,13 +682,15 @@ def _along_slip(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
 
 @wp.kernel
 def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
-                         b: wp.array[wp.float64], touching: wp.array[wp.int32]):
+                         b: wp.array[wp.float64], touching: wp.array[wp.int32], two_sided: wp.array[wp.int32]):
     i = wp.tid()
     if s.active[i] == 0:
         return
     g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
     if h > 0.0 or fr > 0.0:
         touching[0] = 1
+        if wp.min(s.w[i]) < 0.0:
+            two_sided[0] = 1
     for j in range(4):
         if s.pair[i][j] >= 0:
             scatter_node(b, fixed, s.pair[i][j], wp.transpose(slot_map(s, i, j)) * g)
@@ -709,7 +719,7 @@ def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, loa
 @wp.func
 def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     """The pair's Hessian as ``A`` holds it (with respect to ``C q = c``): the barrier's curvature capped, friction's
-    majorized along the slip (``f1 / y``)."""
+    majorized in the sticking ramp (``f1 / y``) and exact when sliding (``0`` along the slip, ``f1 / y`` across it)."""
     n = s.normal[i]
     g, h, fr = _barrier_force(c, s, i, eps)
     h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
@@ -717,65 +727,51 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     x = s.thickness[i] + pad[2] - wp.dot(n, c)  # in its pad: a rod's curvature (delta^1/2) is 0 at the surface,
     if pad[0] > 0.0 and x >= 0.0:  # so A holds at least the pad's at PAD_FLOOR of it deep
         h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
+    slip = _slip(c, s.c0[i], n)
+    y = wp.length(slip)
+    if y >= eps:
+        b = wp.cross(n, slip / y)
+        return h * wp.outer(n, n) + fr * wp.outer(b, b)
     return h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
 
 
+@wp.func
+def _mat33d(M: wp.mat33) -> wp.mat33d:
+    return wp.mat33d(
+        wp.float64(M[0, 0]), wp.float64(M[0, 1]), wp.float64(M[0, 2]),
+        wp.float64(M[1, 0]), wp.float64(M[1, 1]), wp.float64(M[1, 2]),
+        wp.float64(M[2, 0]), wp.float64(M[2, 1]), wp.float64(M[2, 2]),
+    )
+
+
 @wp.kernel
-def _correction_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
-                       p: wp.array[wp.float64], y: wp.array[wp.float64], some: wp.array[wp.int32]):
-    """``y += D p``: per pair ``C^T H C p`` (``H`` its majorizer with friction exact along the slip) less ``A``'s
-    part: ``C^T H_A C`` (one-sided), or twice each side's own blocks (two-sided: :func:`_barrier_assemble_kernel`);
-    ``some[w] = 1`` if a pair of world ``w`` has ``D != 0``."""
+def _two_sided_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
+                      p: wp.array[wp.float64], y: wp.array[wp.float64]):
     i = wp.tid()
-    if s.active[i] == 0:
+    if s.active[i] == 0 or wp.min(s.w[i]) >= 0.0:
+        return
+    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    if H[0, 0] == 0.0 and H[1, 1] == 0.0 and H[2, 2] == 0.0:
         return
     pair = s.pair[i]
     w = s.w[i]
-    c = pair_point(q, s, i, arm, s.anchor[i])
-    two = wp.min(w) < 0.0
-    D = _along_slip(c, s, i, eps)
-    if not two and D[0, 0] == 0.0 and D[1, 1] == 0.0 and D[2, 2] == 0.0:
-        return  # one-sided, not sliding: A holds it exactly
-    HA = _majorizer(c, s, i, eps)
-    if HA[0, 0] == 0.0 and HA[1, 1] == 0.0 and HA[2, 2] == 0.0:
-        return  # untouched
-    some[s.world[i]] = 1
-    up = wp.vec3(0.0)  # C p: the positive side's part, the negative's
-    un = wp.vec3(0.0)
+    u = wp.vec3d(wp.float64(0.0))
     for a in range(4):
         na = pair[a]
         if na >= 0:
-            pa = wp.vec3(0.0)
-            for k in range(3):
-                if fixed[3 * na + k] == 0:
-                    pa[k] = float(p[3 * na + k])
-            if w[a] < 0.0:
-                un += slot_map(s, i, a) * pa
-            else:
-                up += slot_map(s, i, a) * pa
-    body = arm_body(arm, s, i)
-    r = wp.vec3(0.0)
-    if body >= 0:
-        r = s.anchor[i] - arm.com[body]
-        k0 = arm.base[body]
-        up -= wp.vec3(float(p[k0]), float(p[k0 + 1]), float(p[k0 + 2])) + wp.cross(
-            wp.vec3(float(p[k0 + 3]), float(p[k0 + 4]), float(p[k0 + 5])), r)
-    vp = (HA + D) * (up + un)
-    vn = vp
-    if two:
-        vp = vp - 2.0 * (HA * up)
-        vn = vn - 2.0 * (HA * un)
-    else:
-        vp = D * up
+            pa = wp.vec3d(wp.float64(0.0))
+            for c in range(3):
+                if fixed[3 * na + c] == 0:
+                    pa[c] = p[3 * na + c]
+            u += wp.where(w[a] < 0.0, wp.float64(-1.0), wp.float64(1.0)) * (_mat33d(slot_map(s, i, a)) * pa)
+    g = -(_mat33d(H) * u)
     for a in range(4):
         na = pair[a]
         if na >= 0:
-            v = wp.transpose(slot_map(s, i, a)) * wp.where(w[a] < 0.0, vn, vp)
-            for k in range(3):
-                if fixed[3 * na + k] == 0:
-                    wp.atomic_add(y, 3 * na + k, wp.float64(v[k]))
-    if body >= 0:
-        arm_scatter(y, arm, body, r, vp)
+            v = wp.where(w[a] < 0.0, wp.float64(-1.0), wp.float64(1.0)) * (wp.transpose(_mat33d(slot_map(s, i, a))) * g)
+            for c in range(3):
+                if fixed[3 * na + c] == 0:
+                    wp.atomic_add(y, 3 * na + c, v[c])
 
 
 @wp.kernel
@@ -804,18 +800,19 @@ def _barrier_assemble_kernel(
             f = 2.0
     if exact != 0 and f == 1.0:
         H = contact_hessian(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    Hd = _mat33d(H)
     for a in range(4):
         na = pair[a]
         for bb in range(4):
             nb = pair[bb]
             if na >= 0 and nb >= na and w[a] * w[bb] > 0.0:
-                B = f * wp.transpose(slot_map(s, i, a)) * H * slot_map(s, i, bb)
+                B = wp.float64(f) * wp.transpose(_mat33d(slot_map(s, i, a))) * Hd * _mat33d(slot_map(s, i, bb))
                 for c in range(3):
                     for c2 in range(3):
                         if (nb > na or c2 >= c) and fixed[3 * na + c] == 0 and fixed[3 * nb + c2] == 0:
                             slot = row_slot(indptr, indices, 3 * na + c, 3 * nb + c2)
                             if slot >= 0:
-                                wp.atomic_add(vals, slot, wp.float64(B[c, c2]))
+                                wp.atomic_add(vals, slot, B[c, c2])
     body = arm_body(arm, s, i)
     if body >= 0:  # the anchor's DOFs
         r = s.anchor[i] - arm.com[body]
@@ -826,13 +823,15 @@ def _barrier_assemble_kernel(
 
 
 @wp.kernel
-def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, t: wp.array[float]):
+def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, eps: float, t: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
     n = s.normal[i]
-    approach = wp.dot(n, pair_point(dq, s, i, arm, wp.vec3(0.0)))  # d(t) = d - t approach
-    d = wp.dot(n, pair_point(q, s, i, arm, s.anchor[i]))
+    dq_c = pair_point(dq, s, i, arm, wp.vec3(0.0))
+    approach = wp.dot(n, dq_c)  # d(t) = d - t approach
+    c = pair_point(q, s, i, arm, s.anchor[i])
+    d = wp.dot(n, c)
     if approach > 0.0 and d > 0.0:
         th = s.thickness[i]
         k = s.stiffness[i]
@@ -844,6 +843,13 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
             wp.atomic_min(t, s.world[i], (d - th - s.lam[i] / k) / approach)
         else:
             wp.atomic_min(t, s.world[i], IMPACT * d / approach)
+    if s.mu[i] * s.rho[i] > 0.0:
+        slip = _slip(c, s.c0[i], n)
+        y = wp.length(slip)
+        if y >= eps:  # sliding: Newton did not see the sticking ramp, so a step back holds only to its middle
+            rewind = wp.dot(slip / y, _slip(dq_c, wp.vec3(0.0), n))
+            if rewind > 0.0:
+                wp.atomic_min(t, s.world[i], (y - 0.5 * eps) / rewind)
 
 
 @wp.kernel
@@ -972,13 +978,13 @@ def _keep_kernel(s: Slots, lam: wp.array[float]):
 
 
 @wp.kernel
-def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float, converged: int, count: int,
+def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float, count: int,
                   mask: wp.array[wp.int32], left: wp.array[wp.int32], moved: wp.array[wp.int32],
                   go: wp.array[wp.int32]):
-    """Per world of ``mask``: ``moved`` kept only if its solve converged (or need not) and its step has updates left
-    (one spent); its solve goes on if so. ``moved[count]`` (zero before), ``go[count]``: in any world."""
+    """Per world of ``mask``: ``moved`` kept only if its solve converged and its step has updates left (one spent);
+    its solve goes on if so. ``moved[count]`` (zero before), ``go[count]``: in any world."""
     w = wp.tid()
-    if mask[w] != 0 and moved[w] != 0 and (converged == 0 or (dq_max[w] <= tol and pick[w] != 0)) and left[w] > 0:
+    if mask[w] != 0 and moved[w] != 0 and dq_max[w] <= tol and pick[w] != 0 and left[w] > 0:
         left[w] = left[w] - 1
         go[w] = 1
         moved[count] = 1

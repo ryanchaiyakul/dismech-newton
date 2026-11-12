@@ -109,8 +109,8 @@ def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None, fixed=Fa
 def test_proxy_momentum(rng):
     """The solver as Newton's ``SolverCoupledProxy`` destination (:class:`~dismech_newton.coupling.ProxyArm`), a
     free MuJoCo box its proxy: no gravity, a rod thrown at the box (turned at random, struck off centre), 300 steps
-    through the impact. Linear momentum (rod, box and the reaction impulse the box takes next step) stays to 1e-4
-    (2e-5 at most over 16 seeds: the coupler feeds back the proxy's momentum change in our solve, its contact force),
+    through the impact. Linear momentum (rod and box) stays to 1e-4 (2e-5 at most over 16 seeds: the coupler feeds
+    back the proxy's momentum change in our solve, its contact force),
     the box takes most of it, and no node sphere sinks into the box past 0.4 radii (0.27 over 16 seeds)."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(rng.uniform(-0.3, 0.3)))
@@ -126,10 +126,9 @@ def test_proxy_momentum(rng):
     qd[:, 0] = 1.0
     s0.particle_qd.assign(qd)
     m, mb, dt = model.particle_mass.numpy()[:, None], float(model.body_mass.numpy()[body]), 1.0e-3
-    feedback = solver._proxy_mappings[0].coupling_forces  # applied to the box next step
 
     def momentum(s):
-        return (m * s.particle_qd.numpy()).sum(0) + mb * s.body_qd.numpy()[body, :3] + dt * feedback.numpy()[body, :3]
+        return (m * s.particle_qd.numpy()).sum(0) + mb * s.body_qd.numpy()[body, :3]
 
     p0, worst, moved, deepest = momentum(s0), 0.0, 0.0, -np.inf
     for _ in range(300):
@@ -151,10 +150,10 @@ def test_proxy_momentum(rng):
 @pytest.mark.usefixtures("needs_cuda")
 def test_proxy_pin(rng):
     """A rod pinned by a Newton ball joint to a free MuJoCo box (:class:`~dismech_newton.coupling.ProxyPins`), no
-    gravity, thrown sideways (the box turned at random, the throw's direction too), 300 steps: linear momentum (rod,
-    box and the reaction the box takes next step) stays to 1e-4 (4.5e-5 at most over 16 seeds), angular momentum
-    about the origin to 4e-3 (2.6e-3: implicit Euler's, halving with dt), the pin holds to 4e-4 radii after the
-    first jerk (2.7e-4), and the rod drags the box."""
+    gravity, thrown sideways (the box turned at random, the throw's direction too), 300 steps: linear momentum (rod
+    and box) stays to 1e-4 (3.7e-5 at most over 16 seeds), angular momentum
+    about the origin to 4e-3 (2.7e-3: implicit Euler's, halving with dt), the pin holds to 4e-4 radii after the
+    first jerk (2.5e-4), and the rod drags the box."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     turn = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(rng.uniform(-0.3, 0.3)))
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0), turn))
@@ -176,17 +175,16 @@ def test_proxy_pin(rng):
     m, dt = model.particle_mass.numpy()[:, None], 1.0e-3
     mb, inertia, com = (float(model.body_mass.numpy()[body]), model.body_inertia.numpy()[body],
                         model.body_com.numpy()[body])
-    feedback = solver._proxy_mappings[0].coupling_forces  # applied to the box next step
 
     def momenta(s):
         x, v = s.particle_q.numpy(), s.particle_qd.numpy()
-        bq, bqd, f = s.body_q.numpy()[body], s.body_qd.numpy()[body], dt * feedback.numpy()[body]
+        bq, bqd = s.body_q.numpy()[body], s.body_qd.numpy()[body]
         X = wp.transform(wp.vec3(*bq[:3]), wp.quat(*bq[3:]))
         c = np.array(wp.transform_point(X, wp.vec3(*com)))
         R = np.array(wp.quat_to_matrix(wp.quat(*bq[3:]))).reshape(3, 3)
-        p = (m * v).sum(0) + mb * bqd[:3] + f[:3]
-        L = (m * np.cross(x, v)).sum(0) + mb * np.cross(c, bqd[:3]) + R @ inertia @ R.T @ bqd[3:] + np.cross(c, f[:3])
-        return p, L + f[3:], np.linalg.norm(x[0] - np.array(wp.transform_point(X, pin)))
+        p = (m * v).sum(0) + mb * bqd[:3]
+        L = (m * np.cross(x, v)).sum(0) + mb * np.cross(c, bqd[:3]) + R @ inertia @ R.T @ bqd[3:]
+        return p, L, np.linalg.norm(x[0] - np.array(wp.transform_point(X, pin)))
 
     p0, L0, _ = momenta(s0)
     dp = dL = gap = 0.0
@@ -206,14 +204,12 @@ def test_proxy_pin(rng):
     assert mb * np.linalg.norm(s0.body_qd.numpy()[body, :3]) > 0.3 * np.linalg.norm(p0), "the rod did not drag the box"
 
 
-@pytest.mark.xfail(reason="lagged coupling: the source meets the stop a step late and rebounds ~2x the impact speed",
-                   strict=True)
 @pytest.mark.usefixtures("needs_cuda")
 def test_proxy_impact():
     """A free MuJoCo box dropped 1 cm onto a rod clamped along its length (only the box yields), through
     ``SolverCoupledProxy``: the step that meets the rod stops it (implicit Euler: no rebound, under 5% of the impact
     speed back), and it rests a contact thickness (the rod's radius) on the rod, never inside, its weight the
-    coupler's feedback (1%). One proxy pass a step sends it back at about twice its impact speed."""
+    coupler's feedback (1%)."""
     builder = newton.ModelBuilder()
     hx, r, n, drop = 0.02, 0.004, 21, 0.01
     rest = 0.1 + r + hx
@@ -235,7 +231,6 @@ def test_proxy_impact():
         if k >= 500:
             f.append(feedback.numpy()[body, 2])
     impact = -min(vz)
-    print("impact", impact, "rebound", max(vz[int(np.argmin(vz)):]), "z", z[-1] - rest, min(z) - rest, "f", np.mean(f) / weight)
     assert max(vz[int(np.argmin(vz)):]) < 0.05 * impact, (max(vz), impact)
     assert abs(z[-1] - rest) < 0.25 * r, (z[-1], rest)
     assert min(z) > rest - r, (min(z), rest)

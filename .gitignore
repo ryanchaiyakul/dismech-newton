@@ -20,3 +20,7 @@ save
 .claude/worktrees/
 CLAUDE.md
 AGENTS.md
+
+# Media animations (hosted on GitHub Releases, cached locally)
+docs/*.webp
+docs/manifest.json

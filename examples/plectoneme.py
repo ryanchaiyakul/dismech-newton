@@ -132,7 +132,6 @@ class Example(CableExample):
 
     def render(self):
         self.log_plot()
-        self._place_camera(track=0.03)
         shown = self.display or self
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(shown.state_0)

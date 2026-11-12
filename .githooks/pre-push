@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-push hook: verify and upload README .webp animations on version bumps."""
+"""Pre-push hook: verify and push README .webp animations to dismech-newton-media on version bumps."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import re
 import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 MANIFEST = DOCS / "manifest.json"
-REPO = "ryanchaiyakul/dismech-newton"
+MEDIA_CACHE = ROOT / ".cache" / "media-repo"
+MEDIA_SSH = "git@github.com:ryanchaiyakul/dismech-newton-media.git"
+MEDIA_RAW = "https://raw.githubusercontent.com/ryanchaiyakul/dismech-newton-media"
 ZERO_SHA = "0" * 40
 
 ASSETS: dict[str, str] = {
@@ -88,9 +88,9 @@ def cmd_check() -> int:
     errors: list[str] = []
 
     for webp in ASSETS:
-        expected_url = f"https://github.com/{REPO}/releases/download/{tag}/{webp}"
+        expected_url = f"{MEDIA_RAW}/{tag}/{webp}"
         if expected_url not in readme:
-            errors.append(f"README.md missing release URL for {tag}: {expected_url}")
+            errors.append(f"README.md missing media URL for {tag}: {expected_url}")
         if not (DOCS / webp).is_file():
             errors.append(f"Missing cached file: docs/{webp}")
 
@@ -115,74 +115,29 @@ def cmd_check() -> int:
 
 def cmd_upload() -> int:
     tag = f"v{project_version()}"
-    files = [str(DOCS / w) for w in ASSETS]
-    missing = [f for f in files if not Path(f).is_file()]
+    missing = [w for w in ASSETS if not (DOCS / w).is_file()]
     if missing:
-        print(f"Missing local .webp files: {', '.join(missing)}", file=sys.stderr)
+        print(f"Missing local .webp files in docs/: {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    gh = shutil.which("gh")
-    if gh:
-        view = subprocess.run([gh, "release", "view", tag], cwd=ROOT, capture_output=True)
-        if view.returncode != 0:
-            subprocess.run(
-                [gh, "release", "create", tag, "--title", tag, "--notes", f"Release {tag} media assets"],
-                cwd=ROOT,
-                check=True,
-            )
-        subprocess.run([gh, "release", "upload", tag, "--clobber", *files], cwd=ROOT, check=True)
-        print(f"Uploaded {len(files)} .webp assets to GitHub Release {tag}")
-        return 0
+    if MEDIA_CACHE.exists():
+        shutil.rmtree(MEDIA_CACHE)
+    MEDIA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "--depth", "1", "-q", MEDIA_SSH, str(MEDIA_CACHE)], check=True)
+    subprocess.run(["git", "-C", str(MEDIA_CACHE), "checkout", "-B", "main"], check=True, capture_output=True)
 
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if not token:
-        print(
-            f"Neither `gh` CLI nor GITHUB_TOKEN/GH_TOKEN found. Upload docs/*.webp to GitHub Release {tag} "
-            f"manually (or set SKIP_MEDIA=1 to bypass).",
-            file=sys.stderr,
-        )
-        return 1
+    for webp in ASSETS:
+        shutil.copy2(DOCS / webp, MEDIA_CACHE / webp)
 
-    _upload_via_api(tag, [Path(f) for f in files], token)
-    print(f"Uploaded {len(files)} .webp assets to GitHub Release {tag}")
+    subprocess.run(["git", "-C", str(MEDIA_CACHE), "add", *ASSETS.keys()], check=True)
+    diff = subprocess.run(["git", "-C", str(MEDIA_CACHE), "diff", "--cached", "--quiet"])
+    if diff.returncode != 0:
+        subprocess.run(["git", "-C", str(MEDIA_CACHE), "commit", "-q", "-m", f"Media assets for {tag}"], check=True)
+    subprocess.run(["git", "-C", str(MEDIA_CACHE), "tag", "-f", tag], check=True)
+    subprocess.run(["git", "-C", str(MEDIA_CACHE), "push", "-q", "-u", "origin", "main"], check=True)
+    subprocess.run(["git", "-C", str(MEDIA_CACHE), "push", "-q", "-f", "origin", f"refs/tags/{tag}"], check=True)
+    print(f"Pushed {len(ASSETS)} .webp assets to {MEDIA_SSH} ({tag})")
     return 0
-
-
-def _api(url: str, token: str, method: str = "GET", data: bytes | None = None, ctype: str = "application/json") -> dict:
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": ctype,
-        },
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def _upload_via_api(tag: str, files: list[Path], token: str) -> None:
-    try:
-        rel = _api(f"https://api.github.com/repos/{REPO}/releases/tags/{tag}", token)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        body = json.dumps({"tag_name": tag, "name": tag, "body": f"Release {tag} media assets"}).encode("utf-8")
-        rel = _api(f"https://api.github.com/repos/{REPO}/releases", token, method="POST", data=body)
-
-    existing = {a["name"]: a["id"] for a in rel.get("assets", [])}
-    upload_base = rel["upload_url"].split("{", 1)[0]
-    for path in files:
-        if path.name in existing:
-            req = urllib.request.Request(
-                f"https://api.github.com/repos/{REPO}/releases/assets/{existing[path.name]}",
-                method="DELETE",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-            )
-            urllib.request.urlopen(req).read()
-        _api(f"{upload_base}?name={path.name}", token, method="POST", data=path.read_bytes(), ctype="image/webp")
 
 
 def _needs_media_check() -> bool:

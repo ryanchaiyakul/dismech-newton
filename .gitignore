@@ -17,7 +17,8 @@ save
 .cache/
 
 # Agentic tools
-.claude/worktrees/
+.claude/
+.agents
 CLAUDE.md
 AGENTS.md
 

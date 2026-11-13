@@ -93,6 +93,8 @@ class Example(CableExample):
 
         solver = self._proxy(model, mujoco)
         self.soft = solver.solver("soft")
+        # Under 4.4 N finger pinch, default slip_speed=0.01 (eps ~17 um) makes 1 float32 ULP (~3e-8 m) ~0.01 N
+        self.soft.contact.slip_speed = 0.1
         self.fingers = [b for b, label in enumerate(solver.view("soft").body_label) if "finger" in label]
         self.start(viewer, model, solver)
         newton.eval_fk(model, model.joint_q, model.joint_qd, self.state_0)

@@ -61,6 +61,7 @@ class Slots:
     tb: wp.array[wp.vec3]
     pad: wp.array[wp.vec4]  # a pad's point: (c, p, h, d), its energy c (th + h - d)^p, Hunt-Crossley's d [s/m]
     damp: wp.array[float]  # and its damping d f0 / dt (f0 its pressure's force at the step's start)
+    rewound: wp.array[wp.int32]  # sliding pair tried to rewind in this step: use isotropic majorizer
 
 
 @wp.struct
@@ -309,6 +310,7 @@ def emit(
     s.thickness[i] = th - pad[2]
     s.pad[i] = pad
     s.mu[i] = mu
+    s.rewound[i] = 0
 
 
 @wp.func
@@ -316,6 +318,7 @@ def clear(s: Slots, i: int):
     s.active[i] = 0
     s.rho[i] = 0.0
     s.key[i] = -1
+    s.rewound[i] = 0
 
 
 # -- contact as an energy: a barrier and lagged friction ------------------------------------------------------------
@@ -731,7 +734,7 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
         h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
     slip = _slip(c, s.c0[i], n)
     y = wp.length(slip)
-    if y >= eps:
+    if y >= eps and s.rewound[i] == 0:
         b = wp.cross(n, slip / y)
         return h * wp.outer(n, n) + fr * wp.outer(b, b)
     return h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
@@ -851,6 +854,8 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
         if y >= eps:  # sliding: Newton did not see the sticking ramp, so a step back holds only to its middle
             rewind = wp.dot(slip / y, _slip(dq_c, wp.vec3(0.0), n))
             if rewind > 0.0:
+                if rewind > y - 0.5 * eps:
+                    s.rewound[i] = 1
                 wp.atomic_min(t, s.world[i], (y - 0.5 * eps) / rewind)
 
 

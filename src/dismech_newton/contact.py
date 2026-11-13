@@ -358,6 +358,14 @@ class BarrierBlock:
         self.left = wp.zeros(nw, dtype=wp.int32, device=self.device)  # per world, the step's updates left
         self.unsettled = wp.zeros(nw, dtype=wp.int32, device=self.device)  # begin_step's
         self.arm = make_arm(model, getattr(source, "shape_key0", 0), 0, 0)  # no yielding bodies (the solver's to set)
+        self.trib = wp.array([0.0, 0.0, 1.0], dtype=float, device=self.device, requires_grad=True)  # (alpha, beta, N0)
+        self.aniso = wp.array([wp.vec3(0.0, 0.0, 0.0)], dtype=wp.vec3, device=self.device, requires_grad=True)
+
+    def set_tribology(
+        self, alpha: float = 0.0, beta: float = 0.0, n0: float = 1.0, e_hat: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ) -> None:
+        self.trib.assign(np.array([alpha, beta, max(float(n0), 1.0e-12)], dtype=np.float32))
+        self.aniso.assign(np.array([e_hat], dtype=np.float32))
 
     def _launch(self, kernel, inputs, dim=None):
         if self.count:
@@ -430,8 +438,8 @@ class BarrierBlock:
         self._launch(_keep_kernel, [self.s, self.lam])
 
     def assemble(self, q: wp.array, A) -> None:
-        self._launch(_barrier_assemble_kernel, [q, self.s, self.arm, self.slip, self.fixed, 0, A.indptr, A.indices,
-                                                A.vals])
+        self._launch(_barrier_assemble_kernel, [q, self.s, self.arm, self.slip, self.fixed, 0, self.trib, self.aniso,
+                                                A.indptr, A.indices, A.vals])
         if self.arm.k:
             wp.launch(_arm_assemble_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[self.arm, A.indptr,
                       A.indices, A.vals], device=self.device)
@@ -439,7 +447,7 @@ class BarrierBlock:
     def two_sided_mul(self, q: wp.array, p: wp.array, y: wp.array) -> None:
         """``y += delta_A_2side p``: per two-sided pair, ``-(C_a + C_b)^T H (C_a p_a + C_b p_b)`` so ``A`` plus this
         is the exact majorized two-sided Hessian ``(C_a - C_b)^T H (C_a - C_b)``."""
-        self._launch(_two_sided_kernel, [q, self.s, self.arm, self.slip, self.fixed, p, y])
+        self._launch(_two_sided_kernel, [q, self.s, self.arm, self.slip, self.fixed, self.trib, self.aniso, p, y])
 
     def impact(self, q: wp.array, dq: wp.array, t: wp.array) -> None:
         """``t = min(t, ...)`` the line search's longest step along ``-dq`` (each pair's gap ``d`` is linear in it, on
@@ -460,8 +468,8 @@ class BarrierBlock:
     def grad(self, q: wp.array, b: wp.array) -> None:
         self.touching.zero_()
         self.two_sided.zero_()
-        self._launch(_barrier_grad_kernel, [q, self.s, self.arm, self.slip, self.fixed, b, self.touching,
-                                            self.two_sided])
+        self._launch(_barrier_grad_kernel, [q, self.s, self.arm, self.slip, self.fixed, self.trib, self.aniso, b,
+                                            self.touching, self.two_sided])
         if self.arm.k:
             wp.launch(_arm_grad_kernel, dim=(self.arm.M.shape[0], self.arm.k), inputs=[q, self.arm, b],
                       device=self.device)
@@ -472,14 +480,14 @@ class BarrierBlock:
         pinch's), and on a yielding body its force and torque into ``load[k]``, ``load[k + 3]`` (``k`` its first DOF),
         with its inertia's; ``floor[k]``, ``floor[k + 3]``: the body's force and torque below float32's reach (``ulp``
         of a move)."""
-        self._launch(_barrier_load_kernel, [q, self.s, self.arm, self.slip, load])
+        self._launch(_barrier_load_kernel, [q, self.s, self.arm, self.slip, self.trib, self.aniso, load])
         if self.arm.k:
             wp.launch(_arm_load_kernel, dim=(self.arm.M.shape[0], self.arm.k // 6),
                       inputs=[q, self.arm, ulp, load, floor], device=self.device)
 
     def energy(self, q_cand: wp.array, energy: wp.array) -> None:
-        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.stride, self.slip, energy],
-                     dim=(q_cand.shape[0], padded(self.count)))
+        self._launch(_barrier_energy_kernel, [q_cand, self.s, self.arm, self.stride, self.slip, self.trib, self.aniso,
+                                              energy], dim=(q_cand.shape[0], padded(self.count)))
         if self.arm.k:
             wp.launch(_arm_energy_kernel, dim=(q_cand.shape[0], padded(self.arm.M.shape[0] * self.arm.k)),
                       inputs=[q_cand, self.arm, self.stride, energy], device=self.device)
@@ -644,52 +652,89 @@ def _slip(c: wp.vec3, c0: wp.vec3, n: wp.vec3) -> wp.vec3:
 
 
 @wp.func
-def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float,
-                  pad: wp.vec4, damp: float):
-    """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, friction
-    ``mu rho = mu_rho``), and its barrier's and friction's curvatures."""
+def tribology(mu: float, rho: float, alpha: float, n0: float) -> float:
+    """Load-dependent effective friction ``mu * max(rho / n0, 1e-4)^(-alpha)``."""
+    return mu * wp.pow(wp.max(rho / wp.max(n0, 1.0e-12), 1.0e-4), -alpha)
+
+
+@wp.func
+def anisotropy(slip: wp.vec3, n: wp.vec3, eps: float, beta: float, e_hat: wp.vec3):
+    """Normalized tangential anisotropy ``a = 1 + beta * phi`` with ``phi = (slip . e_t)^2 / (|slip|^2 + eps^2)``
+    and ``beta * grad_slip(phi)``."""
+    et = e_hat - wp.dot(e_hat, n) * n
+    inv_d = 1.0 / (wp.dot(slip, slip) + eps * eps)
+    u = wp.dot(slip, et)
+    phi = u * u * inv_d
+    return 1.0 + beta * phi, (2.0 * beta * u * inv_d) * (et - (u * inv_d) * slip)
+
+
+@wp.func
+def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu: float, rho: float,
+                  eps: float, pad: wp.vec4, damp: float, alpha: float, beta: float, n0: float, e_hat: wp.vec3):
+    """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, base friction
+    ``mu``, start normal force ``rho``, tribology ``alpha, beta, n0, e_hat``), and its barrier's and friction's
+    curvatures."""
     e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad) + pad_damping(
         wp.dot(n, c), wp.dot(n, c0), th, pad, damp)
     slip = _slip(c, c0, n)
-    friction = mu_rho * slip_energy(wp.length(slip), eps)[1]
-    return e[1] * n + friction * slip, e[2], friction
+    se = slip_energy(wp.length(slip), eps)
+    mu_rho = tribology(mu, rho, alpha, n0) * rho
+    a, bg = anisotropy(slip, n, eps, beta, e_hat)
+    friction = mu_rho * a * se[1]
+    return e[1] * n + friction * slip + (mu_rho * se[0]) * bg, e[2], friction
 
 
 @wp.func
-def _barrier_force(c: wp.vec3, s: Slots, i: int, eps: float):
-    return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps,
-                         s.pad[i], s.damp[i])
+def _barrier_force(c: wp.vec3, s: Slots, i: int, eps: float, trib: wp.array[float], aniso: wp.array[wp.vec3]):
+    return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i], s.rho[i], eps,
+                         s.pad[i], s.damp[i], trib[0], trib[1], trib[2], aniso[0])
 
 
 @wp.func
-def contact_hessian(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
-    """The pair's exact Hessian with respect to ``C q = c`` (:func:`_barrier_assemble_kernel` majorizes its
-    friction's along the slip)."""
-    n = s.normal[i]
-    nn = wp.outer(n, n)
-    g, h, fr = _barrier_force(c, s, i, eps)
-    return h * nn + fr * (wp.identity(3, float) - nn) + _along_slip(c, s, i, eps)
-
-
-@wp.func
-def _along_slip(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
+def _along_slip(mu_rho: float, slip: wp.vec3, eps: float) -> wp.mat33:
     """Friction's exact curvature along the slip less its majorizer's: ``mu rho (f1' - f1 / y) t t^T``."""
-    slip = _slip(c, s.c0[i], s.normal[i])
     y = wp.length(slip)
     if y == 0.0:
         return wp.mat33()
     t = slip / y
-    return -s.mu[i] * s.rho[i] * wp.where(y < eps, y / (eps * eps), 1.0 / y) * wp.outer(t, t)
+    return -mu_rho * wp.where(y < eps, y / (eps * eps), 1.0 / y) * wp.outer(t, t)
+
+
+@wp.func
+def contact_hessian(c: wp.vec3, s: Slots, i: int, eps: float, trib: wp.array[float],
+                    aniso: wp.array[wp.vec3]) -> wp.mat33:
+    """The pair's exact Hessian with respect to ``C q = c`` (:func:`_barrier_assemble_kernel` majorizes its
+    friction's along the slip)."""
+    n = s.normal[i]
+    nn = wp.outer(n, n)
+    eye_t = wp.identity(3, float) - nn
+    g, h, fr = _barrier_force(c, s, i, eps, trib, aniso)
+    beta, e_hat = trib[1], aniso[0]
+    mu_rho = tribology(s.mu[i], s.rho[i], trib[0], trib[2]) * s.rho[i]
+    slip = _slip(c, s.c0[i], n)
+    a, bg = anisotropy(slip, n, eps, beta, e_hat)
+    H = h * nn + fr * eye_t + _along_slip(mu_rho * a, slip, eps)
+    if beta != 0.0 and wp.length_sq(e_hat) > 0.0:
+        se = slip_energy(wp.length(slip), eps)
+        et = e_hat - wp.dot(e_hat, n) * n
+        inv_d = 1.0 / (wp.dot(slip, slip) + eps * eps)
+        u = wp.dot(slip, et)
+        H_phi = (2.0 * inv_d) * wp.outer(et, et) - (4.0 * u * inv_d * inv_d) * (
+            wp.outer(et, slip) + wp.outer(slip, et)
+        ) - (2.0 * u * u * inv_d * inv_d) * eye_t + (8.0 * u * u * inv_d * inv_d * inv_d) * wp.outer(slip, slip)
+        H += mu_rho * (se[1] * (wp.outer(slip, bg) + wp.outer(bg, slip)) + (se[0] * beta) * H_phi)
+    return H
 
 
 @wp.kernel
 def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
-                         b: wp.array[wp.float64], touching: wp.array[wp.int32], two_sided: wp.array[wp.int32]):
+                         trib: wp.array[float], aniso: wp.array[wp.vec3], b: wp.array[wp.float64],
+                         touching: wp.array[wp.int32], two_sided: wp.array[wp.int32]):
     i = wp.tid()
     if s.active[i] == 0:
         return
-    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
-    if h > 0.0 or fr > 0.0:
+    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
+    if h > 0.0 or wp.abs(fr) > 0.0:
         touching[0] = 1
         if wp.min(s.w[i]) < 0.0:
             two_sided[0] = 1
@@ -702,11 +747,12 @@ def _barrier_grad_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fix
 
 
 @wp.kernel
-def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, load: wp.array[float]):
+def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, trib: wp.array[float],
+                         aniso: wp.array[wp.vec3], load: wp.array[float]):
     i = wp.tid()
     if s.active[i] == 0:
         return
-    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
     for j in range(4):
         n = s.pair[i][j]
         if n >= 0:
@@ -719,11 +765,12 @@ def _barrier_load_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, loa
 
 
 @wp.func
-def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
+def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float, trib: wp.array[float], aniso: wp.array[wp.vec3]) -> wp.mat33:
     """The pair's Hessian as ``A`` holds it (with respect to ``C q = c``): the barrier's curvature capped, friction's
     majorized in the sticking ramp (``f1 / y``) and exact when sliding (``0`` along the slip, ``f1 / y`` across it)."""
     n = s.normal[i]
-    g, h, fr = _barrier_force(c, s, i, eps)
+    nn = wp.outer(n, n)
+    g, h, fr = _barrier_force(c, s, i, eps, trib, aniso)
     h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
     pad = s.pad[i]
     x = s.thickness[i] + pad[2] - wp.dot(n, c)  # in its pad: a rod's curvature (delta^1/2) is 0 at the surface,
@@ -731,10 +778,16 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
         h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
     slip = _slip(c, s.c0[i], n)
     y = wp.length(slip)
+    beta, e_hat = trib[1], aniso[0]
+    if beta != 0.0 and wp.length_sq(e_hat) > 0.0:
+        et = e_hat - wp.dot(e_hat, n) * n
+        mu_rho = tribology(s.mu[i], s.rho[i], trib[0], trib[2]) * s.rho[i]
+        fr_cap = mu_rho * slip_energy(y, eps)[1] * (1.0 + 8.0 * wp.abs(beta) * wp.dot(et, et))
+        return h * nn + fr_cap * (wp.identity(3, float) - nn)
     if y >= eps:
         b = wp.cross(n, slip / y)
-        return h * wp.outer(n, n) + fr * wp.outer(b, b)
-    return h * wp.outer(n, n) + fr * (wp.identity(3, float) - wp.outer(n, n))
+        return h * nn + fr * wp.outer(b, b)
+    return h * nn + fr * (wp.identity(3, float) - nn)
 
 
 @wp.func
@@ -748,11 +801,12 @@ def _mat33d(M: wp.mat33) -> wp.mat33d:
 
 @wp.kernel
 def _two_sided_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
-                      p: wp.array[wp.float64], y: wp.array[wp.float64]):
+                      trib: wp.array[float], aniso: wp.array[wp.vec3], p: wp.array[wp.float64],
+                      y: wp.array[wp.float64]):
     i = wp.tid()
     if s.active[i] == 0 or wp.min(s.w[i]) >= 0.0:
         return
-    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
     if H[0, 0] == 0.0 and H[1, 1] == 0.0 and H[2, 2] == 0.0:
         return
     pair = s.pair[i]
@@ -784,6 +838,8 @@ def _barrier_assemble_kernel(
     eps: float,
     fixed: wp.array[wp.int32],
     exact: int,
+    trib: wp.array[float],
+    aniso: wp.array[wp.vec3],
     indptr: wp.array[wp.int32],
     indices: wp.array[wp.int32],
     vals: wp.array[wp.float64],
@@ -795,13 +851,13 @@ def _barrier_assemble_kernel(
         return
     pair = s.pair[i]
     w = s.w[i]
-    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    H = _majorizer(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
     f = float(1.0)
     for j in range(4):
         if pair[j] >= 0 and w[j] < 0.0:
             f = 2.0
     if exact != 0 and f == 1.0:
-        H = contact_hessian(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+        H = contact_hessian(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
     Hd = _mat33d(H)
     for a in range(4):
         na = pair[a]
@@ -875,7 +931,7 @@ def _newton_size_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: 
 
 @wp.kernel
 def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, stride: int, eps: float,
-                           energy: wp.array[wp.float64]):
+                           trib: wp.array[float], aniso: wp.array[wp.vec3], energy: wp.array[wp.float64]):
     j, i = wp.tid()
     e = wp.float64(0.0)
     w = int(-1)
@@ -885,7 +941,10 @@ def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, stride
         c = pair_point(q_cand[j], s, i, arm, s.anchor[i])
         n = s.normal[i]
         e = wp.float64(pair_energy(wp.dot(n, c), s, i)[0])
-        e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(wp.length(_slip(c, s.c0[i], n)), eps)[0])
+        slip = _slip(c, s.c0[i], n)
+        a, _ = anisotropy(slip, n, eps, trib[1], aniso[0])
+        mu_rho = tribology(s.mu[i], s.rho[i], trib[0], trib[2]) * s.rho[i]
+        e += wp.float64(mu_rho * slip_energy(wp.length(slip), eps)[0] * a)
     world_sum(energy, w, j, stride, e)
 
 
@@ -1013,9 +1072,9 @@ def _compact_kernel(
 
 @wp.func
 def _arm_inertia(q: wp.array[float], arm: Arm, w: int, m: int) -> float:
-    """``(M (z - pred))_m / h^2`` of world ``w``: ``M`` block-diagonal, a body's 6 DOFs (:class:`.coupling.ProxyArm`)."""
+    """``(M (z - pred))_m / h^2`` of world ``w`` (across all ``arm.k`` coupled DOFs, :class:`.coupling.ProxyArm`)."""
     v = float(0.0)
-    for m2 in range(6 * (m // 6), 6 * (m // 6) + 6):
+    for m2 in range(arm.k):
         j = w * arm.k + m2
         v += arm.M[w, m, m2] * (q[arm.start + j] - arm.pred[j])
     return v * arm.inv_h2
@@ -1032,12 +1091,15 @@ def _arm_load_kernel(q: wp.array[float], arm: Arm, ulp: float, load: wp.array[fl
     w, p = wp.tid()
     m = 6 * p
     i = arm.start + w * arm.k + m
+    j = w * arm.k + m
     f = wp.vec3(_arm_inertia(q, arm, w, m), _arm_inertia(q, arm, w, m + 1), _arm_inertia(q, arm, w, m + 2))
     t = wp.vec3(_arm_inertia(q, arm, w, m + 3), _arm_inertia(q, arm, w, m + 4), _arm_inertia(q, arm, w, m + 5))
     wp.atomic_add(load, i, wp.length(f))
     wp.atomic_add(load, i + 3, wp.length(t))
-    floor[i] = arm.M[w, m, m] * arm.inv_h2 * ulp
-    floor[i + 3] = (arm.M[w, m + 3, m + 3] + arm.M[w, m + 4, m + 4] + arm.M[w, m + 5, m + 5]) / 3.0 * arm.inv_h2 * ulp
+    zt = wp.length(wp.vec3(q[i], q[i + 1], q[i + 2])) + wp.length(wp.vec3(arm.pred[j], arm.pred[j + 1], arm.pred[j + 2]))
+    zr = wp.length(wp.vec3(q[i + 3], q[i + 4], q[i + 5])) + wp.length(wp.vec3(arm.pred[j + 3], arm.pred[j + 4], arm.pred[j + 5]))
+    floor[i] = (arm.M[w, m, m] + arm.M[w, m + 1, m + 1] + arm.M[w, m + 2, m + 2]) / 3.0 * arm.inv_h2 * ulp * (zt + 1.0e-5)
+    floor[i + 3] = (arm.M[w, m + 3, m + 3] + arm.M[w, m + 4, m + 4] + arm.M[w, m + 5, m + 5]) / 3.0 * arm.inv_h2 * ulp * (zr + 1.0e-5)
 
 
 @wp.kernel
@@ -1055,5 +1117,5 @@ def _arm_assemble_kernel(arm: Arm, indptr: wp.array[wp.int32], indices: wp.array
                          vals: wp.array[wp.float64]):
     w, m = wp.tid()
     zm = arm.start + w * arm.k
-    for m2 in range(m, 6 * (m // 6) + 6):  # its body's block
+    for m2 in range(m, arm.k):
         wp.atomic_add(vals, row_slot(indptr, indices, zm + m, zm + m2), wp.float64(arm.M[w, m, m2] * arm.inv_h2))

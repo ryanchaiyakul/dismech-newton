@@ -53,7 +53,7 @@ from .contact import (
     slot_map,
     slot_roll,
 )
-from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, proxy_step
+from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, _rotvec, proxy_step
 from .linear import _convert, sparse_solver
 from .state import (
     Dofs,
@@ -156,11 +156,21 @@ class StepAdjoint:
             tape = wp.Tape()
             with tape:
                 if arm is not None:
-                    wp.launch(_arm_pred_kernel, dim=pa._body.shape[0],
-                              inputs=[pa._body, self.arm.base, self.arm.start, self.arm.k, m.body_world, m.body_mass,
-                                      m.body_inertia, m.body_com, m.gravity, state_in.body_q, state_in.body_qd,
-                                      arm.body_f, arm.poses, h],
-                              outputs=[self.pred, self.M, self.Minv, self._offset], device=dev)
+                    if getattr(arm, "art", False):
+                        bf = arm.body_f_in if (arm.body_f_in is not None and arm.body_f_in.requires_grad) else arm.body_f
+                        wp.launch(_arm_offset_kernel, dim=pa._body.shape[0],
+                                  inputs=[pa._body, m.body_com, state_in.body_q, arm.poses], outputs=[self._offset],
+                                  device=dev)
+                        wp.launch(_arm_pred_art_kernel, dim=(self.arm.M.shape[0], self.arm.k),
+                                  inputs=[self.arm.k, pa._slot_body, m.body_world, m.body_mass, m.gravity,
+                                          state_in.body_qd, bf, self._offset, _detached(self.Minv), h, self.art_dt],
+                                  outputs=[self.pred], device=dev)
+                    else:
+                        wp.launch(_arm_pred_kernel, dim=pa._body.shape[0],
+                                  inputs=[pa._body, self.arm.base, self.arm.start, self.arm.k, m.body_world,
+                                          m.body_mass, m.body_inertia, m.body_com, m.gravity, state_in.body_q,
+                                          state_in.body_qd, arm.body_f, arm.poses, h],
+                                  outputs=[self.pred, self.M, self.Minv, self._offset], device=dev)
                     wp.launch(_arm_com_kernel, dim=pa._body.shape[0], inputs=[pa._body, m.body_com, arm.poses],
                               outputs=[self._com], device=dev)  # (before the solve: its lever arms use them)
                     if self.pins is not None:
@@ -207,6 +217,10 @@ class StepAdjoint:
             setattr(a, name, getattr(live, name))
         a.M, a.Minv, a.com, a.pred = _detached(self.M), snap.Minv, snap.com, _detached(self.pred)
         a.inv_h2 = 1.0 / (h * h)
+        self.art_dt = getattr(snap, "art_dt", h)
+        if getattr(snap, "art", False):
+            wp.copy(self.M, snap.M)
+            wp.copy(self.Minv, snap.Minv)
         self.arm, self._snap = a, snap
         if s.pins is not None and s.pins.count:
             p, live = Pins(), s.pins.p
@@ -216,7 +230,7 @@ class StepAdjoint:
     def _solve(self, state_in: State, dt: float, contacts: Slots | None) -> None:
         """``H lam = -adj_q``, then ``lam^T dr`` into the inputs."""
         s = self.solver
-        bind_dofs(self.dofs, s.model, self.mass, s.fixed, s._no_force, state_in, dt)
+        bind_dofs(self.dofs, s.model, self.mass, s.fixed, s._no_force, state_in, dt, edge_f=self._no_q)
         wp.launch(_rhs_kernel, dim=s.num_dofs, inputs=[s.fixed], outputs=[self.q_star.grad, self._rhs], device=s.device)
         self._hessian(state_in, dt)
         self.linear.invalidate()
@@ -238,8 +252,9 @@ class StepAdjoint:
         x, r, z, p, hp = self._cg
         wp.copy(self._h, A.vals)
         arm = self.arm if self.arm is not None else s.contact.arm
+        trib, aniso = _detached(s.contact.trib), _detached(s.contact.aniso)
         wp.launch(_barrier_assemble_kernel, dim=c.active.shape[0],
-                  inputs=[self.q_star, c, arm, eps, s.fixed, 1, A.indptr, A.indices, A.vals], device=dev)
+                  inputs=[self.q_star, c, arm, eps, s.fixed, 1, trib, aniso, A.indptr, A.indices, A.vals], device=dev)
         wp.launch(_convert, dim=n, inputs=[self._rhs], outputs=[r], device=dev)
         x.zero_()
         self.linear.solve(r, z)
@@ -253,8 +268,8 @@ class StepAdjoint:
                 break
             hp.zero_()
             wp.launch(_spmv_kernel, dim=n, inputs=[A.indptr, A.indices, self._h, p], outputs=[hp], device=dev)
-            wp.launch(_contact_matvec_kernel, dim=c.active.shape[0], inputs=[self.q_star, c, arm, eps, s.fixed, p],
-                      outputs=[hp], device=dev)
+            wp.launch(_contact_matvec_kernel, dim=c.active.shape[0],
+                      inputs=[self.q_star, c, arm, eps, s.fixed, trib, aniso, p], outputs=[hp], device=dev)
             wp.launch(_dot_kernel, dim=n, inputs=[p, hp, 1], outputs=[dots], device=dev)
             wp.launch(_cg_step_kernel, dim=n, inputs=[dots, p, hp], outputs=[x, r], device=dev)
             self.linear.solve(r, z)
@@ -341,9 +356,12 @@ class StepAdjoint:
                           outputs=[weights], device=dev)
                 # the lever arms from the step's anchors (a body's point, which its surface point at q_in can miss
                 # along the surface): their values, the surface point's derivative
+                shape_mu = s.model.shape_material_mu if s.model.shape_count else wp.zeros(1, dtype=float, device=dev)
                 inputs = [contacts, src.bodies, poses, weights, arm, src.shape_key0, s.fixed,
                           s.contact.slip_speed * dt, dt, self.q_star, q_in, _detached(q_in), self.mass,
-                          _detached(self.mass), self._com if self.arm is not None else self._no_com,
+                          _detached(self.mass), src._mu_shape, shape_mu, _detached(shape_mu),
+                          float(s.model.particle_mu), s.contact.trib, s.contact.aniso,
+                          self._com if self.arm is not None else self._no_com,
                           self.Minv if self.arm is not None else arm.Minv]
                 off, anchors = (wp.zeros(n_c, dtype=wp.vec3, device=dev) for _ in range(2))
                 if self.arm is not None:
@@ -436,7 +454,8 @@ def _spmv_kernel(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], vals: 
 
 @wp.kernel(enable_backward=False)
 def _contact_matvec_kernel(q: wp.array[float], c: Slots, arm: Arm, eps: float, fixed: wp.array[wp.int32],
-                           x: wp.array[wp.float64], y: wp.array[wp.float64]):
+                           trib: wp.array[float], aniso: wp.array[wp.vec3], x: wp.array[wp.float64],
+                           y: wp.array[wp.float64]):
     """``y += J^T H_c J x`` on the free DOFs (``J``: :func:`~.contact.node_map` per node, ``-P`` on a yielding
     body's DOFs), :func:`~.contact.contact_hessian` at ``q``."""
     i = wp.tid()
@@ -459,7 +478,7 @@ def _contact_matvec_kernel(q: wp.array[float], c: Slots, arm: Arm, eps: float, f
         r = wp.vec3d(c.anchor[i] - arm.com[body])
         v -= wp.vec3d(x[zi], x[zi + 1], x[zi + 2]) + wp.cross(wp.vec3d(x[zi + 3], x[zi + 4], x[zi + 5]), r)
         cq -= arm_move(q, arm, body, c.anchor[i] - arm.com[body])
-    hv = wp.mat33d(contact_hessian(cq, c, i, eps)) * v
+    hv = wp.mat33d(contact_hessian(cq, c, i, eps, trib, aniso)) * v
     if body >= 0:
         t = wp.cross(r, hv)
         for a in range(3):
@@ -517,6 +536,12 @@ def _contact_residual_kernel(
     q_in0: wp.array[float],
     mass: wp.array[float],
     mass0: wp.array[float],
+    mu_shape: wp.array[wp.int32],
+    shape_mu: wp.array[float],
+    shape_mu0: wp.array[float],
+    particle_mu: float,
+    trib: wp.array[float],
+    aniso: wp.array[wp.vec3],
     com: wp.array[wp.vec3],
     Minv: wp.array3d[float],
     lever_off: wp.array[wp.vec3],
@@ -570,7 +595,21 @@ def _contact_residual_kernel(
     if body >= 0:
         cq -= arm_move(q, arm, body, lever)
     anchors[i] = anchor
-    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.pad[i][3] * pf / dt)
+    ms = mu_shape[pair[0]]
+    mu0 = wp.where(ms >= 0, shape_mu[wp.max(ms, 0)], particle_mu)
+    mu0_d = wp.where(ms >= 0, shape_mu0[wp.max(ms, 0)], particle_mu)
+    if c.key[i] >= key0:
+        sk_mu = shape_of(c.key[i], key0)
+        mu1 = shape_mu[sk_mu]
+        mu1_d = shape_mu0[sk_mu]
+    else:
+        other = wp.where(w[1] > 0.0, pair[2], wp.where(pair[2] >= 0 and pair[1] < 0, pair[2], pair[1]))
+        mso = mu_shape[wp.max(other, 0)]
+        mu1 = wp.where(other >= 0 and mso >= 0, shape_mu[wp.max(mso, 0)], particle_mu)
+        mu1_d = wp.where(other >= 0 and mso >= 0, shape_mu0[wp.max(mso, 0)], particle_mu)
+    mu_pair = c.mu[i] + (0.5 * (mu0 + mu1) - 0.5 * (mu0_d + mu1_d))
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], mu_pair, rho, eps, c.pad[i], c.pad[i][3] * pf / dt,
+                             trib[0], trib[1], trib[2], aniso[0])
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)
@@ -770,6 +809,41 @@ def _arm_pred_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], start: 
     dc, dr = proxy_step(q0[b], body_q[b], body_qd[b], body_f[b], mass[b], inertia[b], body_com[b],
                         gravity[wp.max(body_world[b], 0)], h, w, i, i0, pred, M, Minv)
     offset[b] = wp.spatial_vector(dc, dr)
+
+
+@wp.kernel
+def _arm_offset_kernel(body: wp.array[wp.int32], body_com: wp.array[wp.vec3], body_q: wp.array[wp.transform],
+                       q0: wp.array[wp.transform], offset: wp.array[wp.spatial_vector]):
+    b = body[wp.tid()]
+    dc = wp.transform_point(body_q[b], body_com[b]) - wp.transform_point(q0[b], body_com[b])
+    dr = _rotvec(wp.transform_get_rotation(body_q[b]) * wp.quat_inverse(wp.transform_get_rotation(q0[b])))
+    offset[b] = wp.spatial_vector(dc, dr)
+
+
+@wp.kernel
+def _arm_pred_art_kernel(k: int, slot_body: wp.array2d[wp.int32], body_world: wp.array[wp.int32],
+                         mass: wp.array[float], gravity: wp.array[wp.vec3],
+                         body_qd: wp.array[wp.spatial_vector], body_f: wp.array[wp.spatial_vector],
+                         offset: wp.array[wp.spatial_vector], Minv: wp.array3d[float], h: float,
+                         art_dt: float, pred: wp.array[float]):
+    w, m = wp.tid()
+    s = m // 6
+    b = slot_body[w, s]
+    if b < 0:
+        pred[w * k + m] = 0.0
+        return
+    acc = float(0.0)
+    nb = k // 6
+    for s2 in range(nb):
+        b2 = slot_body[w, s2]
+        if b2 >= 0:
+            w2 = wp.max(body_world[b2], 0)
+            f2 = body_f[b2] + wp.spatial_vector(mass[b2] * gravity[w2], wp.vec3(0.0))
+            o2 = 6 * s2
+            for a2 in range(6):
+                acc += Minv[w, m, o2 + a2] * f2[a2]
+    c = m - 6 * s
+    pred[w * k + m] = offset[b][c] + h * body_qd[b][c] + (h * art_dt) * acc
 
 
 @wp.kernel(enable_backward=False)

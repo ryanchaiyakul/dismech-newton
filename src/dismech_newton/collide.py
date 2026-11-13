@@ -273,11 +273,13 @@ class Offset:
         wp.launch(_offset_kernel, dim=self.num_nodes + self.num_edges,
                   inputs=[self._bvh.id, faces, self._lo, self._hi, sc], device=dev)
 
-    def reactions(self, q: wp.array, s: Slots, arm: Arm, eps: float, body_f: wp.array) -> None:
+    def reactions(self, q: wp.array, s: Slots, arm: Arm, eps: float, trib: wp.array, aniso: wp.array,
+                  body_f: wp.array) -> None:
         """Add to ``body_f`` each shape pair's force at ``q`` on its body (equal and opposite to the nodes'), with its
         torque about the body's centre of mass at the step's end: world frame, Newton's ``body_f`` layout."""
         wp.launch(_reaction_kernel, dim=s.active.shape[0],
-                  inputs=[q, s, arm, eps, self.shape_key0, self.bodies, body_f], device=self.fixed.device)
+                  inputs=[q, s, arm, eps, trib, aniso, self.shape_key0, self.bodies, body_f],
+                  device=self.fixed.device)
 
 
 @wp.struct
@@ -471,15 +473,15 @@ def _anchor(b: Bodies, k: int, x: wp.vec3):
 
 
 @wp.kernel
-def _reaction_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int, b: Bodies,
-                     body_f: wp.array[wp.spatial_vector]):
+def _reaction_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, trib: wp.array[float],
+                     aniso: wp.array[wp.vec3], key0: int, b: Bodies, body_f: wp.array[wp.spatial_vector]):
     i = wp.tid()
     if s.active[i] == 0 or s.key[i] < key0:
         return
     j = b.body[shape_of(s.key[i], key0)]
     if j < 0:
         return
-    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps)
+    g, h, fr = _barrier_force(pair_point(q, s, i, arm, s.anchor[i]), s, i, eps, trib, aniso)
     com = wp.transform_point(b.body_q[j], b.body_com[j])
     if b.body_qd.shape[0] > 0:
         com += b.h * wp.spatial_top(b.body_qd[j])

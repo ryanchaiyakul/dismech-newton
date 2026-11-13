@@ -139,23 +139,27 @@ def world_sum(a: wp.array[wp.float64], w: int, k: int, stride: int, v: wp.float6
 @wp.struct
 class Dofs:
     """Per DOF its mass and whether it is fixed; the external force's inputs (gravity, ``particle_f`` on the first
-    ``num_node_dofs``); ``1/dt^2``."""
+    ``num_node_dofs``, ``edge_f`` on the next ``num_edge_dofs``); ``1/dt^2``."""
 
     mass: wp.array[float]
     fixed: wp.array[wp.int32]
     gravity: wp.array[wp.vec3]
     particle_f: wp.array[wp.vec3]
+    edge_f: wp.array[float]
     num_node_dofs: int
+    num_edge_dofs: int
     inv_dt2: float
 
 
 @wp.func
 def _external(f: Dofs, i: int) -> float:
-    """``m g + particle_f`` on node DOF ``i``."""
+    """``m g + particle_f`` on node DOF ``i``, ``edge_f`` on twist DOF ``i``."""
     if i < f.num_node_dofs:
         n = i // 3
         k = i - 3 * n
         return f.mass[i] * f.gravity[0][k] + f.particle_f[n][k]
+    if i < f.num_node_dofs + f.num_edge_dofs:
+        return f.edge_f[i - f.num_node_dofs]
     return 0.0
 
 
@@ -184,11 +188,19 @@ def _dof_mass_kernel(particle_mass: wp.array[float], edge_inertia: wp.array[floa
 
 
 def bind_dofs(f: Dofs, model: Model, mass: wp.array, fixed: wp.array, no_force: wp.array, state_in: State,
-              dt: float) -> Dofs:
+              dt: float, *, particle_f: wp.array | None = None, edge_f: wp.array | None = None) -> Dofs:
     """``f`` set for a step of ``dt`` from ``state_in`` (``no_force``: zeros for a state without ``particle_f``)."""
     f.mass, f.fixed, f.gravity, f.num_node_dofs = mass, fixed, model.gravity, 3 * model.particle_count
     f.inv_dt2 = 1.0 / (dt * dt)
-    f.particle_f = state_in.particle_f if state_in.particle_f is not None else no_force
+    f.particle_f = particle_f if particle_f is not None else (
+        state_in.particle_f if state_in.particle_f is not None else no_force
+    )
+    if edge_f is not None:
+        f.edge_f, f.num_edge_dofs = edge_f, edge_f.shape[0]
+    else:
+        if f.edge_f is None:
+            f.edge_f = wp.zeros(0, dtype=float, device=mass.device)
+        f.num_edge_dofs = 0
     return f
 
 

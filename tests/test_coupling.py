@@ -378,3 +378,151 @@ def test_newton_franka_swap():
     ex.test_final()
     servo = M.GRIP_STIFFNESS * (args.payload_radius - M.GRIP_HOLD)
     assert np.allclose(grips, servo, rtol=0.02), (np.min(grips), np.max(grips), servo)
+
+
+@pytest.mark.usefixtures("needs_cuda", "mujoco")
+def test_articulated_one_pass_pinch_slip():
+    """Closed-chain Delassus ``ProxyArm``: 1-pass ``R-S-R`` pinch and axial slip on light ``15 g`` distal phalanges
+    matches multi-pass (``iterations=12``) contact normal and slip force (<1.5%) and Coulomb ``mu * sum(N)``."""
+    from newton.solvers import SolverMuJoCo  # noqa: PLC0415
+    from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy  # noqa: PLC0415
+
+    r, n, mu_rod, mu_pad = 0.005, 17, 0.4, 0.6
+
+    def build_and_run(iterations: int):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+        SolverMuJoCo.register_custom_attributes(builder)
+        carriage = builder.add_link(
+            xform=wp.transform(wp.vec3(0.08, 0.0, 0.0), wp.quat_identity()),
+            mass=0.25,
+            inertia=wp.mat33(1.0e-3, 0.0, 0.0, 0.0, 1.0e-3, 0.0, 0.0, 0.0, 1.0e-3),
+            label="carriage",
+        )
+        j_car = builder.add_joint_prismatic(
+            parent=-1,
+            child=carriage,
+            axis=wp.vec3(1.0, 0.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.08, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform_identity(),
+            target_ke=1.0e4,
+            target_kd=200.0,
+            actuator_mode=newton.JointTargetMode.POSITION,
+        )
+        # Symmetric upper & lower 2-link articulated fingers carrying 15 g distal phalanges.
+        hx, hy, hz = 0.008, 0.006, 0.012
+        dist_rho = 0.015 / (8.0 * hx * hy * hz)
+        hand_joints = [j_car]
+        finger_bodies = [carriage]
+        for sgn in (1.0, -1.0):
+            prox = builder.add_link(xform=wp.transform(wp.vec3(0.08, sgn * 0.016, 0.028), wp.quat_identity()))
+            j_prox = builder.add_joint_revolute(
+                parent=carriage,
+                child=prox,
+                axis=wp.vec3(1.0, 0.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, sgn * 0.016, 0.028), wp.quat_identity()),
+                child_xform=wp.transform_identity(),
+                target_ke=10.0,
+                target_kd=0.3,
+                actuator_mode=newton.JointTargetMode.POSITION,
+            )
+            dist = builder.add_link(xform=wp.transform(wp.vec3(0.08, sgn * (r + hy + 0.002), 0.0), wp.quat_identity()))
+            j_dist = builder.add_joint_revolute(
+                parent=prox,
+                child=dist,
+                axis=wp.vec3(1.0, 0.0, 0.0),
+                parent_xform=wp.transform(wp.vec3(0.0, -sgn * (0.016 - r - hy - 0.002), -0.028), wp.quat_identity()),
+                child_xform=wp.transform_identity(),
+                target_ke=5.0,
+                target_kd=0.15,
+                actuator_mode=newton.JointTargetMode.POSITION,
+            )
+            builder.add_shape_box(
+                prox, hx=0.006, hy=0.005, hz=0.006, cfg=newton.ModelBuilder.ShapeConfig(density=500.0, mu=mu_pad)
+            )
+            builder.add_shape_box(
+                dist, hx=hx, hy=hy, hz=hz, cfg=newton.ModelBuilder.ShapeConfig(density=dist_rho, mu=mu_pad)
+            )
+            finger_bodies.extend((prox, dist))
+            hand_joints.extend((j_prox, j_dist))
+        builder.add_articulation(hand_joints)
+
+        rod = newton.Rod(np.column_stack([np.linspace(0.0, 0.16, n), np.zeros(n), np.zeros(n)]), radius=r)
+        caps, _ = SolverDiSMech.add_rod(
+            builder,
+            rod=rod,
+            cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=mu_rod),
+            stretch_stiffness=1.0e4,
+            bend_stiffness=5.0e-3,
+            bend_damping=1.0e-4,
+        )
+        SolverDiSMech.fix_segment(builder, caps[0])
+        model = builder.finalize()
+        soft_bodies = [b for b in range(model.body_count) if b not in finger_bodies]
+        soft_joints = [j for j in range(model.joint_count) if j not in hand_joints]
+        proxy_bodies = [b for b in finger_bodies if b != carriage]
+        solver = SolverCoupledProxy(
+            model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="mjc",
+                    solver=lambda v: SolverMuJoCo(
+                        v, solver="newton", integrator="implicitfast", use_mujoco_contacts=False, njmax=128, nconmax=32
+                    ),
+                    bodies=finger_bodies,
+                    joints=hand_joints,
+                ),
+                SolverCoupled.Entry(
+                    name="soft",
+                    solver=SolverDiSMech,
+                    particles=list(range(model.particle_count)),
+                    bodies=soft_bodies,
+                    joints=soft_joints,
+                ),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[
+                    SolverCoupledProxy.Proxy(source="mjc", destination="soft", bodies=proxy_bodies, mode="lagged")
+                ],
+                iterations=iterations,
+            ),
+        )
+        s0, s1, ctrl = model.state(), model.state(), model.control()
+        flatten_state(s0)
+        flatten_state(s1)
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        soft = solver.solver("soft")
+        mjc = solver.solver("mjc")
+        tq = np.zeros(model.joint_dof_count, dtype=np.float32)
+        dt = 2.0e-3
+        mu_pair = 0.5 * (mu_rod + mu_pad)
+        sns, pushes = [], []
+        # Steps 0..39: pinch symmetrically on y; steps 40..149: slide carriage +x to steady Coulomb slip.
+        for k in range(150):
+            alpha = min(1.0, (k + 1) / 30.0)
+            tq[1] = -0.10 * alpha
+            tq[2] = -0.05 * alpha
+            tq[3] = 0.10 * alpha
+            tq[4] = 0.05 * alpha
+            if k >= 40:
+                tq[0] = 0.10 * (k - 39) * dt
+            ctrl.joint_target_q.assign(tq)
+            s0.clear_forces()
+            pipeline.collide(s0, contacts)
+            solver.step(s0, s1, ctrl, contacts, dt)
+            s0, s1 = s1, s0
+            if k >= 120:
+                s = soft.contact.s
+                act = s.active.numpy() != 0
+                sns.append(float(s.rho.numpy()[act].sum()))
+                pushes.append(float(mjc.mjw_data.qfrc_actuator.numpy()[0, 0]))
+        sum_n = float(np.mean(sns))
+        return sum_n, float(np.mean(pushes)), mu_pair * sum_n
+
+    n_1, p_1, cap_1 = build_and_run(1)
+    n_12, p_12, cap_12 = build_and_run(12)
+    assert n_1 > 0.5 and abs(p_1) > 0.1, (n_1, p_1)
+    assert abs(n_1 - n_12) / n_12 < 0.015, (n_1, n_12)
+    assert abs(p_1 - p_12) / p_12 < 0.015, (p_1, p_12)
+    assert abs(p_1 - cap_1) / cap_1 < 0.02, (p_1, cap_1)

@@ -727,11 +727,11 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     majorized in the sticking ramp (``f1 / y``) and exact when sliding (``0`` along the slip, ``f1 / y`` across it)."""
     n = s.normal[i]
     g, h, fr = _barrier_force(c, s, i, eps)
-    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
     pad = s.pad[i]
     x = s.thickness[i] + pad[2] - wp.dot(n, c)  # in its pad: a rod's curvature (delta^1/2) is 0 at the surface,
     if pad[0] > 0.0 and x >= 0.0:  # so A holds at least the pad's at PAD_FLOOR of it deep
         h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
+    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
     slip = _slip(c, s.c0[i], n)
     y = wp.length(slip)
     if y >= eps and s.rewound[i] == 0:

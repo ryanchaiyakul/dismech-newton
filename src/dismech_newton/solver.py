@@ -51,7 +51,7 @@ TOLERANCE = 0.01
 ULP = 1.0e-6  # float32's reach: a few of its epsilons of a coordinate (+ the cap): forces below it, in a
 # DOF's inertia, are not resolved (the force balance's floor)
 EPS32 = 1.1920929e-07  # float32's epsilon: a coordinate's ulp is at most this times it
-CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_dahl_q")  # state a step carries beyond the DOFs (and strains)
+CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_mem_q", "face_mem_q")  # carried beyond DOFs and strains
 
 
 class _OwnResetState(logging.Filter):
@@ -139,6 +139,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             raise ValueError(f"theta must be in [1/2, 1], got {theta}")
         self.theta = float(theta)
         self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
+        self._last_dt: float = 0.0
         self.tolerance = TOLERANCE  # (read here: tests set the module's)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
@@ -179,7 +180,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         wd.count, wd.stride = W, nc
         rows = {"edge_d1_q": of[3 * node0]}  # a masked reset's rows: per attribute, its rows' worlds
         for t in types:  # an element's: its first node's (a rod's carry its triplets' reference twists, Dahl)
-            for name in (t.stored, *(CARRIED[1:] if t is self.triplets else ())):
+            for name in (t.stored, *(("triplet_ref_twist_q",) if t is self.triplets else ()),
+                         *((t.memory,) if getattr(t, "memory", None) else ())):
                 rows[name] = of[t.dofs()[:, 0]] if t.count else []
         self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
@@ -309,6 +311,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         tape.record_func(lambda: self.vjp(state_in, state_out, dt, contacts, arm), arrays)
 
     def _step(self, state_in: State, state_out: State, dt: float) -> None:
+        self._last_dt = dt
         flatten_state(state_in)
         flatten_state(state_out)
         s_in, s_out, n = state_in.dismech, state_out.dismech, self.num_state_dofs
@@ -338,13 +341,13 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self._proxy_arm.finish(q, state_in, state_out, dt, h)
         wp.launch(end_kernel, dim=n, inputs=[self.fixed, s_in.q, s_in.qd, q, self.theta, dt],
                   outputs=[s_out.q, s_out.qd], device=self.device)
-        self._carry(state_in.particle_q, state_in.dismech, state_out.particle_q, state_out.dismech)
+        self._carry(state_in.particle_q, state_in.dismech, state_out.particle_q, state_out.dismech, dt)
         self.update_proxies(state_out)
         for dst, src in self._carry_pairs(self._carried.dismech, state_out.dismech):
             wp.copy(dst, src)
         self._carry_valid.fill_(1)
 
-    def _carry(self, prev_nodes: wp.array, p, nodes: wp.array, s) -> None:
+    def _carry(self, prev_nodes: wp.array, p, nodes: wp.array, s, dt: float = 0.0) -> None:
         """``s``'s edge frames, reference twists, stored strains and Dahl stresses as a step from ``p`` leaves them
         (each a state's ``dismech``, or the adjoint's stand-in; ``nodes`` its ``q``'s positions)."""
         d, tr, dev = self.der, self.triplets, self.device
@@ -352,9 +355,10 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                   d.edge_node0, d.edge_node1, p.edge_d1_q], outputs=[s.edge_d1_q], device=dev)
         wp.launch(advance_ref_twist_kernel, dim=tr.count, inputs=[s.q, s.edge_d1_q, tr.conn, p.triplet_ref_twist_q],
                   outputs=[s.triplet_ref_twist_q], device=dev)
-        for e in self.elements:
-            e.store(s)
-        tr.carry(p, s)
+        for b in self.elements:
+            b.store(s)
+            if b.carry is not None:
+                b.carry(p, s, dt)
 
     def restart(self, state: State, prev: State) -> None:
         """Start the next step from ``state``, its DOFs set (to data, say) and the rest of its state as a step from
@@ -362,7 +366,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         start (:meth:`reset`)."""
         flatten_state(state)
         flatten_state(prev)
-        self._carry(prev.particle_q, prev.dismech, state.particle_q, state.dismech)
+        self._carry(prev.particle_q, prev.dismech, state.particle_q, state.dismech, self._last_dt)
         self.reset(state)
 
     def reset(self, state: State, world_mask: wp.array[wp.bool] | None = None, flags: StateFlags | int | None = None

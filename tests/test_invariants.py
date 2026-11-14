@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import solver as solver_module
+from dismech_newton.contact import CURVATURE, Slots, _majorizer, _slots
 from dismech_newton.state import dof_constants
 
 
@@ -385,7 +386,7 @@ def test_restart_and_mass_refresh_and_hinge_barrier():
     wp.copy(fresh.dismech.q, s_end.dismech.q)
     wp.copy(fresh.dismech.qd, s_end.dismech.qd)
     sim.restart(fresh, s_prev)
-    for field in ("edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q", "triplet_dahl_q"):
+    for field in ("edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q", "triplet_mem_q"):
         np.testing.assert_allclose(getattr(fresh.dismech, field).numpy(), getattr(s_end.dismech, field).numpy(),
                                    atol=1.0e-6)
     cont_a, _ = simulate(m, sim, 5, 0.01, state=fresh)
@@ -424,3 +425,25 @@ def test_restart_and_mass_refresh_and_hinge_barrier():
     out3, _ = simulate(m3, sim3, 5, 0.02, state=s3)
     assert np.isfinite(out3.dismech.q.numpy()).all()
     assert np.isfinite(out3.dismech.face_strain_q.numpy()).all()
+
+
+@wp.kernel
+def _eval_majorizer_kernel(c: wp.vec3, s: Slots, eps: float, out: wp.array[wp.mat33]):
+    out[0] = _majorizer(c, s, 0, eps)
+
+
+def test_pad_majorizer_curvature_cap():
+    """``contact._majorizer`` caps hydroelastic pad curvature at ``CURVATURE * s.stiffness[i]`` even when pad
+    stiffness exceeds ``100 * k`` (both inside the pad and at the pad surface where ``PAD_FLOOR`` applies)."""
+    s = _slots(1, None)
+    s.active.fill_(1)
+    s.normal.fill_(wp.vec3(0.0, 0.0, 1.0))
+    s.thickness.fill_(0.005)
+    s.stiffness.fill_(1.0e3)
+    s.pad.fill_(wp.vec4(1.0e12, 2.0, 0.01, 0.0))  # pad e'' = 2e12 >> CURVATURE * 1e3 = 1e5
+    out = wp.zeros(1, dtype=wp.mat33)
+    for d in (0.015, 0.010):  # at pad surface (x = 0, PAD_FLOOR branch) and 5 mm deep
+        s.c0.fill_(wp.vec3(0.0, 0.0, d))
+        wp.launch(_eval_majorizer_kernel, dim=1, inputs=[wp.vec3(0.0, 0.0, d), s, 1.0e-4], outputs=[out])
+        H = out.numpy()[0]
+        assert np.isclose(H[2, 2], float(CURVATURE) * 1.0e3, rtol=1.0e-6), (d, H[2, 2])

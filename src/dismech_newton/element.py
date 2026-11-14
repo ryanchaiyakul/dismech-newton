@@ -41,6 +41,8 @@ class ElementBlock:
     def __init__(self, elem, *, slots, fixed, num_candidates: int = 0):
         self.k, self.count, self.bind, self.params = elem.kernels, elem.count, elem.bind, elem.params
         self.rest, self.stored, self.slots, self.fixed = elem.rest, elem.stored, slots, fixed
+        self.memory = getattr(elem, "memory", None)
+        self.carry = getattr(elem, "carry", None)
         self.effective = getattr(elem, "effective", None)  # (state, dt) -> the step's (params, rest), else theirs
         self.params_step, self.rest_step = self.params, self.rest
         self.device, vec = fixed.device, elem.kernels.vec

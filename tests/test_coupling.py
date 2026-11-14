@@ -70,10 +70,23 @@ def test_standalone_proxy_arm_and_pin_conserve_momenta(rng):
         return p, L, gap
 
     p0, L0, _ = momenta(s0)
-    dp = dL = max_gap = 0.0
+    dp = dL = max_gap = max_wrench_err = 0.0
+    dt = 1.0e-3
+    p_wrench = np.zeros(3)
     for k in range(120):
-        solver.step(s0, s1, None, None, 1.0e-3)
+        bqd_in = s0.body_qd.numpy()[body].astype(np.float64)
+        bq_in = s0.body_q.numpy()[body].astype(np.float64)
+        R_in = np.array(wp.quat_to_matrix(wp.quat(*bq_in[3:])), dtype=np.float64).reshape(3, 3)
+        solver.step(s0, s1, None, None, dt)
         s0, s1 = s1, s0
+        bqd_out = s0.body_qd.numpy()[body].astype(np.float64)
+        wrench = solver._proxy_arm.last_wrench.numpy()[body].astype(np.float64)
+        p_wrench += wrench[:3] * dt
+        expected = np.concatenate([
+            mb * (bqd_out[:3] - bqd_in[:3]) / dt,
+            (R_in @ inertia @ R_in.T @ (bqd_out[3:] - bqd_in[3:])) / dt,
+        ])
+        max_wrench_err = max(max_wrench_err, np.linalg.norm(wrench - expected))
         p, L, g = momenta(s0)
         dp = max(dp, np.linalg.norm(p - p0) / np.linalg.norm(p0))
         dL = max(dL, np.linalg.norm(L - L0) / np.linalg.norm(L0))
@@ -82,7 +95,50 @@ def test_standalone_proxy_arm_and_pin_conserve_momenta(rng):
     assert dp < 1.0e-4, dp
     assert dL < 5.0e-3, dL
     assert max_gap < 5.0e-4, max_gap
+    assert max_wrench_err < 1.0e-5, max_wrench_err
+    assert np.linalg.norm(p_wrench - mb * s0.body_qd.numpy()[body, :3]) < 1.0e-5
     assert mb * np.linalg.norm(s0.body_qd.numpy()[body, :3]) > 0.25 * np.linalg.norm(p0)
+    solver.reset(s0)
+    assert np.all(solver._proxy_arm.last_wrench.numpy() == 0.0)
+
+
+def test_proxy_arm_last_wrench_equilibrium():
+    """Steady-state rod resting off-centre on a ``BodyFlags.PROXY`` box held in equilibrium by ``body_f``:
+    ``ProxyArm.last_wrench`` matches the exact weight and off-centre torque ``[0, 0, -m g, 0, a m g, 0]``."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    hx, a, r, n = 0.05, 0.02, 0.004, 15
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, hx), wp.quat_identity()))
+    builder.add_shape_box(body, hx=hx, hy=hx, hz=hx, cfg=newton.ModelBuilder.ShapeConfig(density=50.0, mu=0.5))
+    rod = newton.Rod(np.column_stack([np.full(n, a), np.linspace(-0.04, 0.04, n), np.full(n, 2 * hx + r + 0.001)]),
+                     radius=r)
+    SolverDiSMech.add_rod(builder, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0, mu=0.5),
+                          stretch_stiffness=1.0e4, stretch_damping=10.0, bend_stiffness=0.1, bend_damping=1.0e-2)
+    model = builder.finalize()
+    flags = model.body_flags.numpy()
+    flags[body] |= int(BodyFlags.PROXY)
+    model.body_flags.assign(flags)
+    solver = SolverDiSMech(model, iterations=30)
+    m_rod = float(model.particle_mass.numpy().sum())
+    m_box = float(model.body_mass.numpy()[body])
+    weight = m_rod * 9.81
+    hold = np.zeros((model.body_count, 6), dtype=np.float32)
+    hold[body] = [0.0, 0.0, (m_box + m_rod) * 9.81, 0.0, -a * weight, 0.0]
+    s0, s1 = model.state(), model.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    for _ in range(300):
+        s0.body_f.assign(hold)
+        solver.step(s0, s1, None, None, 2.0e-3)
+        s0, s1 = s1, s0
+    wrench = solver._proxy_arm.last_wrench.numpy()[body]
+    expected = np.array([0.0, 0.0, -weight, 0.0, a * weight, 0.0])
+    assert np.allclose(wrench[:3], expected[:3], atol=1.0e-3 * weight), (wrench, expected)
+    assert np.allclose(wrench[3:], expected[3:], atol=2.0e-3 * a * weight), (wrench, expected)
+    assert np.allclose(wrench, solver.body_reaction.numpy()[body], rtol=1.0e-2, atol=1.0e-5)
+    solver.reset(s0, wp.array([True, False], dtype=wp.bool))
+    assert np.allclose(solver._proxy_arm.last_wrench.numpy()[body], wrench)
+    solver.reset(s0, wp.array([False, True], dtype=wp.bool))
+    assert np.all(solver._proxy_arm.last_wrench.numpy() == 0.0)
 
 
 @pytest.mark.usefixtures("needs_cuda", "mujoco")

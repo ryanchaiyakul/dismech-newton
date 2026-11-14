@@ -81,6 +81,7 @@ class ProxyArm:
         self._start = wp.zeros(nb, dtype=wp.transform, device=self.device)  # the proxies' poses the step began at
         self._valid = wp.zeros(nb, dtype=wp.int32, device=self.device)  # per body: it has a last pose
         self._was_valid = wp.zeros_like(self._valid)  # the step's: its start pose is the last step's end
+        self.last_wrench = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)
         self._last_grad = None  # the last recorded step's adjoint of its end poses (snapshot)
         self.restart = False  # the next step repeats the last (a coupler's iteration restart): from its start
         self._arm: Arm | None = None
@@ -98,9 +99,10 @@ class ProxyArm:
         """Start the proxies from their synced poses next step (those of the worlds of ``mask``, else all)."""
         if mask is None:
             self._valid.zero_()
+            self.last_wrench.zero_()
         elif self._body.shape[0]:
             wp.launch(_proxy_reset_kernel, dim=self._body.shape[0], inputs=[self._body, self.model.body_world, mask],
-                      outputs=[self._valid], device=self.device)
+                      outputs=[self._valid, self.last_wrench], device=self.device)
 
     def update(self, state: State, h: float) -> tuple[wp.array, wp.array]:
         """The arm at the step from ``state`` (step ``h``); returns the body poses and velocities for the step: the
@@ -144,6 +146,9 @@ class ProxyArm:
         wp.launch(_proxy_finish_kernel, dim=self._body.shape[0],
                   inputs=[self._body, a.base, z, a.com, m.body_com, self._q, self._offset, dt, h],
                   outputs=[state_out.body_q, state_out.body_qd, self._last], device=self.device)
+        wp.launch(_proxy_wrench_kernel, dim=self._body.shape[0],
+                  inputs=[self._body, a.base, z, a.M, a.pred, a.start, self.k, 1.0 / (h * h)],
+                  outputs=[self.last_wrench], device=self.device)
         self._valid.fill_(1)
 
 
@@ -227,11 +232,45 @@ def _proxy_update_kernel(body: wp.array[wp.int32], base: wp.array[wp.int32], sta
 
 @wp.kernel(enable_backward=False)
 def _proxy_reset_kernel(body: wp.array[wp.int32], body_world: wp.array[wp.int32], mask: wp.array[wp.bool],
-                        valid: wp.array[wp.int32]):
+                        valid: wp.array[wp.int32], last_wrench: wp.array[wp.spatial_vector]):
     b = body[wp.tid()]
     w = body_world[b]
     if mask[wp.where(w >= 0, w, mask.shape[0] - 1)]:
         valid[b] = 0
+        last_wrench[b] = wp.spatial_vector()
+
+
+@wp.kernel(enable_backward=False)
+def _proxy_wrench_kernel(
+    body: wp.array[wp.int32],
+    base: wp.array[wp.int32],
+    z: wp.array[float],
+    arm_M: wp.array3d[float],
+    arm_pred: wp.array[float],
+    start: int,
+    k: int,
+    inv_h2: float,
+    last_wrench: wp.array[wp.spatial_vector],
+):
+    """World-frame contact/pin wrench ``M (z - pred) / h^2`` per proxy body."""
+    p = wp.tid()
+    b = body[p]
+    z0 = base[b]
+    i = z0 - start
+    w = i // k
+    i0 = i - w * k
+    f = wp.vec3(0.0)
+    tau = wp.vec3(0.0)
+    for row in range(3):
+        fx = float(0.0)
+        tx = float(0.0)
+        for col in range(6):
+            dz = z[z0 + col] - arm_pred[i + col]
+            fx += arm_M[w, i0 + row, i0 + col] * dz
+            tx += arm_M[w, i0 + 3 + row, i0 + col] * dz
+        f[row] = fx * inv_h2
+        tau[row] = tx * inv_h2
+    last_wrench[b] = wp.spatial_vector(f, tau)
 
 
 @wp.kernel

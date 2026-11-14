@@ -37,6 +37,7 @@ class Rods:
     """The model's triplets as an element type; ``rest`` starts at the initial strains (stretch 0)."""
 
     stored = "triplet_strain_q"
+    memory = "triplet_mem_q"
 
     def __init__(self, model: Model):
         d, dev = model.dismech, wp.get_device(model.device)
@@ -66,15 +67,15 @@ class Rods:
         """The step's ``(params, rest)`` with Dahl from ``s`` (a state's ``dismech``; into ``params``, ``rest``)."""
         params = self.params_step if params is None else params
         rest = self.rest_step if rest is None else rest
-        wp.launch(dahl_step_kernel, dim=self.count, inputs=[self.params, self.rest, self.dahl, s.triplet_dahl_q, dt],
+        wp.launch(dahl_step_kernel, dim=self.count, inputs=[self.params, self.rest, self.dahl, s.triplet_mem_q, dt],
                   outputs=[params, rest], device=self.params.device)
         return params, rest
 
-    def carry(self, p, s) -> None:
+    def carry(self, p, s, dt: float = 0.0) -> None:
         """``s``'s Dahl stresses as the step from ``p`` leaves them (both with their stored strains)."""
-        if self.effective is not None:
+        if self.effective is not None and self.count:
             wp.launch(dahl_update_kernel, dim=self.count, inputs=[p.triplet_strain_q, s.triplet_strain_q,
-                      self.params, self.dahl, p.triplet_dahl_q], outputs=[s.triplet_dahl_q],
+                      self.params, self.dahl, p.triplet_mem_q], outputs=[s.triplet_mem_q],
                       device=self.params.device)
 
     def bind(self, s) -> Rod:
@@ -290,35 +291,36 @@ def dahl_advance(d: float, sigma: float, sigma_max: float, tau: float) -> float:
 
 @wp.kernel
 def dahl_step_kernel(params: wp.array[vec10f], rest: wp.array[vec5f], dahl: wp.array[wp.vec2],
-                     sigma: wp.array[wp.vec3], dt: float, params_out: wp.array[vec10f], rest_out: wp.array[vec5f]):
+                     mem: wp.array[vec5f], dt: float, params_out: wp.array[vec10f], rest_out: wp.array[vec5f]):
     """``rest - sigma / K`` and the damping ``C + dt K eps_max / tau`` on the bend and twist strains."""
     t = wp.tid()
     p = params[t]
     r = rest[t]
     on = wp.where(dahl[t][0] > 0.0 and dahl[t][1] > 0.0, 1.0, 0.0)
     rate = on * dt * dahl[t][0] / wp.max(dahl[t][1], 1.0e-30)
-    sg = sigma[t]
+    m = mem[t]
     k1, k2, k3 = p[2], p[3], p[4]
-    rest_out[t] = vec5f(r[0], r[1], r[2] - on * sg[0] / wp.max(k1, 1.0e-30), r[3] - on * sg[1] / wp.max(k2, 1.0e-30),
-                        r[4] - on * sg[2] / wp.max(k3, 1.0e-30))
+    rest_out[t] = vec5f(r[0], r[1], r[2] - on * m[2] / wp.max(k1, 1.0e-30), r[3] - on * m[3] / wp.max(k2, 1.0e-30),
+                        r[4] - on * m[4] / wp.max(k3, 1.0e-30))
     params_out[t] = vec10f(p[0], p[1], k1, k2, k3, p[5], p[6], p[7] + rate * k1, p[8] + rate * k2, p[9] + rate * k3)
 
 
 @wp.kernel
 def dahl_update_kernel(prev: wp.array[vec5f], strain: wp.array[vec5f], params: wp.array[vec10f],
-                       dahl: wp.array[wp.vec2], sigma: wp.array[wp.vec3], sigma_out: wp.array[wp.vec3]):
+                       dahl: wp.array[wp.vec2], mem: wp.array[vec5f], mem_out: wp.array[vec5f]):
     """``sigma`` advanced over the step's strain change (none from a state no step has written)."""
     t = wp.tid()
     eps_max, tau = dahl[t][0], dahl[t][1]
-    a, b, p, sg = prev[t], strain[t], params[t], sigma[t]
-    out = wp.vec3(0.0)
+    a, b, p, m = prev[t], strain[t], params[t], mem[t]
+    out = vec5f(0.0)
     if eps_max > 0.0 and tau > 0.0 and not wp.isnan(a[0]):
-        out = wp.vec3(dahl_advance(b[2] - a[2], sg[0], eps_max * p[2], tau),
-                      dahl_advance(b[3] - a[3], sg[1], eps_max * p[3], tau),
-                      dahl_advance(b[4] - a[4], sg[2], eps_max * p[4], tau))
+        sg = wp.vec3(dahl_advance(b[2] - a[2], m[2], eps_max * p[2], tau),
+                     dahl_advance(b[3] - a[3], m[3], eps_max * p[3], tau),
+                     dahl_advance(b[4] - a[4], m[4], eps_max * p[4], tau))
+        out = vec5f(m[0], m[1], sg[0], sg[1], sg[2])
     elif eps_max > 0.0 and tau > 0.0:
-        out = sg
-    sigma_out[t] = out
+        out = m
+    mem_out[t] = out
 
 
 # -- end-of-step kernels (one thread per edge or triplet) ---------------------------------

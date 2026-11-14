@@ -88,16 +88,16 @@ class StepAdjoint:
         self.q_star, self.q_pred, self.q, self.qd, self.residual, self.mass = (grad(n) for _ in range(6))
         self.edge_d1 = grad(s.der.edge_length.shape[0], wp.vec3)
         self.ref_twist = grad(s.triplets.count)
-        self.dahl = grad(s.triplets.count, wp.vec3)
         self.elements = [
             SimpleNamespace(blk=b, eps_prev=grad(b.count, b.k.vec), strain=grad(b.count, b.k.vec),
                             xs=grad(b.count, b.k.xvec), g=grad(b.count, b.k.xvec), params=grad(b.count, b.params.dtype),
                             xs_rows=grad((b.count, b.k.D), b.k.xvec), g_rows=grad((b.count, b.k.D), b.k.xvec),
-                            rest=grad(b.count, b.k.vec))
+                            rest=grad(b.count, b.k.vec), mem=grad(b.count, b.k.vec) if b.memory else None)
             for b in s.elements if b.count
         ]
-        self._intermediates = [self.q_star, self.q_pred, self.q, self.qd, self.edge_d1, self.ref_twist, self.dahl,
-                               *(a for e in self.elements for a in (e.eps_prev, e.strain, e.params, e.rest))]
+        self._intermediates = [self.q_star, self.q_pred, self.q, self.qd, self.edge_d1, self.ref_twist,
+                               *(a for e in self.elements for a in (e.eps_prev, e.strain, e.params, e.rest, e.mem)
+                                 if a is not None)]
         nd = s.num_node_dofs
         self._q_nodes = self.q[:nd].reshape((nd // 3, 3)).view(wp.vec3)
         self._rhs, self._lam = (wp.zeros(n, dtype=float, device=dev) for _ in range(2))
@@ -127,8 +127,10 @@ class StepAdjoint:
         proxies', :meth:`~.coupling.ProxyArm.snapshot`)."""
         s = self.solver
         s_in, s_out = state_in.dismech, state_out.dismech
-        seeds = {self.q: s_out.q.grad, self.qd: s_out.qd.grad, self.edge_d1: s_out.edge_d1_q.grad,
-                 self.ref_twist: s_out.triplet_ref_twist_q.grad, self.dahl: s_out.triplet_dahl_q.grad,
+        seeds = {self.q: s_out.q.grad, self.qd: s_out.qd.grad,
+                 self.edge_d1: s_out.edge_d1_q.grad if s.der.edge_length.shape[0] else None,
+                 self.ref_twist: s_out.triplet_ref_twist_q.grad if s.triplets.count else None,
+                 **{e.mem: getattr(s_out, e.blk.memory).grad for e in self.elements if e.mem is not None},
                  **{e.strain: getattr(s_out, e.blk.stored).grad for e in self.elements}}
         if arm is not None:
             seeds[self.end] = arm.end_grad
@@ -142,8 +144,9 @@ class StepAdjoint:
         self._bind_arm(arm, h)
         strains = {b.stored: getattr(s_out, b.stored) for b in s.elements} | {e.blk.stored: e.strain
                                                                              for e in self.elements}  # (empty blocks)
-        end = SimpleNamespace(q=self.q, edge_d1_q=self.edge_d1, triplet_ref_twist_q=self.ref_twist,
-                              triplet_dahl_q=self.dahl, **strains)
+        mems = ({b.memory: getattr(s_out, b.memory) for b in s.elements if getattr(b, "memory", None)}
+                | {e.blk.memory: e.mem for e in self.elements if e.mem is not None})
+        end = SimpleNamespace(q=self.q, edge_d1_q=self.edge_d1, triplet_ref_twist_q=self.ref_twist, **strains, **mems)
         with suspended_tape():
             for a in self._intermediates:
                 a.grad.zero_()
@@ -185,7 +188,7 @@ class StepAdjoint:
                               inputs=[pa._body, self.arm.base, self.q_star, self._com, m.body_com, arm.poses,
                                       self._offset, dt, h], outputs=[self.end, self._end_qd, self._end_last],
                               device=dev)
-                s._carry(state_in.particle_q, s_in, self._q_nodes, end)
+                s._carry(state_in.particle_q, s_in, self._q_nodes, end, dt)
             tape.backward(grads=seeds)
             if arm is not None:  # the start poses' adjoint: to the last step's ends, or the synced poses
                 arm.end_grad.zero_()

@@ -44,6 +44,7 @@ class Shells:
     strains (the model's initial shape, angles 0)."""
 
     stored = "face_strain_q"
+    memory = "face_mem_q"
 
     def __init__(self, model: Model, hinge_offset: int):
         d, dev = model.dismech, wp.get_device(model.device)
@@ -59,6 +60,10 @@ class Shells:
         v.hinge_offset = hinge_offset
         self.kernels = element_kernels(Shell, shell_strain, shell_jacobian, shell_dofs, 6, 21, shell_geometric)
         self.rest = rest_strains(self, model, vec6f)
+        self.effective = None
+
+    def carry(self, p, s, dt: float = 0.0) -> None:
+        pass
 
     def bind(self, s) -> Shell:
         return self.view

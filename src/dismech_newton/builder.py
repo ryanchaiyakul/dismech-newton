@@ -51,10 +51,11 @@ STATE_ATTRIBUTES = [
     ("triplet", "triplet_ref_twist_q", float, None),
     # The strains at the end of the last step (strain-rate damping); NaN until a step measures them.
     ("triplet", "triplet_strain_q", vec5f, vec5f(*([float("nan")] * 5))),
-    ("triplet", "triplet_dahl_q", wp.vec3, None),  # Dahl stress (kappa1, kappa2, tau) [N m]
+    ("triplet", "triplet_mem_q", vec5f, vec5f(0.0, 0.0, 0.0, 0.0, 0.0)),  # triplet memory (Dahl stress in [2:])
     ("hinge", "hinge_q", float, None),  # midedge angle
     ("hinge", "hinge_qd", float, None),
     ("face", "face_strain_q", vec6f, vec6f(*([float("nan")] * 6))),
+    ("face", "face_mem_q", vec6f, vec6f(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
 ]
 
 
@@ -255,7 +256,7 @@ def add_rod(
                 _P + "triplet_edge1": edge0 + int(triplets[t, 1]),
                 _P + "triplet_params": vec10f(*params[t].tolist()),
                 _P + "triplet_dahl": wp.vec2(dahl_eps_max, dahl_tau),
-                _P + "triplet_dahl_q": wp.vec3(0.0),
+                _P + "triplet_mem_q": vec5f(0.0, 0.0, 0.0, 0.0, 0.0),
                 _P + "triplet_ref_twist_q": 0.0,  # the first strain evaluation yields the reference twist itself
             }
         )
@@ -437,6 +438,7 @@ def add_cloth_mesh(
                 _P + "face_strain_map": wp.mat33(*W[f].ravel().tolist()),
                 _P + "face_bend_map": wp.mat33(*Wb[f].ravel().tolist()),
                 _P + "face_params": vec12f(*params[f].tolist()),
+                _P + "face_mem_q": vec6f(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             },
         )
     return np.arange(v0, builder.particle_count)

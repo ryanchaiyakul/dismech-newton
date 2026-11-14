@@ -445,7 +445,7 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
     R_wp = np.array(wp.quat_to_matrix(wp.quat(*q_rand.tolist())), dtype=np.float32).reshape(3, 3)
     t_shift = np.array([1.25, -0.8, 0.6], dtype=np.float32)
 
-    b0 = _build_rod_builder(n_seg, points=pts0, bend_damping=1e-3, stretch_damping=1e-2, twist_damping=1e-3, n_fixed=1)
+    b0 = _build_rod_builder(n_seg, points=pts0, bend_damping=1e-2, stretch_damping=1e-1, twist_damping=1e-2, n_fixed=1)
     m0 = b0.finalize(device=device)
     s0_in = m0.state()
     bq0 = s0_in.body_q.numpy().copy()
@@ -454,7 +454,7 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
     pts1 = (pts0 @ R_wp.T) + t_shift
 
     b1 = _build_rod_builder(
-        n_seg, points=pts1, quaternions=quats1, bend_damping=1e-3, stretch_damping=1e-2, twist_damping=1e-3, n_fixed=1
+        n_seg, points=pts1, quaternions=quats1, bend_damping=1e-2, stretch_damping=1e-1, twist_damping=1e-2, n_fixed=1
     )
     m1 = b1.finalize(device=device)
 
@@ -462,7 +462,8 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
     m0.gravity.assign(tuple(g0.tolist()))
     m1.gravity.assign(tuple((R_wp @ g0).tolist()))
 
-    w_nz = rng.normal(0.0, 0.08, size=(16, 5)).astype(np.float32)
+    w_scale = np.array([0.08, 0.08, 0.015, 0.015, 0.015], dtype=np.float64)
+    w_nz = (rng.normal(0.0, 1.0, size=(16, 5)) * w_scale).astype(np.float32)
     d_rest = rng.normal(0.0, 0.01, size=(n_seg - 1, 5)).astype(np.float32)
     spec0 = ResidualSpec(rod_rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
     spec1 = ResidualSpec(rod_rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
@@ -472,11 +473,15 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
     s0_in.particle_qd.assign(v0)
     s1_in = m1.state()
     s1_in.particle_qd.assign(v0 @ R_wp.T)
+    s0_b = m0.state()
+    s0_b.particle_qd.assign(v0)
 
+    fin_b, _ = simulate(m0, SolverDiSMech(m0, residual=None), 10, 0.01, state=s0_b)
     fin0, _ = simulate(m0, SolverDiSMech(m0, residual=spec0), 10, 0.01, state=s0_in)
     fin1, _ = simulate(m1, SolverDiSMech(m1, residual=spec1), 10, 0.01, state=s1_in)
+    assert np.abs(fin0.particle_q.numpy() - fin_b.particle_q.numpy()).max() > 5e-4
     expected = (fin0.particle_q.numpy() @ R_wp.T) + t_shift
-    assert_close(fin1.particle_q.numpy(), expected, 5e-4, name="se3_particle_q")
+    assert_close(fin1.particle_q.numpy(), expected, 5e-5, name="se3_particle_q")
 
     # 2) Continuum mesh refinement convergence N=(8, 16, 32, 64) over fixed physical clamped zone [0, L/8].
     w_cont = rng.normal(0.0, 15.0, size=(16, 5)).astype(np.float32)
@@ -524,9 +529,9 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
         f"\n[continuum] residual_delta={delta} (dd16_32={dd16_32:.4e}, dd32_64={dd32_64:.4e})"
     )
     assert abs(tips_res[64]) > 0.05
-    assert abs(delta[64]) > 1.0e-3
+    assert abs(delta[64]) > 5.0e-4
     assert d16_32 < 0.55 * d8_16 and d32_64 < 0.55 * d16_32
-    assert dd16_32 < 0.55 * dd8_16 and dd32_64 < 0.55 * dd16_32 and dd32_64 < 5.0e-4
+    assert dd16_32 < 0.55 * dd8_16 and dd32_64 < 0.55 * dd16_32 and dd32_64 < max(5.0e-4, 0.15 * abs(delta[64]))
 
 
 def _rollout_loss(

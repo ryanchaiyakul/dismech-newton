@@ -12,7 +12,7 @@ import numpy as np
 import warp as wp
 from newton import Model
 
-from .builder import _P, vec6f
+from .builder import _P, vec6f, vec12f
 from .element import element_kernels, rest_strains
 
 wp.set_module_options({"enable_backward": False})
@@ -60,7 +60,38 @@ class Shells:
         v.hinge_offset = hinge_offset
         self.kernels = element_kernels(Shell, shell_strain, shell_jacobian, shell_dofs, 6, 21, shell_geometric)
         self.rest = rest_strains(self, model, vec6f)
+        if self.count:
+            p = model.particle_q.numpy().astype(np.float64)[conn[:, :3]]
+            area = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), axis=1)
+            self.area = wp.array(area.astype(np.float32), dtype=float, device=dev)
+        else:
+            self.area = wp.zeros(0, dtype=float, device=dev)
+        self._residual = None
         self.effective = None
+
+    def bind_residual(self, res) -> None:
+        """Bind a constitutive residual so :meth:`effective` evaluates it."""
+        self._residual = res
+        res._shells = self
+        if self.count:
+            self.params_step = (
+                res.shell_params_step
+                if res.shell_params_step is not None
+                else wp.empty(self.count, dtype=vec12f, device=self.params.device)
+            )
+            self.rest_step = (
+                res.shell_rest_step
+                if res.shell_rest_step is not None
+                else wp.empty(self.count, dtype=vec6f, device=self.rest.device)
+            )
+            self.effective = self._effective
+
+    def _effective(self, s, dt: float, params=None, rest=None):
+        """The step's ``(params, rest)`` with constitutive residual from ``s`` (into ``params``, ``rest``)."""
+        params = self.params_step if params is None else params
+        rest = self.rest_step if rest is None else rest
+        self._residual.eval_shell(self, s, dt, self.params, self.rest, params, rest)
+        return params, rest
 
     def carry(self, p, s, dt: float = 0.0) -> None:
         pass
@@ -100,6 +131,13 @@ def shell_strain(x: vec21f, v: Shell, i: int) -> vec6f:
 def shell_jacobian(x: vec21f, v: Shell, i: int):
     m, g, J = _derivatives(_points(x), _angles(x), v.sign[i], v.flap[i], v.strain_map[i], v.bend_map[i] * _b_of_g())
     return _whiten(v, i, m, g), J
+
+
+@wp.func
+def shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, i: int):
+    """Face strain and directional strain rate ``J * xd``."""
+    eps, J = shell_jacobian(x, v, i)
+    return eps, J * xd
 
 
 @wp.func

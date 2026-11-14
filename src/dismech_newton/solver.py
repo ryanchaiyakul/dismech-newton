@@ -15,6 +15,7 @@ from .contact import BarrierBlock, make_arm
 from .coupling import ProxyArm, ProxyPins, _turn
 from .element import ElementBlock
 from .linear import SymmetricCSR, sparse_solver
+from .residual import ConstitutiveResidual, ResidualSpec
 from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_proxies_kernel, proxy_joints
 from .shell import Shells
 from .state import (
@@ -133,6 +134,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
+        residual: ResidualSpec | None = None,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
@@ -185,6 +187,9 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                 rows[name] = of[t.dofs()[:, 0]] if t.count else []
         self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
+        self.residual = ConstitutiveResidual(model, residual, device=dev) if residual is not None else None
+        if self.residual is not None:
+            self.triplets.bind_residual(self.residual)
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
         )
@@ -301,6 +306,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self.model.particle_mass,
             self.der.edge_inertia,
             *(a for e in self.elements for a in (e.params, e.rest)),
+            *(self.residual.grad_inputs() if self.residual is not None else ()),
         ]
         arm = None
         if self._proxy_arm is not None:  # the proxies' step, held for its adjoint

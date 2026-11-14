@@ -58,22 +58,39 @@ class Rods:
             r[:, :2] = 0.0
             self.rest.assign(r)
         self.dahl = d.triplet_dahl
-        self.effective = None  # (params, rest) per step: only with Dahl hysteresis
-        if self.count and (self.dahl.numpy() > 0.0).all(1).any():
+        self._has_dahl = bool(self.count and (self.dahl.numpy() > 0.0).all(1).any())
+        self._residual = None
+        self.effective = None  # (params, rest) per step: with Dahl hysteresis or constitutive residual
+        if self._has_dahl:
             self.effective = self._effective
             self.params_step, self.rest_step = wp.empty_like(self.params), wp.empty_like(self.rest)
 
+    def bind_residual(self, res) -> None:
+        """Bind a constitutive residual so :meth:`effective` evaluates it (fused with Dahl when active)."""
+        self._residual = res
+        res._rods = self
+        if self.count:
+            if res.params_step is not None:
+                self.params_step, self.rest_step = res.params_step, res.rest_step
+            elif self.effective is None:
+                self.params_step, self.rest_step = wp.empty_like(self.params), wp.empty_like(self.rest)
+            self.effective = self._effective
+
     def _effective(self, s, dt: float, params=None, rest=None):
-        """The step's ``(params, rest)`` with Dahl from ``s`` (a state's ``dismech``; into ``params``, ``rest``)."""
+        """The step's ``(params, rest)`` with Dahl and/or constitutive residual from ``s`` (into ``params``,
+        ``rest``)."""
         params = self.params_step if params is None else params
         rest = self.rest_step if rest is None else rest
-        wp.launch(dahl_step_kernel, dim=self.count, inputs=[self.params, self.rest, self.dahl, s.triplet_mem_q, dt],
-                  outputs=[params, rest], device=self.params.device)
+        if self._residual is not None:
+            self._residual.eval_rod(self, s, dt, self.params, self.rest, params, rest)
+        else:
+            wp.launch(dahl_step_kernel, dim=self.count, inputs=[self.params, self.rest, self.dahl, s.triplet_mem_q, dt],
+                      outputs=[params, rest], device=self.params.device)
         return params, rest
 
     def carry(self, p, s, dt: float = 0.0) -> None:
         """``s``'s Dahl stresses as the step from ``p`` leaves them (both with their stored strains)."""
-        if self.effective is not None and self.count:
+        if self._has_dahl and self.count:
             wp.launch(dahl_update_kernel, dim=self.count, inputs=[p.triplet_strain_q, s.triplet_strain_q,
                       self.params, self.dahl, p.triplet_mem_q], outputs=[s.triplet_mem_q],
                       device=self.params.device)

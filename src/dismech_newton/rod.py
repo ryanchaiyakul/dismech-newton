@@ -6,15 +6,10 @@ import numpy as np
 import warp as wp
 from newton import JointType, Model
 
-from .builder import _P, vec5f, vec10f
+from .builder import _P
+from .constants import DAHL_DEADBAND, mat5x11f, vec5f, vec5i, vec8f, vec10f, vec11f, vec11i
 from .element import element_kernels, rest_strains
 from .state import node
-
-vec5i = wp.types.vector(5, wp.int32)
-vec8f = wp.types.vector(8, float)
-vec11i = wp.types.vector(11, wp.int32)
-vec11f = wp.types.vector(11, float)
-mat5x11f = wp.types.matrix((5, 11), float)
 
 
 @wp.struct
@@ -171,6 +166,25 @@ def rod_jacobian(x: vec11f, v: Rod, t: int):
     return g.strain, J
 
 
+@wp.func
+def rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
+    """Triplet strain and directional strain rate ``J * xd`` without forming the full ``5x11`` matrix."""
+    g, xo = _geometry(_oriented(x, v.sign[t]), v, t), _oriented(xd, v.sign[t])
+    ze = wp.vec3(xo[4] - xo[0], xo[5] - xo[1], xo[6] - xo[2])
+    zf = wp.vec3(xo[8] - xo[4], xo[9] - xo[5], xo[10] - xo[6])
+    ge, gf = _dphi(g.te_old, g.te, g.ne), _dphi(g.tf_old, g.tf, g.nf)
+    De1, Df1, a1, b1 = _dkappa(g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
+    De2, Df2, a2, b2 = _dkappa(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
+    pe, pf = wp.dot(ge, ze) + xo[3], wp.dot(gf, zf) + xo[7]
+    return g.strain, vec5f(
+        wp.dot(g.te, ze) / g.l0e,
+        wp.dot(g.tf, zf) / g.l0f,
+        wp.dot(De1, ze) + wp.dot(Df1, zf) + a1 * pe + b1 * pf,
+        wp.dot(De2, ze) + wp.dot(Df2, zf) + a2 * pe + b2 * pf,
+        0.5 * wp.dot(g.kb / g.ne, ze) + 0.5 * wp.dot(g.kb / g.nf, zf) - pe + pf,
+    )
+
+
 # -- frames and geometry ----------------------------------------------------------------------
 
 
@@ -299,8 +313,6 @@ def _z_of_dof(i: int):
 # tangent sigma_max / tau (the mean of the two branches' at sigma) times the strain's change: a rest shift and a
 # damping-like term of the element, implicit, so the stiff Dahl response cannot ring (a frozen sigma, Newton's force,
 # lags up to 2 sigma_max / tau = 40 K one step). After the step sigma follows the law exactly over the step's change.
-
-DAHL_DEADBAND = wp.constant(1.0e-6)  # a smaller strain change keeps sigma's branch: noise cannot erode sigma
 
 
 @wp.func

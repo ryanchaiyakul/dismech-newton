@@ -29,10 +29,9 @@ from typing import Any
 import warp as wp
 from newton import State
 
-from .collide import FLAT, OPEN, Bodies, _closest_st, _edge_scan, _shape_gap, _shape_pose
+from .collide import Bodies, _closest_st, _edge_scan, _shape_gap, _shape_pose
+from .constants import CG_ITERATIONS, CG_TOLERANCE, FLAT, LIFT, OPEN, SIDES
 from .contact import (
-    LIFT,
-    SIDES,
     Arm,
     Slots,
     _arm_assemble_kernel,
@@ -67,9 +66,6 @@ from .state import (
     scatter_node,
     suspended_tape,
 )
-
-CG_TOLERANCE = 1.0e-8  # the contact solve's relative residual, in the preconditioner's norm (exact but for rod-rod pairs)
-CG_ITERATIONS = 100
 
 
 class StepAdjoint:

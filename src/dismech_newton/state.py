@@ -12,6 +12,7 @@ import warp as wp
 from newton import Model, ParticleFlags, State
 
 from .builder import ATTRIBUTES, STATE_ATTRIBUTES, complete
+from .constants import BLOCK
 
 
 def dof_constants(model: Model) -> tuple[wp.array, wp.array]:
@@ -54,9 +55,6 @@ def flatten_state(state: State) -> None:
                 view.assign(getattr(ns, name))
                 setattr(ns, name, view)
         setattr(ns, flat_name, flat)
-
-
-BLOCK = 256  # threads per block of a kernel that sums over its threads (tile reductions, wp.launch's default)
 
 
 def padded(n: int) -> int:

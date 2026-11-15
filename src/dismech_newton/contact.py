@@ -13,25 +13,26 @@ import numpy as np
 import warp as wp
 from newton import Model, State
 
+from .constants import (
+    CURVATURE,
+    DECAY,
+    FWD_MODULE_OPTS,
+    GROW,
+    IMPACT,
+    LIFT,
+    LOAD,
+    MAX_SCALE,
+    NONE,
+    PAD_FLOOR,
+    SIDES,
+    SLIP_SPEED,
+    SMOOTH,
+    STIFFNESS,
+)
 from .linear import row_slot
 from .state import node, padded, scatter_node, world_sum
 
-wp.set_module_options({"enable_backward": False})
-
-SMOOTH = wp.constant(0.02)  # the barrier's activation margin above the thickness (in thicknesses): a pair resting at
-# its thickness already has curvature, so A sees it
-LOAD = wp.constant(0.25)  # a node's pairs are stiffened until they hold its load at most this many thicknesses deep
-GROW = wp.constant(2.0)  # a node's load scale grows at most this factor per step
-DECAY = wp.constant(0.99)  # and relaxes by this factor per step, toward 1
-MAX_SCALE = wp.constant(1.0e5)  # and stays below this (unbounded, it spreads pair to pair and overflows k)
-CURVATURE = wp.constant(1.0e2)  # A holds a pair's normal curvature to at most this many k (its log's: d >= tau/10)
-STIFFNESS = 1.0e3  # each pair's barrier stiffness, in units of its inertia 1 / (dt^2 C M^-1 C^T)
-SIDES = 16  # a shape's pair keys per feature: a line contact's ends, or a pad's points (collide)
-PAD_FLOOR = wp.constant(0.05)  # A holds a pad pair at least at this fraction of its depth (:func:`_majorizer`)
-SLIP_SPEED = 0.01  # friction is smoothed below this slip speed [m/s]
-LIFT = wp.constant(0.25)  # a shape pair's least gap at a step's start, from the barrier's zero (in thicknesses)
-IMPACT = wp.constant(0.8)  # the line search's longest step: this fraction of the first pair's impact (IPC's)
-NONE = wp.constant(wp.int64(9223372036854775807))  # an empty place's sort key
+wp.set_module_options(FWD_MODULE_OPTS)
 
 
 @wp.struct

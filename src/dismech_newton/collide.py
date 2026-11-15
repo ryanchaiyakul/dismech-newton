@@ -20,22 +20,25 @@ from newton._src.geometry.sdf_texture import TextureSDFData, create_empty_textur
 from scipy.sparse.csgraph import maximum_bipartite_matching
 
 from .builder import _P
-from .contact import SIDES, Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
+from .constants import (
+    BISECT,
+    EXCLUSION,
+    FACE_PASSES,
+    FLAT,
+    FWD_MODULE_OPTS,
+    INSIDE,
+    NEARER,
+    OPEN,
+    PAD_DEPTH,
+    PAIRS,
+    PARALLEL,
+    REACH,
+    SIDES,
+)
+from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
 from .state import node
 
-wp.set_module_options({"enable_backward": False})
-
-PAIRS = 8  # the pair list's places per feature (node or edge), shared: the scenes' peak is 1.7 (cloth_style3d)
-PAD_DEPTH = wp.constant(0.5)  # a pad holds the outer half of a pair's thickness, its core's barrier the rest
-REACH = 2.0  # pairs within this many thicknesses: the thickness, plus two move caps (a radius each)
-EXCLUSION = 1.5  # rod-rod pairs closer than this many thicknesses along one rod are not contacts
-OPEN = 1.0e-4  # an edge-edge closest point this close to an end (fraction of the edge) is the node's: blocks are open
-PARALLEL = 1.0e-3  # edges with sin^2 of their angle below this: no edge-edge pair (their nodes' pairs hold it, IPC)
-BISECT = 14  # bisections for a rod edge's closest point to a shape
-FACE_PASSES = 8  # alternating closest points for a triangle's point nearest a shape
-INSIDE = 0.01  # its weights at least this (else on its edges, theirs)
-NEARER = 0.01  # an edge's or triangle's shape pair: closer than its nodes by this many thicknesses (else theirs)
-FLAT = 0.015  # 1 - cos 10 deg: normals along an edge within this of its closest point's are its face's (a line contact)
+wp.set_module_options(FWD_MODULE_OPTS)
 
 
 @wp.struct

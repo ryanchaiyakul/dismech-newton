@@ -8,15 +8,9 @@ import warp as wp
 from newton import Model, ModelBuilder, ParticleFlags, Rod
 from newton._src.core.types import Vec3
 
-vec5f = wp.types.vector(5, float)  # a triplet's strains [eps_e, eps_f, kappa1, kappa2, tau]
-vec10f = wp.types.vector(10, float)  # [stiffness, damping] per triplet strain
-vec6f = wp.types.vector(6, float)  # a face's strains (membrane 3, bending 3)
-vec12f = wp.types.vector(12, float)
+from .constants import ATTR_PREFIX, NAMESPACE, ROD_GROUP, vec5f, vec6f, vec10f, vec12f
 
-NAMESPACE = "dismech"
-_P = f"{NAMESPACE}:"
-ROD_GROUP = 0  # every colliding rod capsule's collision group: Newton pairs group 0 with nothing (the solver's own
-# contact finds the rod's), so no rigid solver or coupler collides with the capsules
+_P = ATTR_PREFIX
 
 # (frequency, name, dtype, references)
 ATTRIBUTES = [

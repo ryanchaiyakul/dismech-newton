@@ -11,6 +11,10 @@ from newton.solvers.experimental.coupled import CouplingInterface
 
 from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
 from .collide import Offset
+from .constants import ARMIJO_C1 as _C1
+from .constants import CARRIED, EPS32, FWD_MODULE_OPTS, LINESEARCH, NEST, TOLERANCE, ULP
+from .constants import OBJECTIVE_NOISE as _NOISE
+from .constants import PCG_SWEEPS as CG
 from .contact import BarrierBlock, make_arm
 from .coupling import ProxyArm, ProxyPins, _turn
 from .element import ElementBlock
@@ -39,20 +43,7 @@ from .state import (
     world_sum,
 )
 
-wp.set_module_options({"enable_backward": False})
-
-_C1 = 1.0e-4  # Armijo's sufficient decrease
-_NOISE = 1.0e-5  # a rise of the objective within its float32 rounding
-CG = 2  # SPD PCG sweeps on two-sided contacts (m = 0 scales A^-1 b; m = 1..CG-1 add CG-1 back-solves)
-LINESEARCH = 4  # step lengths tried per iteration, halving from 1
-NEST = 8  # iterations nested per conditional chain (:meth:`SolverDiSMech.step`)
-# the barrier's step has converged when its Newton step moves no node more than this many radii, nor changes a pair's
-# force by more than this fraction of (the force that moves its mass a radius in a step + the force it holds)
-TOLERANCE = 0.01
-ULP = 1.0e-6  # float32's reach: a few of its epsilons of a coordinate (+ the cap): forces below it, in a
-# DOF's inertia, are not resolved (the force balance's floor)
-EPS32 = 1.1920929e-07  # float32's epsilon: a coordinate's ulp is at most this times it
-CARRIED = ("edge_d1_q", "triplet_ref_twist_q", "triplet_mem_q", "face_mem_q")  # carried beyond DOFs and strains
+wp.set_module_options(FWD_MODULE_OPTS)
 
 
 class _OwnResetState(logging.Filter):
@@ -135,6 +126,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         theta: float = 1.0,
         refactor: bool = True,
         residual: ResidualSpec | None = None,
+        tolerance: float | None = None,
+        ulp: float | None = None,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
@@ -142,7 +135,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self.theta = float(theta)
         self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
         self._last_dt: float = 0.0
-        self.tolerance = TOLERANCE  # (read here: tests set the module's)
+        self.tolerance = float(TOLERANCE if tolerance is None else tolerance)  # (read here: tests set the module's)
+        self.ulp = float(ULP if ulp is None else ulp)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
@@ -519,9 +513,9 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self._load.zero_()
             self._net.zero_()
             self._unbalanced.zero_()
-            self.contact.load(q, self._load, self._floor, ULP)
+            self.contact.load(q, self._load, self._floor, self.ulp)
             wp.launch(_unbalanced_kernel, dim=self.model.particle_count, inputs=[q, self.q_pred, f, self._b,
-                      self._load, self._anchor, self.worlds], outputs=[self._net], device=self.device)
+                      self._load, self._anchor, self.worlds, self.ulp], outputs=[self._net], device=self.device)
             a = self.contact.arm
             if a.k:
                 wp.launch(_arm_unbalanced_kernel, dim=(a.M.shape[0], a.k // 6),
@@ -976,7 +970,8 @@ _NET, _LOAD, _FLOOR, _ANCHOR2, _N = 0, 3, 4, 5, 6  # a world's net force (3), lo
 
 @wp.kernel
 def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
-                       load: wp.array[float], anchor: wp.array[float], wd: Worlds, net: wp.array[wp.float64]):
+                       load: wp.array[float], anchor: wp.array[float], wd: Worlds, ulp: float,
+                       net: wp.array[wp.float64]):
     """The nodes' force balance at ``q``, summed per world into ``net`` (net force, its loads, float32's floor):
     ``b``, the step's gradient, is the unbalanced force; the loads are magnitudes: its contacts' forces (``load``,
     opposed pairs adding), its inertia and external force; the elastic forces are internal: they carry the load, they
@@ -1002,7 +997,7 @@ def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: 
     a = wp.vec3(anchor[i], anchor[i + 1], anchor[i + 2])
     s = EPS32 * wp.length(a) * wp.length(x)
     wp.atomic_add(net, o + _ANCHOR2, wp.float64(s * s))
-    wp.atomic_add(net, o + _FLOOR, wp.float64(k * ULP * (wp.length(x) + wp.length(r))))
+    wp.atomic_add(net, o + _FLOOR, wp.float64(k * ulp * (wp.length(x) + wp.length(r))))
 
 
 @wp.kernel

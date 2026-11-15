@@ -12,17 +12,11 @@ import numpy as np
 import warp as wp
 from newton import Model
 
-from .builder import _P, vec6f, vec12f
+from .builder import _P
+from .constants import FWD_MODULE_OPTS, mat6x21f, mat23f, mat63f, vec6f, vec9i, vec12f, vec21f, vec21i
 from .element import element_kernels, rest_strains
 
-wp.set_module_options({"enable_backward": False})
-
-vec9i = wp.types.vector(9, wp.int32)
-vec21i = wp.types.vector(21, wp.int32)
-vec21f = wp.types.vector(21, float)
-mat63f = wp.types.matrix((6, 3), float)
-mat6x21f = wp.types.matrix((6, 21), float)
-mat23f = wp.types.matrix((2, 3), float)
+wp.set_module_options(FWD_MODULE_OPTS)
 
 
 @wp.struct
@@ -136,10 +130,29 @@ def shell_jacobian(x: vec21f, v: Shell, i: int):
 
 
 @wp.func
-def shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, i: int):
-    """Face strain and directional strain rate ``J * xd``."""
-    eps, J = shell_jacobian(x, v, i)
-    return eps, J * xd
+def shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
+    """Face strain and directional strain rate ``J * xd`` without forming the full ``6x21`` matrix."""
+    P, dP, th, dth = _points(x), _points(xd), _angles(x), _angles(xd)
+    eu, ev, deu, dev = _row(P, 1) - _row(P, 0), _row(P, 2) - _row(P, 0), _row(dP, 1) - _row(dP, 0), _row(dP, 2) - _row(dP, 0)
+    dm = wp.vec3(2.0 * wp.dot(eu, deu), wp.dot(eu, dev) + wp.dot(ev, deu), 2.0 * wp.dot(ev, dev))
+    m, g = _forms(P, th, v.sign[f], v.flap[f])
+    n, dn = wp.cross(eu, ev), wp.cross(deu, ev) + wp.cross(eu, dev)
+    nn = wp.length(n)
+    dnn, dg = wp.dot(n / nn, dn), wp.vec3()
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        pj, pk, dpj, dpk = _row(P, j), _row(P, k), _row(dP, j), _row(dP, k)
+        t, dpsi = pk - pj, float(0.0)
+        L = wp.length(t)
+        tn, h, c = t / L, nn / L, g[i] * L / nn
+        if v.flap[f][i] != 0.0:
+            fl, dfl, pi, dpi = _row(P, 3 + i), _row(dP, 3 + i), _row(P, i), _row(dP, i)
+            ng = wp.cross(pj - pk, fl - pk)
+            u1, u2 = n / wp.dot(n, n), ng / wp.dot(ng, ng)
+            dpsi = -0.5 * (wp.dot(u1, L * dpi + wp.dot(pi - pk, tn) * dpj - wp.dot(pi - pj, tn) * dpk)
+                           + wp.dot(u2, L * dfl + wp.dot(fl - pk, tn) * dpj - wp.dot(fl - pj, tn) * dpk))
+        dg[i] = c * (dnn - h * wp.dot(tn, dpk - dpj)) / L + h * (1.0 + c * c) * (dpsi + float(v.sign[f][i]) * dth[i])
+    return _whiten(v, f, m, g), _whiten(v, f, dm, dg)
 
 
 @wp.func

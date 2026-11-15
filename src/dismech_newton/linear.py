@@ -16,9 +16,12 @@ try:
 except ImportError:
     cudss = None
 
-wp.set_module_options({"enable_backward": False})
+from .constants import CUDA_R_32F as _CUDA_R_32F
+from .constants import CUDA_R_32I as _CUDA_R_32I
+from .constants import CUDA_R_64F as _CUDA_R_64F
+from .constants import FWD_MODULE_OPTS
 
-_CUDA_R_32F, _CUDA_R_64F, _CUDA_R_32I = 0, 1, 10  # cudaDataType codes
+wp.set_module_options(FWD_MODULE_OPTS)
 
 
 class SymmetricCSR:

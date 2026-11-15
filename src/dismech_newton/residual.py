@@ -8,14 +8,17 @@ import numpy as np
 import warp as wp
 from newton import Control, JointType, Model
 
-from .builder import _P, vec5f, vec6f, vec10f, vec12f
+from .builder import _P
 from .collide import Bodies, Mesh, Offset, _slot_edge_t, slot_surface_pair
+from .constants import ADJ_MODULE_OPTS as _ADJ_OPTS
+from .constants import vec5f, vec6f, vec10f, vec11f, vec11i, vec12f, vec21f, vec21i
 from .contact import Arm, Slots, barrier, contact_point, pad_energy, shape_of, slot_map
-from .rod import Rod, _dkappa, _dphi, _geometry, _oriented, rod_dofs, vec11f, vec11i
-from .shell import Shell, _angles, _forms, _points, _row, _whiten, shell_dofs, vec21f, vec21i
+from .rod import Rod, rod_dofs
+from .rod import rod_strain_rate as _rod_strain_rate
+from .shell import Shell, shell_dofs
+from .shell import shell_strain_rate as _shell_strain_rate
 from .state import node
 
-_ADJ_OPTS = {"enable_backward": True, "max_unroll": 32, "optimization_level": 2}
 _MEM_MODES = {"none": 0, "dahl": 0, "elastoplastic": 1, "prony": 2, "bouc_wen": 3}
 _MEM_ATTRS = {1: ("flow", "yield_weight"), 2: ("k_mem", "tau"), 3: ("k_mem", "flow", "bw_sat")}
 @dataclass
@@ -221,18 +224,6 @@ def _mem_ops(N: int, md: int):
         mem_out[t] = out if dt > 0.0 else h
     return mem_step, mem_carry
 @wp.func
-def _rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
-    """Triplet strain and directional strain rate ``J * xd`` without forming the full ``5x11`` matrix."""
-    g, xo = _geometry(_oriented(x, v.sign[t]), v, t), _oriented(xd, v.sign[t])
-    ze, zf = wp.vec3(xo[4] - xo[0], xo[5] - xo[1], xo[6] - xo[2]), wp.vec3(xo[8] - xo[4], xo[9] - xo[5], xo[10] - xo[6])
-    ge, gf = _dphi(g.te_old, g.te, g.ne), _dphi(g.tf_old, g.tf, g.nf)
-    De1, Df1, a1, b1 = _dkappa(g, g.strain[2], g.m2e, g.m2f, -g.m1e, -g.m1f)
-    De2, Df2, a2, b2 = _dkappa(g, g.strain[3], -g.m1e, -g.m1f, -g.m2e, -g.m2f)
-    pe, pf = wp.dot(ge, ze) + xo[3], wp.dot(gf, zf) + xo[7]
-    return g.strain, vec5f(wp.dot(g.te, ze) / g.l0e, wp.dot(g.tf, zf) / g.l0f,
-        wp.dot(De1, ze) + wp.dot(Df1, zf) + a1 * pe + b1 * pf, wp.dot(De2, ze) + wp.dot(Df2, zf) + a2 * pe + b2 * pf,
-        0.5 * wp.dot(g.kb / g.ne, ze) + 0.5 * wp.dot(g.kb / g.nf, zf) - pe + pf)
-@wp.func
 def _rff_loop(z_a: vec5f, z_b: vec5f, fr: wp.array[vec10f], wr: wp.array2d[vec5f],
               w_idx: int, R_: int, lane: int, stride: int, cn: float, iso: int):
     """Strided origin-orthogonal odd RFF sum in a helper function (avoids Warp kernel-loop AD bugs)."""
@@ -315,30 +306,6 @@ def _v11(a: wp.array[float], d: vec11i) -> vec11f:
 def _v21(a: wp.array[float], d: vec21i) -> vec21f:
     return vec21f(a[d[0]], a[d[1]], a[d[2]], a[d[3]], a[d[4]], a[d[5]], a[d[6]], a[d[7]], a[d[8]], a[d[9]], a[d[10]],
                   a[d[11]], a[d[12]], a[d[13]], a[d[14]], a[d[15]], a[d[16]], a[d[17]], a[d[18]], a[d[19]], a[d[20]])
-@wp.func
-def _shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
-    """Face strain and directional strain rate ``J * xd`` without forming the full ``6x21`` matrix."""
-    P, dP, th, dth = _points(x), _points(xd), _angles(x), _angles(xd)
-    eu, ev, deu, dev = _row(P, 1)-_row(P, 0), _row(P, 2)-_row(P, 0), _row(dP, 1)-_row(dP, 0), _row(dP, 2)-_row(dP, 0)
-    dm = wp.vec3(2.0 * wp.dot(eu, deu), wp.dot(eu, dev) + wp.dot(ev, deu), 2.0 * wp.dot(ev, dev))
-    m, g = _forms(P, th, v.sign[f], v.flap[f])
-    n, dn = wp.cross(eu, ev), wp.cross(deu, ev) + wp.cross(eu, dev)
-    nn = wp.length(n)
-    dnn, dg = wp.dot(n / nn, dn), wp.vec3()
-    for i in range(3):
-        j, k = (i + 1) % 3, (i + 2) % 3
-        pj, pk, dpj, dpk = _row(P, j), _row(P, k), _row(dP, j), _row(dP, k)
-        t, dpsi = pk - pj, float(0.0)
-        L = wp.length(t)
-        tn, h, c = t / L, nn / L, g[i] * L / nn
-        if v.flap[f][i] != 0.0:
-            fl, dfl, pi, dpi = _row(P, 3 + i), _row(dP, 3 + i), _row(P, i), _row(dP, i)
-            ng = wp.cross(pj - pk, fl - pk)
-            u1, u2 = n / wp.dot(n, n), ng / wp.dot(ng, ng)
-            dpsi = -0.5 * (wp.dot(u1, L * dpi + wp.dot(pi - pk, tn) * dpj - wp.dot(pi - pj, tn) * dpk)
-                           + wp.dot(u2, L * dfl + wp.dot(fl - pk, tn) * dpj - wp.dot(fl - pj, tn) * dpk))
-        dg[i] = c * (dnn - h * wp.dot(tn, dpk - dpj)) / L + h * (1.0 + c * c) * (dpsi + float(v.sign[f][i]) * dth[i])
-    return _whiten(v, f, m, g), _whiten(v, f, dm, dg)
 @cache
 def _shell_step_fn(md: int):
     """Fused 6D BAC shell strain/rate, RFF reduction, SPD clamping, and memory kernel."""

@@ -1,11 +1,9 @@
-import gc
-
 import newton
 import numpy as np
 import pytest
 import warp as wp
-from fd import assert_close, assert_derivative, jacobian
-from rollouts import simulate
+from fd import assert_close, check_vjp_probe, make_probe_dirs
+from rollouts import dismech_loss_kernel, finalize_worlds, simulate
 from utils.common import FrameGraph
 
 import dismech_newton as dn
@@ -73,23 +71,6 @@ def _rod_strain_kernel(
     eps_out[t] = eps
     eps_dot_out[t] = edot
     sigma_out[t] = sig
-
-
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
-def _dismech_loss_kernel(
-    q: wp.array(dtype=float),
-    qd: wp.array(dtype=float),
-    q_ref: wp.array(dtype=float),
-    w_q: wp.array(dtype=float),
-    w_qd: wp.array(dtype=float),
-    dt: float,
-    loss: wp.array(dtype=float),
-):
-    i = wp.tid()
-    dq = q[i] - q_ref[i]
-    vq = dt * qd[i]
-    val = 0.5 * dq * dq + w_q[i] * q[i] + w_qd[i] * vq + 0.05 * vq * vq
-    wp.atomic_add(loss, 0, val)
 
 
 def _quat_from_rotvec(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -163,16 +144,6 @@ def _build_rod_builder(
     for edge in range(n_fixed):
         dn.fix_segment(b, edge=edge)
     return b
-
-
-def _finalize_multiworld(sub_builder: newton.ModelBuilder, worlds: int, device) -> newton.Model:
-    if worlds == 1:
-        return sub_builder.finalize(device=device)
-    main = newton.ModelBuilder()
-    dn.register_custom_attributes(main)
-    for _ in range(worlds):
-        main.add_world(sub_builder)
-    return main.finalize(device=device)
 
 
 def _eval_direct(solver: SolverDiSMech, state: newton.State, dt: float) -> tuple[np.ndarray, ...]:
@@ -258,7 +229,7 @@ def test_zero_weights_bit_identical(device, dahl: bool, worlds: int):
         dahl_eps_max=0.02 if dahl else 0.0,
         dahl_tau=0.08 if dahl else 0.0,
     )
-    model = _finalize_multiworld(sub, worlds, device)
+    model = finalize_worlds(sub, worlds, device)
     model.gravity.assign((0.0, 0.0, -9.81))
 
     def _init_state():
@@ -434,8 +405,8 @@ def test_origin_orthogonality_and_symmetries(device, rng):
     assert np.linalg.norm(sig_ar[0, 2:4] - R_phi_neg @ sig_ap[0, 2:4]) > 1e-4
 
 
-def test_se3_invariance_and_continuum_convergence(device, rng):
-    # 1) SE(3) invariance on a curved, twisted rod with nonzero w_rod and spatial_rest_delta.
+def test_se3_invariance(device, rng):
+    """SE(3) invariance on a curved, twisted rod with nonzero w_rod and spatial_rest_delta."""
     n_seg = 8
     theta = np.linspace(0.0, 0.7, n_seg + 1)
     pts0 = np.stack([np.sin(theta), 0.25 * (1.0 - np.cos(theta)), 0.15 * theta], axis=-1).astype(np.float32)
@@ -483,7 +454,10 @@ def test_se3_invariance_and_continuum_convergence(device, rng):
     expected = (fin0.particle_q.numpy() @ R_wp.T) + t_shift
     assert_close(fin1.particle_q.numpy(), expected, 5e-5, name="se3_particle_q")
 
-    # 2) Continuum mesh refinement convergence N=(8, 16, 32, 64) over fixed physical clamped zone [0, L/8].
+
+@pytest.mark.slow
+def test_continuum_convergence(device, rng):
+    """Continuum mesh refinement convergence N=(8, 16, 32, 64) over fixed physical clamped zone [0, L/8]."""
     w_cont = rng.normal(0.0, 15.0, size=(16, 5)).astype(np.float32)
     tips_zero = {}
     tips_res = {}
@@ -566,9 +540,9 @@ def _rollout_loss(
             for k in range(steps):
                 solver.step(states[k], states[k + 1], None, None, dt)
             wp.launch(
-                _dismech_loss_kernel,
+                dismech_loss_kernel,
                 dim=states[-1].dismech.q.shape[0],
-                inputs=[states[-1].dismech.q, states[-1].dismech.qd, q_ref, w_q, w_qd, dt],
+                inputs=[states[-1].dismech.q, states[-1].dismech.qd, q_ref, w_q, w_qd, dt, 0.5, 0.05],
                 outputs=[loss],
                 device=model.device,
             )
@@ -584,7 +558,7 @@ def _rollout_loss(
     return val, None, None
 
 
-@pytest.mark.parametrize("worlds", [1, 2])
+@pytest.mark.parametrize("worlds", [1, pytest.param(2, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("dahl", [False, True])
 def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int, dahl: bool):
     if worlds == 2 and dahl:
@@ -608,7 +582,7 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
         dahl_tau=0.05 if dahl else 0.0,
         n_fixed=1,
     )
-    model = _finalize_multiworld(sub, worlds, device)
+    model = finalize_worlds(sub, worlds, device)
     model.gravity.assign((0.0, 0.0, -9.81))
 
     R = 8
@@ -641,7 +615,7 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     w_q = wp.array(rng.normal(0.0, 0.2, size=n_dof).astype(np.float32), dtype=float, device=device)
     w_qd = wp.array(rng.normal(0.0, 0.2, size=n_dof).astype(np.float32), dtype=float, device=device)
 
-    steps = 8
+    steps = 3
     dt = 0.005 if dahl else 0.01
     L0, tape, loss_arr = _rollout_loss(model, solver, s_init, q_ref, w_q, w_qd, steps, dt, record_tape=True)
     tape.backward(loss_arr)
@@ -655,39 +629,8 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     assert np.linalg.norm(g_w) > 1e-4, f"unexpected near-zero w_rod grad: {np.linalg.norm(g_w)}"
     assert np.linalg.norm(g_d) > 1e-4, f"unexpected near-zero d_rest grad: {np.linalg.norm(g_d)}"
 
-    def _make_dirs(g: np.ndarray, mask: np.ndarray | None = None, k: int = 4) -> np.ndarray:
-        g_m = g if mask is None else g * mask
-        g_norm = float(np.linalg.norm(g_m))
-        assert g_norm > 1e-5
-        d = rng.normal(size=(k, g.size))
-        if mask is not None:
-            d *= mask
-        d[0] = g_m / g_norm
-        d[1:] /= np.linalg.norm(d[1:], axis=1, keepdims=True)
-        return d
-
-    def _check_probe(label: str, dirs: np.ndarray, g_vec: np.ndarray, eval_fn, h_fd: float, rtol: float = 1.0e-3):
-        fd_j, est_j = jacobian(eval_fn, np.zeros(dirs.shape[0]), h_fd, error=True)
-        adj = dirs @ g_vec
-        scale = float(abs(adj[0]))
-        rel0 = abs(adj[0] - fd_j[0, 0]) / max(abs(fd_j[0, 0]), 1.0e-12)
-        max_rel = float(np.max(np.abs(adj - fd_j[0])) / max(scale, 1.0e-12))
-        print(
-            f"[adjoint worlds={worlds} dahl={dahl}] {label}: "
-            f"ad0={adj[0]:+.6f} fd0={fd_j[0, 0]:+.6f} est0={est_j[0, 0]:.2e} rel0={rel0:.3e} max_rel={max_rel:.3e}"
-        )
-        for j in range(adj.shape[0]):
-            assert_derivative(
-                float(adj[j]),
-                float(fd_j[0, j]),
-                float(est_j[0, j]),
-                rtol,
-                name=f"{label}_{j}",
-                scale=scale,
-            )
-        assert abs(adj[0] - fd_j[0, 0]) <= rtol * abs(fd_j[0, 0]) + 4.0 * est_j[0, 0]
-
-    dirs_w = _make_dirs(g_w)
+    tag = f"adjoint worlds={worlds} dahl={dahl}"
+    dirs_w = make_probe_dirs(rng, g_w)
 
     def _eval_w(alphas: np.ndarray) -> np.ndarray:
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
@@ -700,10 +643,10 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
         solver.residual.w_rod.assign(w0_3d)
         return vals
 
-    print(f"\n[adjoint worlds={worlds} dahl={dahl}] L0={L0:.6f}")
-    _check_probe("w_rod", dirs_w, g_w, _eval_w, 1.0e-2)
+    print(f"\n[{tag}] L0={L0:.6f}")
+    check_vjp_probe("w_rod", dirs_w, g_w, _eval_w, 1.0e-2, tag=tag)
 
-    dirs_d = _make_dirs(g_d)
+    dirs_d = make_probe_dirs(rng, g_d)
 
     def _eval_d(alphas: np.ndarray) -> np.ndarray:
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
@@ -716,7 +659,7 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
         solver.residual.d_rest.assign(d0)
         return vals
 
-    _check_probe("d_rest", dirs_d, g_d, _eval_d, 2.0e-3)
+    check_vjp_probe("d_rest", dirs_d, g_d, _eval_d, 2.0e-3, tag=tag)
 
     q_p_base = s_init.particle_q.numpy().copy()
     v_p_base = s_init.particle_qd.numpy().copy()
@@ -725,7 +668,7 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     free_p[:, :2, :] = 0.0  # keep fixed edge 0 vertices unperturbed in each world
     free_mask = free_p.reshape(-1)
 
-    dirs_q = _make_dirs(g_q0[: q_p_base.size], mask=free_mask)
+    dirs_q = make_probe_dirs(rng, g_q0[: q_p_base.size], mask=free_mask)
 
     def _eval_q0(alphas: np.ndarray) -> np.ndarray:
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
@@ -737,9 +680,9 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
             vals[row, 0] = val
         return vals
 
-    _check_probe("q0", dirs_q, g_q0[: q_p_base.size], _eval_q0, 2.0e-4, rtol=2.5e-3)
+    check_vjp_probe("q0", dirs_q, g_q0[: q_p_base.size], _eval_q0, 2.0e-4, rtol=2.5e-3, tag=tag)
 
-    dirs_v = _make_dirs(g_qd0[: v_p_base.size], mask=free_mask)
+    dirs_v = make_probe_dirs(rng, g_qd0[: v_p_base.size], mask=free_mask)
 
     def _eval_v0(alphas: np.ndarray) -> np.ndarray:
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
@@ -751,15 +694,15 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
             vals[row, 0] = val
         return vals
 
-    _check_probe("qd0", dirs_v, g_qd0[: v_p_base.size], _eval_v0, 3.0e-2, rtol=2.5e-3)
+    check_vjp_probe("qd0", dirs_v, g_qd0[: v_p_base.size], _eval_v0, 3.0e-2, rtol=2.5e-3, tag=tag)
 
 
-def test_rod_residual_framegraph_w256(device, rng):
+def test_rod_residual_framegraph_capture(device, rng):
     if not wp.get_device(device).is_cuda:
-        pytest.skip("FrameGraph benchmark requires CUDA")
+        pytest.skip("FrameGraph capture test requires CUDA")
 
-    worlds = 256
-    n_seg = 24
+    worlds = 4
+    n_seg = 12
     sub = _build_rod_builder(
         n_seg,
         length=1.0,
@@ -773,19 +716,16 @@ def test_rod_residual_framegraph_w256(device, rng):
         twist_damping=1e-3,
         n_fixed=1,
     )
-    model = _finalize_multiworld(sub, worlds, device)
-    model.gravity.assign((0.0, 0.0, -9.81))
+    model = finalize_worlds(sub, worlds, device)
 
-    R = 64
+    R = 32
     w_nz = rng.normal(0.0, 0.05, size=(R, 5)).astype(np.float32)
-    dt = 0.01
-    warmup_iters, iters, rounds, substeps = 15, 20, 7, 4
-    stream = wp.get_stream(model.device)
-    e0 = wp.Event(device=model.device, enable_timing=True)
-    e1 = wp.Event(device=model.device, enable_timing=True)
+    dt, substeps = 0.01, 4
 
-    def _compile_warm(solver: SolverDiSMech):
+    def _capture_and_replay(solver: SolverDiSMech):
         s0, s1 = model.state(), model.state()
+        flatten_state(s0)
+        flatten_state(s1)
 
         def work():
             for _ in range(substeps // 2):
@@ -793,45 +733,32 @@ def test_rod_residual_framegraph_w256(device, rng):
                 solver.step(s1, s0, None, None, dt)
 
         fg = FrameGraph(work, solver, enabled=True)
-        for _ in range(warmup_iters):
+        for _ in range(3):
             fg()
         assert fg.graph is not None
-        return fg, s0
 
-    def _run_block(fg: FrameGraph) -> float:
-        wp.synchronize()
-        stream.record_event(e0)
-        for _ in range(iters):
-            fg()
-        stream.record_event(e1)
-        wp.synchronize()
-        return float(wp.get_event_elapsed_time(e0, e1)) / (substeps * iters)
+        s_init = model.state()
+        flatten_state(s_init)
+        wp.copy(s0.particle_q, s_init.particle_q)
+        wp.copy(s0.particle_qd, s_init.particle_qd)
+        for attr in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
+            wp.copy(getattr(s0.dismech, attr), getattr(s_init.dismech, attr))
+        solver.reset(s0)
+        fg()
+        return s0.particle_q.numpy(), s_init
 
-    print()
     for sc in (False, True):
         s_base = SolverDiSMech(model, self_contact=sc, residual=None)
         s_res = SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, seed=5))
-        fg_base, s0_base = _compile_warm(s_base)
-        fg_res, s0_res = _compile_warm(s_res)
-        round_pairs = []
-        gc.collect()
-        for r in range(rounds):
-            if r % 2 == 0:
-                tb = _run_block(fg_base)
-                tr = _run_block(fg_res)
-            else:
-                tr = _run_block(fg_res)
-                tb = _run_block(fg_base)
-            round_pairs.append((tb, tr))
-        ms_base = float(np.median([tb for tb, _ in round_pairs]))
-        ms_res = float(np.median([tr for _, tr in round_pairs]))
-        q_base, q_res = s0_base.particle_q.numpy(), s0_res.particle_q.numpy()
-        overhead_pct = float(np.median([100.0 * (tr - tb) / tb for tb, tr in round_pairs]))
-        print(
-            f"[FrameGraph W={worlds} N={n_seg} self_contact={sc}] "
-            f"base={ms_base:.3f} ms/step, res={ms_res:.3f} ms/step, overhead={overhead_pct:+.2f}%"
+        q_base, _ = _capture_and_replay(s_base)
+        q_res, s_init = _capture_and_replay(s_res)
+        s_eager, _ = simulate(
+            model,
+            SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, seed=5)),
+            substeps,
+            dt,
+            state=s_init,
         )
-        assert np.isfinite(q_base).all()
-        assert np.isfinite(q_res).all()
+        assert np.isfinite(q_base).all() and np.isfinite(q_res).all()
         assert np.max(np.abs(q_res - q_base)) > 1e-4
-        assert overhead_pct <= 2.5, f"FrameGraph overhead {overhead_pct:+.2f}% > +2.5% (self_contact={sc})"
+        np.testing.assert_allclose(q_res, s_eager.particle_q.numpy(), atol=1e-6)

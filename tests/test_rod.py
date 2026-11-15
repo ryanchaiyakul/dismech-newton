@@ -162,7 +162,8 @@ def _dahl_quasistatic(force, eps_max, tau, l=0.1):
     return np.array(out)
 
 
-@pytest.mark.parametrize("period", [1.0, 2.0])
+@pytest.mark.slow
+@pytest.mark.parametrize("period", [1.0, pytest.param(2.0, marks=pytest.mark.slow)])
 def test_dahl_loop_matches_closed_form(period):
     """Newton's Dahl hysteresis on one triplet under a tip force ``3 sin(2 pi t / T)`` N (moment ~0.3 K), without
     damping: the curvature against the exact quasi-static loop, whose branches are exponentials toward
@@ -187,6 +188,7 @@ def test_dahl_loop_matches_closed_form(period):
     assert exact[zero] > 0.5 * eps_max  # a set of order eps_max: the loop is open
 
 
+@pytest.mark.slow
 def test_dahl_off_is_elastic():
     """Dahl is off where ``eps_max`` or ``tau`` is 0: the trajectory bit-identical to a rod without it."""
     force = 3.0 * np.sin(np.linspace(0.0, 2.0 * np.pi, 200))
@@ -304,7 +306,8 @@ def test_axial_extension_and_torsion_and_curved_rest():
     assert energies(m3, sim3, s_arc)[1] < 1.0e-12
 
 
-@pytest.mark.parametrize("alpha", [2.0, 5.0])
+@pytest.mark.slow
+@pytest.mark.parametrize("alpha", [pytest.param(2.0, marks=pytest.mark.slow), 5.0])
 def test_nonlinear_elastica_cantilever(alpha):
     """Large-deflection cantilever under vertical tip load ``F = alpha EI / L_eff^2`` (tip sag 49% and 71% of ``L``,
     foreshortening 16% and 39%, where linear beam theory is off by 35% and 133%): matches exact Euler elastica BVP

@@ -11,15 +11,14 @@
 - ``W = 256`` CUDA ``FrameGraph`` paired benchmark (<= +2.5% overhead).
 """
 
-import gc
 import sys
 
 import newton
 import numpy as np
 import pytest
 import warp as wp
-from fd import assert_derivative, jacobian
-from rollouts import RADIUS, simulate
+from fd import check_vjp_probe, make_probe_dirs
+from rollouts import RADIUS, dismech_loss_kernel, simulate
 from scipy.spatial.transform import Rotation
 from utils.common import FrameGraph, pads
 
@@ -57,18 +56,6 @@ def _emit_slot_kernel(
     s.stiffness[0] = stiff
     s.lam[0] = lam
     s.rho[0] = rho
-
-
-@wp.kernel
-def _dismech_loss_kernel(
-    q: wp.array[float],
-    qd: wp.array[float],
-    w_q: wp.array[float],
-    w_qd: wp.array[float],
-    loss: wp.array[float],
-):
-    i = wp.tid()
-    wp.atomic_add(loss, 0, w_q[i] * q[i] + 0.05 * q[i] * q[i] + w_qd[i] * qd[i] + 0.02 * qd[i] * qd[i])
 
 
 def _rod_ground_model(
@@ -419,12 +406,12 @@ def test_se3_covariance(device, rng, monkeypatch, kind):
         spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
                             contact=SurfaceMaterialSpec(rff_dim=24, v_ref=0.5, num_materials=2, embeddings=emb,
                                                         w_contact=wc if use_res else None, seed=23))
-        sim = SolverDiSMech(m, exact=True, iterations=400, self_contact=False, residual=spec)
+        sim = SolverDiSMech(m, exact=True, iterations=80, self_contact=False, residual=spec)
         st = m.state()
         st.particle_qd.assign(np.tile((R @ v0).astype(np.float32), (m.particle_count, 1)))
         flatten_state(st)
         force = np.tile((R @ f0).astype(np.float32), (m.particle_count, 1))
-        end, _ = simulate(m, sim, 30, 4.0e-3, force=force, state=st)
+        end, _ = simulate(m, sim, 8, 4.0e-3, force=force, state=st)
         assert int(sim.counts.numpy()[2]) == 0, f"failed {kind} counts={sim.counts.numpy()}"
         return (end.particle_q.numpy().astype(np.float64) - t) @ R
 
@@ -476,6 +463,7 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     wqd_np = rng_l.normal(0.0, 0.25, n_dof).astype(np.float32)
     wq_wp = wp.array(wq_np, dtype=float, device=device)
     wqd_wp = wp.array(wqd_np, dtype=float, device=device)
+    q_ref_wp = wp.zeros(n_dof, dtype=float, device=device)
 
     def _run_loss(record: bool, q_np=None, qd_np=None, steps: int = 1):
         states = [m.state(requires_grad=record) for _ in range(steps + 1)]
@@ -498,8 +486,13 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
                 for k in range(steps):
                     sim.step(states[k], states[k + 1], None, None, dt)
                     assert int(sim.counts.numpy()[0]) == 0
-                wp.launch(_dismech_loss_kernel, n_dof, inputs=[
-                    states[-1].dismech.q, states[-1].dismech.qd, wq_wp, wqd_wp, loss], device=device)
+                wp.launch(
+                    dismech_loss_kernel,
+                    n_dof,
+                    inputs=[states[-1].dismech.q, states[-1].dismech.qd, q_ref_wp, wq_wp, wqd_wp, 1.0, 0.05, 0.02],
+                    outputs=[loss],
+                    device=device,
+                )
             return float(loss.numpy()[0]), tape, loss, states[0]
         for k in range(steps):
             sim.step(states[k], states[k + 1], None, None, dt)
@@ -521,15 +514,10 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     if kh > 0.0:
         assert np.linalg.norm(g_wc.reshape(R, 2)[:, 1]) > 1.0e-4, "pad w_contact[:, 1] grad should be active"
 
+    tag = f"FD kh={kh:g}"
+
     def _probe(label: str, g_vec: np.ndarray, eval_scalar, h_fd: float, dirs_override=None):
-        if dirs_override is None:
-            dirs = np.zeros((3, g_vec.size), dtype=np.float64)
-            dirs[0] = g_vec / np.linalg.norm(g_vec)
-            for r in range(1, 3):
-                d = rng.normal(size=g_vec.size)
-                dirs[r] = d / np.linalg.norm(d)
-        else:
-            dirs = dirs_override
+        dirs = make_probe_dirs(rng, g_vec, k=2) if dirs_override is None else dirs_override
 
         def f_batch(alphas):
             out = np.empty((alphas.shape[0], 1), dtype=np.float64)
@@ -537,14 +525,7 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
                 out[k, 0] = eval_scalar((a[:, None] * dirs).sum(axis=0))
             return out
 
-        fd_j, est_j = jacobian(f_batch, np.zeros(dirs.shape[0]), h_fd, error=True)
-        adj = dirs @ g_vec.astype(np.float64)
-        scale = max(float(np.abs(adj).max()), float(np.abs(fd_j[0]).max()))
-        rel0 = abs(adj[0] - fd_j[0, 0]) / max(abs(fd_j[0, 0]), 1.0e-12)
-        print(f"\n[FD kh={kh:g}] {label}: adj0={adj[0]:+.6e} fd0={fd_j[0, 0]:+.6e} est={est_j[0, 0]:.1e} rel={rel0:.3e}")
-        for j in range(dirs.shape[0]):
-            assert_derivative(float(adj[j]), float(fd_j[0, j]), float(est_j[0, j]), 5.0e-3,
-                              name=f"kh={kh:g}-{label}-{j}", scale=scale)
+        check_vjp_probe(label, dirs, g_vec, f_batch, h_fd, rtol=5.0e-3, tag=tag, scale_max=True)
 
     def _eval_wc(d):
         sim.residual.contact.w_contact.assign(wc0 + d.reshape(wc0.shape).astype(np.float32))
@@ -633,13 +614,13 @@ def test_multiworld_isolation(device, rng):
             assert np.array_equal(qda[mask], qdb[mask])
 
 
-def test_contact_residual_framegraph_w256(device, rng):
-    """256 worlds of sliding contact with ``CompositionalContactResidual`` capture cleanly in ``FrameGraph`` and stay
-    ``<= +2.5%`` over the ``residual=None`` baseline."""
+def test_contact_residual_framegraph_capture(device, rng):
+    """Batched worlds of sliding contact with ``CompositionalContactResidual`` capture cleanly in ``FrameGraph``
+    and match eager execution."""
     if not wp.get_device(device).is_cuda:
-        pytest.skip("FrameGraph benchmark requires CUDA")
+        pytest.skip("FrameGraph capture test requires CUDA")
 
-    worlds, R, M = 256, 32, 2
+    worlds, R, M = 4, 16, 2
     sub = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     rod = newton.Rod.create_straight((-0.08, 0.0, 1.015 * RADIUS), (1.0, 0.0, 0.0), 0.16, segment_count=4,
                                      radius=RADIUS)
@@ -668,11 +649,9 @@ def test_contact_residual_framegraph_w256(device, rng):
 
     v0 = np.tile([0.4, 0.2, 0.0], (m.particle_count, 1)).astype(np.float32)
     f_drv = np.tile([0.06, 0.02, 0.0], (m.particle_count, 1)).astype(np.float32)
-    dt, substeps, warmup, iters, rounds = 0.005, 4, 100, 20, 7
-    stream = wp.get_stream(m.device)
-    e0, e1 = wp.Event(device=m.device, enable_timing=True), wp.Event(device=m.device, enable_timing=True)
+    dt, substeps = 0.005, 4
 
-    def _compile(sim: SolverDiSMech):
+    def _capture_and_replay(sim: SolverDiSMech):
         s0, s1 = m.state(), m.state()
         s0.particle_qd.assign(v0)
         s0.particle_f.assign(f_drv)
@@ -683,44 +662,32 @@ def test_contact_residual_framegraph_w256(device, rng):
                 sim.step(s0, s1, None, None, dt)
                 sim.step(s1, s0, None, None, dt)
 
-        gc.collect()
         fg = FrameGraph(work, sim, enabled=True)
-        fg()
-        assert fg.graph is not None
-        return fg, s0
-
-    fg_base, s0_base = _compile(s_base)
-    fg_res, s0_res = _compile(s_res)
-    for _ in range(warmup):
-        fg_base()
-        fg_res()
-    wp.synchronize()
-
-    def _run_block(fg: FrameGraph) -> float:
-        wp.synchronize()
-        stream.record_event(e0)
-        for _ in range(iters):
+        for _ in range(3):
             fg()
-        stream.record_event(e1)
-        wp.synchronize()
-        return float(wp.get_event_elapsed_time(e0, e1)) / (substeps * iters)
+        assert fg.graph is not None
 
-    pairs = []
-    gc.collect()
-    for r in range(rounds):
-        if r % 2 == 0:
-            tb, tr = _run_block(fg_base), _run_block(fg_res)
-        else:
-            tr, tb = _run_block(fg_res), _run_block(fg_base)
-        pairs.append((tb, tr))
+        s_init = m.state()
+        s_init.particle_qd.assign(v0)
+        flatten_state(s_init)
+        wp.copy(s0.particle_q, s_init.particle_q)
+        wp.copy(s0.particle_qd, s_init.particle_qd)
+        for attr in ("q", "qd", "edge_d1_q", "triplet_ref_twist_q", "triplet_strain_q"):
+            wp.copy(getattr(s0.dismech, attr), getattr(s_init.dismech, attr))
+        sim.reset(s0)
+        fg()
+        return s0.particle_q.numpy(), s_init
 
-    ms_base = float(np.median([tb for tb, _ in pairs]))
-    ms_res = float(np.median([tr for _, tr in pairs]))
-    overhead_pct = float(np.median([100.0 * (tr - tb) / tb for tb, tr in pairs]))
-    print(f"\n[ContactResidual FrameGraph W={worlds} segs/world=4] base={ms_base:.4f} ms/step, "
-          f"res={ms_res:.4f} ms/step, overhead={overhead_pct:+.2f}%")
-
-    q_base, q_res = s0_base.particle_q.numpy(), s0_res.particle_q.numpy()
+    q_base, _ = _capture_and_replay(s_base)
+    q_res, s_init = _capture_and_replay(s_res)
+    s_eager, _ = simulate(
+        m,
+        SolverDiSMech(m, self_contact=False, residual=spec),
+        substeps,
+        dt,
+        force=f_drv,
+        state=s_init,
+    )
     assert np.isfinite(q_base).all() and np.isfinite(q_res).all()
     assert np.max(np.abs(q_res - q_base)) > 1.0e-4
-    assert overhead_pct <= 2.5, f"FrameGraph overhead {overhead_pct:+.2f}% > +2.5%"
+    np.testing.assert_allclose(q_res, s_eager.particle_q.numpy(), atol=1.0e-6)

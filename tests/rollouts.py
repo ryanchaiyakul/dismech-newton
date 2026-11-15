@@ -710,3 +710,43 @@ class PadRollout(GroundRollout):
         v = super()._velocity(rng, model)
         v[2 : 3 * model.particle_count : 3] = -0.05
         return v
+
+
+def finalize_worlds(
+    sub: newton.ModelBuilder,
+    worlds: int,
+    device,
+    gravity: tuple[float, float, float] | None = (0.0, 0.0, -9.81),
+) -> newton.Model:
+    """Finalize ``sub`` across ``worlds`` replicated Newton worlds with DiSMech custom attributes."""
+    if worlds == 1:
+        m = sub.finalize(device=device)
+    else:
+        mb = newton.ModelBuilder(gravity=gravity if gravity is not None else (0.0, -9.81, 0.0))
+        SolverDiSMech.register_custom_attributes(mb)
+        for _ in range(worlds):
+            mb.add_world(sub)
+        m = mb.finalize(device=device)
+    if gravity is not None:
+        m.gravity.assign(gravity)
+    return m
+
+
+@wp.kernel
+def dismech_loss_kernel(
+    q: wp.array[float],
+    qd: wp.array[float],
+    q_ref: wp.array[float],
+    w_q: wp.array[float],
+    w_qd: wp.array[float],
+    dt: float,
+    c_q2: float,
+    c_qd2: float,
+    loss: wp.array[float],
+):
+    """Smooth quadratic + linear probe loss over generalized ``(q, qd)``."""
+    i = wp.tid()
+    dq = q[i] - q_ref[i]
+    vq = dt * qd[i]
+    val = c_q2 * dq * dq + w_q[i] * q[i] + w_qd[i] * vq + c_qd2 * vq * vq
+    wp.atomic_add(loss, 0, val)

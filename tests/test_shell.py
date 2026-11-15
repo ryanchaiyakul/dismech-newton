@@ -100,7 +100,7 @@ def test_curved_shell_at_rest_stays(rng):
     assert np.abs(moved.particle_q.numpy() - v).max() < 1.0e-6
 
 
-@pytest.mark.parametrize("exact", [False, True])
+@pytest.mark.parametrize("exact", [False, pytest.param(True, marks=pytest.mark.slow)])
 def test_plate_strip_converges_to_beam_theory(exact):
     """Tip deflection of a strip clamped at ``x = 0`` (two node columns) under its weight against ``p L^4 / (8 D)``
     (the clamp at the second column), nu = 0: within 20%, closer on the finer mesh."""
@@ -158,8 +158,19 @@ def test_isotropic_limit(rng):
         np.testing.assert_allclose(b, a, rtol=1e-6, atol=1e-9 * np.abs(a).max())
 
 
-@pytest.mark.parametrize("C", [(2.0e2, 5.0e1, 1.0e1), "isotropic"])
-@pytest.mark.parametrize("theta", [0.0, 0.5 * np.pi, 0.25 * np.pi, 0.3])
+@pytest.mark.parametrize(
+    "C, theta",
+    [
+        pytest.param((2.0e2, 5.0e1, 1.0e1), 0.0, marks=pytest.mark.slow),
+        ((2.0e2, 5.0e1, 1.0e1), 0.3),
+        pytest.param("isotropic", 0.3, marks=pytest.mark.slow),
+        pytest.param((2.0e2, 5.0e1, 1.0e1), 0.5 * np.pi, marks=pytest.mark.slow),
+        pytest.param((2.0e2, 5.0e1, 1.0e1), 0.25 * np.pi, marks=pytest.mark.slow),
+        ("isotropic", 0.0),
+        pytest.param("isotropic", 0.5 * np.pi, marks=pytest.mark.slow),
+        pytest.param("isotropic", 0.25 * np.pi, marks=pytest.mark.slow),
+    ],
+)
 def test_uniaxial_stretch(C, theta):
     """A strip clamped at ``x = 0`` and pulled at ``x = 1`` by a small stress, its weft at ``theta``: the strain in
     its middle third is ``C(theta)^-1 (sigma, 0, 0)`` (the effective modulus, Poisson ratio and shear coupling along
@@ -185,6 +196,7 @@ def test_uniaxial_stretch(C, theta):
     assert np.abs([E[0, 0], E[1, 1], 2.0 * E[0, 1]] - expected).max() < 0.01 * expected[0]
 
 
+@pytest.mark.slow
 def test_plate_strip_bends_along_its_weave():
     """The cantilever strip of the plate test (``nu = 0``), ``bend_aniso = (D, D/4, D/2)``, cut along the weft, the
     warp and at 45 degrees: the tip deflection against ``p L^4 / (8 D_eff)``, ``1 / D_eff`` the bending compliance
@@ -307,6 +319,7 @@ def test_sheet_on_sheet(self_contact):
         assert z.max() < 0.0
 
 
+@pytest.mark.slow
 def test_sheet_over_rod():
     """A coarse sheet dropped across a clamped rod of three long edges: the rod passes between its vertices, so
     the contacts are vertex-edge and edge-edge; nothing comes closer than the summed radii."""
@@ -365,6 +378,7 @@ def test_rod_on_rod():
     assert abs(gaps[-1] - 2 * r) < 0.05 * r  # resting on it
 
 
+@pytest.mark.slow
 def test_rod_on_hammock():
     """A rod dropped on a sheet clamped at its border: it is held above the sheet by the summed radii."""
     rs, rr = 0.002, 0.005
@@ -425,7 +439,10 @@ def sdf(p, shape: str, h: float, z: float = 0.0):
 SHAPES = ["sphere", "box", "mesh"]
 
 
-@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize(
+    "shape",
+    ["sphere", pytest.param("box", marks=pytest.mark.slow), pytest.param("mesh", marks=pytest.mark.slow)],
+)
 def test_sheet_on_shape(shape):
     """A sheet dropped on a shape (no collision pipeline): no vertex, nor any point of a triangle, comes inside its
     offset surface, and the sheet rests on the top at its thickness (its lowest vertex there: the facets crossing a
@@ -458,7 +475,10 @@ def test_sheet_on_shape(shape):
     assert np.abs(sdf(x[top], shape, h, h) - r).min() < 0.3 * r
 
 
-@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize(
+    "shape",
+    ["sphere", pytest.param("box", marks=pytest.mark.slow), pytest.param("mesh", marks=pytest.mark.slow)],
+)
 def test_rod_on_shape(shape):
     """A rod of three long edges dropped across a shape: its middle edge spans the top, so the contact is at the
     edge's interior (a sphere's top, a box's rims); no point of the rod comes inside the offset surface, and it
@@ -504,7 +524,8 @@ def _settle(model, steps: int, dt: float, force=None):
     return simulate(model, SolverDiSMech(model, iterations=30), steps, dt, force=force)[0]
 
 
-@pytest.mark.parametrize("g", [98.1, 981.0])
+@pytest.mark.slow
+@pytest.mark.parametrize("g", [98.1, pytest.param(981.0, marks=pytest.mark.slow)])
 def test_pad_rest_depth(g):
     """A rod and a sheet resting on a pad sink as Winkler's foundation says: a cylinder's line load
     ``kh (4/3) sqrt(2R) delta^(3/2)``, a sheet's pressure ``kh delta`` (the pad's points along rod edges, over
@@ -530,6 +551,7 @@ def test_pad_rest_depth(g):
     assert np.allclose(PAD_TOP + 0.002 - x[:, 2], exact, rtol=1.0e-3)
 
 
+@pytest.mark.slow
 def test_pad_tilt():
     """A stiff rod on a pad with an off-centre load ``P`` tilts as the foundation's force and moment balance says
     (``delta = delta0 + theta s``, Winkler's line load integrated exactly): delta0 within 1%, theta 3% (the rod's own
@@ -560,7 +582,8 @@ def test_pad_tilt():
     assert abs(th / et - 1.0) < 0.03, (th, et)
 
 
-@pytest.mark.parametrize("d", [0.0, 2.0])
+@pytest.mark.slow
+@pytest.mark.parametrize("d", [pytest.param(0.0, marks=pytest.mark.slow), 2.0])
 def test_pad_rebound(d):
     """A rod thrown flat at a pad at ``v_i`` rebounds as Hunt-Crossley's ``F = k delta^n (1 + d v)`` says, whatever
     ``k``, ``n``: ``d v_o + ln(1 - d v_o) = -(d v_i - ln(1 + d v_i))`` (``v_o = v_i`` at ``d = 0``), less backward
@@ -590,6 +613,7 @@ def test_pad_rebound(d):
     assert 0.95 < vo / exact < 0.99, (vo, exact)
 
 
+@pytest.mark.slow
 def test_plate_poisson_anticlastic_saddle():
     """Kirchhoff-Love Poisson coupling ``nu = 0.4`` vs ``nu = 0`` at fixed bending rigidity ``D``: a narrow clamped
     strip relaxes ``M_yy = D (kappa_yy + nu kappa_xx) = 0`` across its free side edges, forming an anticlastic saddle
@@ -619,7 +643,7 @@ def test_plate_poisson_anticlastic_saddle():
     assert 1.10 < sags[0.4] / sags[0.0] < 1.22, sags
 
 
-@pytest.mark.parametrize("kind", ["rod", "shell"])
+@pytest.mark.parametrize("kind", ["rod", pytest.param("shell", marks=pytest.mark.slow)])
 def test_coulomb_inclined_plane_critical_angle(kind):
     """Coulomb critical angle ``arctan(mu)`` (``mu = 0.5 -> 26.6 deg``): on an 18 deg slope a settled rod or shell
     sticks; on a 35 deg slope it slides with ``x(t) = 1/2 g (sin alpha - mu cos alpha) t^2``."""

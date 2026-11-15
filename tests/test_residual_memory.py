@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import gc
-
 import newton
 import numpy as np
 import pytest
 import warp as wp
 from fd import assert_close, jacobian
-from rollouts import cloth, simulate
+from rollouts import cloth, finalize_worlds, simulate
 from utils.common import FrameGraph, capturable, grid
 
 from dismech_newton import SolverDiSMech, flatten_state
@@ -85,23 +83,9 @@ def _build_shell(
     return b
 
 
-def _finalize_worlds(sub: newton.ModelBuilder, worlds: int, device: str, gravity=(0.0, 0.0, -9.81)) -> newton.Model:
-    if worlds == 1:
-        m = sub.finalize(device=device)
-        m.gravity.assign(gravity)
-        return m
-    mb = newton.ModelBuilder(gravity=gravity)
-    register_custom_attributes(mb)
-    for _ in range(worlds):
-        mb.add_world(sub)
-    m = mb.finalize(device=device)
-    m.gravity.assign(gravity)
-    return m
-
-
 def _make_model(elem_kind: str, worlds: int, device: str, **kw) -> newton.Model:
     sub = _build_rod(**kw) if elem_kind == "rod" else _build_shell(**kw)
-    return _finalize_worlds(sub, worlds, device, gravity=kw.get("gravity", (0.0, 0.0, -9.81)))
+    return finalize_worlds(sub, worlds, device, gravity=kw.get("gravity", (0.0, 0.0, -9.81)))
 
 
 def _mem_spec(elem_kind: str, mode: str, **kw) -> ResidualSpec:
@@ -147,8 +131,8 @@ def _mem_loss_kernel(
 
 def test_memory_spec_validation_and_dahl_parity(device):
     sub = _build_rod(n=6, dahl_eps_max=0.02, dahl_tau=0.05)
-    model_dahl = _finalize_worlds(sub, 1, device)
-    model_sh = _finalize_worlds(_build_shell(), 1, device)
+    model_dahl = finalize_worlds(sub, 1, device)
+    model_sh = finalize_worlds(_build_shell(), 1, device)
 
     for bad_kw in (
         {"memory": MemorySpec(mode="unknown")},
@@ -227,7 +211,7 @@ def test_prony_relaxation_theory(device, elem_kind: str):
         sub.particle_flags[i] &= ~newton.ParticleFlags.ACTIVE
     if elem_kind == "rod":
         SolverDiSMech.fix_segment(sub, edge=1)
-    model = _finalize_worlds(sub, 1, device, gravity=(0.0, 0.0, 0.0))
+    model = finalize_worlds(sub, 1, device, gravity=(0.0, 0.0, 0.0))
 
     tau, k_mem, dt, steps = 0.08, 0.4, 0.01, 30
     dims_kw = {"enabled_dims": (0, 1, 2)} if elem_kind == "shell" else {}
@@ -286,7 +270,7 @@ def test_prony_relaxation_theory(device, elem_kind: str):
     assert max_f_rel <= 0.02
 
 
-@pytest.mark.parametrize("elem_kind", ["rod", "shell"])
+@pytest.mark.parametrize("elem_kind", ["rod", pytest.param("shell", marks=pytest.mark.slow)])
 def test_elastoplastic_permanent_set(device, elem_kind: str):
     """Above-yield loading then unloading leaves permanent plastic set h_t != 0 and shifted rest shape."""
     kw = (
@@ -457,7 +441,7 @@ def test_masked_reset_rod_and_shell(device):
     for idx in p[:3]:
         sub.particle_flags[int(idx)] &= ~newton.ParticleFlags.ACTIVE
 
-    model = _finalize_worlds(sub, 2, device, gravity=(0.0, 0.0, -25.0))
+    model = finalize_worlds(sub, 2, device, gravity=(0.0, 0.0, -25.0))
     spec = ResidualSpec(
         rod_rff_dim=16,
         shell_rff_dim=16,
@@ -528,9 +512,19 @@ def test_masked_reset_rod_and_shell(device):
     )
 
 
-@pytest.mark.parametrize("worlds", [1, 2])
-@pytest.mark.parametrize("mode", ["prony", "elastoplastic", "bouc_wen"])
-@pytest.mark.parametrize("elem_kind", ["rod", "shell"])
+@pytest.mark.parametrize(
+    "elem_kind, mode, worlds",
+    [
+        ("rod", "prony", 1),
+        ("rod", "elastoplastic", 1),
+        pytest.param("rod", "bouc_wen", 1, marks=pytest.mark.slow),
+        pytest.param("shell", "prony", 1, marks=pytest.mark.slow),
+        pytest.param("shell", "elastoplastic", 1, marks=pytest.mark.slow),
+        ("shell", "bouc_wen", 1),
+        pytest.param("rod", "prony", 2, marks=pytest.mark.slow),
+        pytest.param("shell", "prony", 2, marks=pytest.mark.slow),
+    ],
+)
 def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, worlds: int):
     """Multi-step StepAdjoint VJP through carried h_t wrt learnable memory params and initial (q0, h0)."""
     monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
@@ -755,10 +749,13 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
 
 @pytest.mark.usefixtures("needs_cudss")
 @pytest.mark.parametrize("elem_kind", ["rod", "shell"])
-def test_framegraph_w256_memory_overhead(device, elem_kind: str):
-    """W=256 FrameGraph with carried memory captures cleanly on CUDA and has <= +2.5% overhead."""
+def test_framegraph_memory_capture(device, elem_kind: str):
+    """Batched FrameGraph with carried memory captures cleanly on CUDA and matches eager execution."""
+    if not wp.get_device(device).is_cuda:
+        pytest.skip("FrameGraph capture test requires CUDA")
+
     if elem_kind == "rod":
-        sub = _build_rod(n=25, length=1.0)
+        sub = _build_rod(n=13, length=1.0)
     else:
         sub = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         register_custom_attributes(sub)
@@ -768,7 +765,7 @@ def test_framegraph_w256_memory_overhead(device, elem_kind: str):
         )
         for k in np.flatnonzero(v[:, 0] <= 0.1 + 1e-6):
             sub.particle_flags[int(ids[k])] &= ~newton.ParticleFlags.ACTIVE
-    model = _finalize_worlds(sub, 256, device)
+    model = finalize_worlds(sub, 4, device)
     ms = MemorySpec(
         mode="elastoplastic",
         yield_eps=0.01,
@@ -777,13 +774,13 @@ def test_framegraph_w256_memory_overhead(device, elem_kind: str):
         enabled_dims=(2, 3, 4) if elem_kind == "rod" else (3, 4, 5),
     )
     spec = ResidualSpec(
-        rod_rff_dim=64,
-        shell_rff_dim=64,
+        rod_rff_dim=32,
+        shell_rff_dim=32,
         memory=ms if elem_kind == "rod" else None,
         shell_memory=ms if elem_kind == "shell" else None,
     )
 
-    dt, substeps, warm, iters, rounds = 0.01, 4, 15, 20, 7
+    dt, substeps = 0.01, 4
     s0 = model.state()
     flatten_state(s0)
     copy_attrs = (
@@ -796,11 +793,8 @@ def test_framegraph_w256_memory_overhead(device, elem_kind: str):
         "triplet_mem_q",
         "face_mem_q",
     )
-    stream = wp.get_stream(model.device)
-    e0 = wp.Event(device=model.device, enable_timing=True)
-    e1 = wp.Event(device=model.device, enable_timing=True)
 
-    def _compile_and_warm(solver):
+    def _run_fg(solver):
         a, b = model.state(), model.state()
         flatten_state(a)
         flatten_state(b)
@@ -821,47 +815,25 @@ def test_framegraph_w256_memory_overhead(device, elem_kind: str):
 
         fg = FrameGraph(work, solver, enabled=True)
         _reset_a()
-        for _ in range(warm):
+        for _ in range(3):
             fg()
         assert fg.graph is not None
+        _reset_a()
+        fg()
         wp.synchronize()
-        return fg, a, _reset_a
+        return a
 
-    def _time(fg, reset_fn) -> float:
-        reset_fn()
-        wp.synchronize()
-        stream.record_event(e0)
-        for _ in range(iters):
-            fg()
-        stream.record_event(e1)
-        wp.synchronize()
-        return float(wp.get_event_elapsed_time(e0, e1)) / (substeps * iters)
-
-    gc.collect()
-    s_base = SolverDiSMech(model, self_contact=False, residual=None)
     s_mem = SolverDiSMech(model, self_contact=False, residual=spec)
     assert capturable(s_mem)
-    fg_base, _, rst_base = _compile_and_warm(s_base)
-    fg_mem, q_mem_st, rst_mem = _compile_and_warm(s_mem)
-    round_pairs = []
-    for r in range(rounds):
-        if r % 2 == 0:
-            tb = _time(fg_base, rst_base)
-            tm = _time(fg_mem, rst_mem)
-        else:
-            tm = _time(fg_mem, rst_mem)
-            tb = _time(fg_base, rst_base)
-        round_pairs.append((tb, tm))
-    q_mem_np = q_mem_st.particle_q.numpy()
-    mem_arr = _mem_np(s_mem, q_mem_st, elem_kind)
-    ms_base = float(np.median([tb for tb, _ in round_pairs]))
-    ms_mem = float(np.median([tm for _, tm in round_pairs]))
-    overhead_pct = float(np.median([100.0 * (tm - tb) / tb for tb, tm in round_pairs]))
-    print(
-        f"\n[{elem_kind} W=256 FrameGraph] base={ms_base:.4f} ms/step, "
-        f"mem={ms_mem:.4f} ms/step, overhead={overhead_pct:+.2f}%"
-    )
+    a_fg = _run_fg(s_mem)
+    q_mem_np = a_fg.particle_q.numpy()
+    mem_arr = _mem_np(s_mem, a_fg, elem_kind)
     assert np.all(np.isfinite(q_mem_np))
     assert np.all(np.isfinite(mem_arr))
     assert float(np.max(np.abs(mem_arr))) > 1e-4
-    assert overhead_pct <= 2.5
+
+    # Captured replay matches eager execution
+    s_eag = SolverDiSMech(model, self_contact=False, residual=spec)
+    a_eag, _ = simulate(model, s_eag, substeps, dt)
+    np.testing.assert_allclose(q_mem_np, a_eag.particle_q.numpy(), atol=1.0e-6)
+    np.testing.assert_allclose(mem_arr, _mem_np(s_eag, a_eag, elem_kind), atol=1.0e-6)

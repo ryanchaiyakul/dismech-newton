@@ -29,8 +29,12 @@ def _free(kind: str):
 
 @pytest.mark.parametrize(
     "kind, options",
-    [("rod", {}), ("rod", {"exact": True, "iterations": 30}), ("sheet", {}),
-     ("sheet", {"exact": True, "iterations": 30})],
+    [
+        ("rod", {}),
+        pytest.param("rod", {"exact": True, "iterations": 30}, marks=pytest.mark.slow),
+        ("sheet", {}),
+        pytest.param("sheet", {"exact": True, "iterations": 30}, marks=pytest.mark.slow),
+    ],
     ids=["rod-admm", "rod-exact", "sheet-admm", "sheet-exact"],
 )
 def test_free_body_keeps_momentum_and_loses_energy(rng, kind, options):
@@ -68,6 +72,7 @@ def test_free_body_keeps_momentum_and_loses_energy(rng, kind, options):
     simulate(model, solver, 100, 0.01, state=s0, on_step=check)
 
 
+@pytest.mark.slow
 def test_midpoint_conserves_total_energy():
     """An undamped 3D helical cantilever swinging nonlinearly under gravity with ``theta = 0.5, exact = True``: kinetic
      and potential energy trade over a full swing while total Hamiltonian ``K + V_el + V_g`` stays constant to <0.5% of
@@ -310,6 +315,7 @@ def _rollout(model, steps, reset_at=None, worlds=()):
     return s0.dismech.q.numpy(), world
 
 
+@pytest.mark.slow
 def test_masked_reset_replays_a_fresh_start():
     """Helices dropped on the ground for 40 steps (world 1 moves 1.9 cm, its twist 0.08 rad), then reset by
     ``world_mask``, then 40 more steps. Both worlds reset: the same as 40 steps from the start. World 1 alone: it

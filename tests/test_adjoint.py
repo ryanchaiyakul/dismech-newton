@@ -14,8 +14,8 @@ EXACT = {"exact": True, "iterations": 30, "self_contact": False}
 
 @pytest.mark.parametrize(
     "options, drive",
-    [(EXACT, 0.0), ({"iterations": 300, "self_contact": False}, 0.0), (EXACT, 2.0e-3),
-     ({**EXACT, "theta": 0.5}, 0.0)],
+    [(EXACT, 0.0), pytest.param({"iterations": 300, "self_contact": False}, 0.0, marks=pytest.mark.slow),
+     (EXACT, 2.0e-3), ({**EXACT, "theta": 0.5}, 0.0)],
     ids=["exact", "admm", "driven", "midpoint"],
 )
 def test_step_adjoint_matches_finite_differences(rng, options, drive):
@@ -69,7 +69,11 @@ class DahlRollout(ClampedRollout):
     rod_options = dict(ClampedRollout.rod_options, dahl_eps_max=0.1, dahl_tau=0.05)
 
 
-@pytest.mark.parametrize("options", [EXACT, {"iterations": 300, "self_contact": False}], ids=["exact", "admm"])
+@pytest.mark.parametrize(
+    "options",
+    [EXACT, pytest.param({"iterations": 300, "self_contact": False}, marks=pytest.mark.slow)],
+    ids=["exact", "admm"],
+)
 def test_dahl_adjoint_matches_finite_differences(rng, options):
     """With Dahl hysteresis (its tangent ``sigma_max / tau`` twice the bend stiffness): the stress is state, carried
     across steps by the exact law, and its adjoint with it, so gradients reach the stiffness through ``sigma_max``
@@ -77,6 +81,7 @@ def test_dahl_adjoint_matches_finite_differences(rng, options):
     DahlRollout(rng).check(options, fd_options=EXACT)
 
 
+@pytest.mark.slow
 def test_proxy_pin_adjoint_matches_finite_differences(rng, monkeypatch):
     """A rod pinned by a ball joint (:class:`~dismech_newton.coupling.ProxyPins`) to a free 6-DOF proxy body
     (:class:`~dismech_newton.coupling.ProxyArm`), chained across multiple steps: gradients wrt rod parameters, states,

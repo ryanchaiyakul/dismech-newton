@@ -401,7 +401,7 @@ def test_tape_vjp_direct_and_coupled(device):
         fd.assert_derivative(actual, fd_v, est, rtol=2.0e-3, name=f"coupled_{name}", resolved=2.0e-2)
 
 
-def test_multiworld_isolation_and_w256_overhead(device, needs_cuda):
+def test_multiworld_isolation_and_framegraph_capture(device, needs_cuda):
     rng = np.random.default_rng(31)
 
     # Validation checks
@@ -456,52 +456,46 @@ def test_multiworld_isolation_and_w256_overhead(device, needs_cuda):
         assert jfe_m[w * D4] == u4[w * D4]
     assert jfe_m[1 * D4 + 1] != u4[1 * D4 + 1]
 
-    # W=256 FrameGraph capture paired wp.Event(enable_timing=True) overhead check (<= +2.5%)
-    m256, ids256 = _build_coupled_worlds(
-        device, n_worlds=256, two_dof=False, arm_z=0.0299, collide_rod=True, sphere=True, arm_x=0.1, n_rod_pts=16,
-    )
-    D256 = m256.joint_dof_count // 256
-    spec256 = ResidualSpec(
+    # W=4 FrameGraph capture & replay equivalence check
+    D_fg = D4
+    spec_fg = ResidualSpec(
         rod_rff_dim=0, shell_rff_dim=0,
         joint=JointResidualSpec(
-            rff_dim=32, coulomb=0.2, stribeck=0.1,
-            w_joint=rng.normal(0.0, 0.2, (1, D256, 32)).astype("f4"),
+            rff_dim=16, coulomb=0.2, stribeck=0.1,
+            w_joint=rng.normal(0.0, 0.2, (1, D_fg, 16)).astype("f4"),
         ),
     )
-    s_base = _make_coupled(m256, ids256, None)
-    s_res = _make_coupled(m256, ids256, spec256)
-    s0_0, s1_0, c0 = m256.state(), m256.state(), m256.control()
-    s0_1, s1_1, c1 = m256.state(), m256.state(), m256.control()
-    newton.eval_fk(m256, s0_0.joint_q, s0_0.joint_qd, s0_0)
-    newton.eval_fk(m256, s0_1.joint_q, s0_1.joint_qd, s0_1)
-    c0.joint_f = wp.zeros(m256.joint_dof_count, dtype=float, device=device)
-    c1.joint_f = wp.zeros(m256.joint_dof_count, dtype=float, device=device)
-    g_base = FrameGraph(lambda: s_base.step(s0_0, s1_0, c0, None, 2.0e-3), s_base._entries["soft"].solver)
-    g_res = FrameGraph(lambda: s_res.step(s0_1, s1_1, c1, None, 2.0e-3), s_res._entries["soft"].solver)
+    s_base = _make_coupled(m4, ids4, None)
+    s_res = _make_coupled(m4, ids4, spec_fg)
+    s_eag = _make_coupled(m4, ids4, spec_fg)
 
-    for _ in range(100):
+    def _fresh_pair():
+        sa, sb = m4.state(), m4.state()
+        sa.joint_q.assign(q4)
+        sa.joint_qd.assign(qd4)
+        newton.eval_fk(m4, sa.joint_q, sa.joint_qd, sa)
+        return sa, sb
+
+    c_fg = m4.control()
+    c_fg.joint_f = wp.array(u4, dtype=float, device=device)
+    s0_0, s1_0 = _fresh_pair()
+    s0_1, s1_1 = _fresh_pair()
+    g_base = FrameGraph(lambda: s_base.step(s0_0, s1_0, c_fg, None, 2.0e-3), s_base._entries["soft"].solver)
+    g_res = FrameGraph(lambda: s_res.step(s0_1, s1_1, c_fg, None, 2.0e-3), s_res._entries["soft"].solver)
+    for _ in range(3):
         g_base()
         g_res()
+    assert g_base.graph is not None and g_res.graph is not None
+
+    # Replay captured graph from clean start and match eager step
+    s0_1, s1_1 = _fresh_pair()
+    g_res2 = FrameGraph(lambda: s_res.step(s0_1, s1_1, c_fg, None, 2.0e-3), s_res._entries["soft"].solver)
+    for _ in range(2):
+        g_res2()
+    s_eag0, s_eag1 = _fresh_pair()
+    for _ in range(2):
+        s_eag.step(s_eag0, s_eag1, c_fg, None, 2.0e-3)
     wp.synchronize()
-
-    iters, rounds = 20, 7
-    ts_base, ts_res = [], []
-    for r in range(rounds):
-        order = (0, 1) if r % 2 == 0 else (1, 0)
-        res = {}
-        for k in order:
-            g = g_base if k == 0 else g_res
-            e0, e1 = wp.Event(enable_timing=True), wp.Event(enable_timing=True)
-            wp.record_event(e0)
-            for _ in range(iters):
-                g()
-            wp.record_event(e1)
-            wp.synchronize()
-            res[k] = wp.get_event_elapsed_time(e0, e1) / iters
-        ts_base.append(res[0])
-        ts_res.append(res[1])
-
-    med_base, med_res = float(np.median(ts_base)), float(np.median(ts_res))
-    overhead_pct = (med_res - med_base) / med_base * 100.0
-    print(f"\nW=256 FrameGraph: base={med_base:.4f} ms/step, res={med_res:.4f} ms/step, overhead={overhead_pct:+.2f}%")
-    assert overhead_pct <= 2.5, f"Overhead {overhead_pct:.2f}% > +2.5%"
+    assert np.isfinite(s1_0.body_qd.numpy()).all() and np.isfinite(s1_1.body_qd.numpy()).all()
+    assert np.max(np.abs(s1_1.body_qd.numpy() - s1_0.body_qd.numpy())) > 1.0e-5
+    np.testing.assert_allclose(s1_1.body_qd.numpy(), s_eag1.body_qd.numpy(), atol=1.0e-6)

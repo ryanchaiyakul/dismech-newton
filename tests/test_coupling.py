@@ -141,6 +141,7 @@ def test_proxy_arm_last_wrench_equilibrium():
     assert np.all(solver._proxy_arm.last_wrench.numpy() == 0.0)
 
 
+@pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda", "mujoco")
 def test_admm_entry(rng):
     """The solver as an entry of Newton's ``SolverCoupledADMM`` with a MuJoCo box: no gravity, a rod thrown at the
@@ -233,6 +234,7 @@ def _proxy_scene(builder, body, rod, mu, rigid_contacts=True, pin=None, fixed=Fa
     return model, solver, pipeline, s0, s1
 
 
+@pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda", "mujoco")
 def test_proxy_momentum(rng):
     """The solver as Newton's ``SolverCoupledProxy`` destination, a free MuJoCo box its proxy: linear momentum stays to
@@ -272,6 +274,7 @@ def test_proxy_momentum(rng):
     assert deepest < 0.4 * r, deepest
 
 
+@pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda", "mujoco")
 def test_proxy_pin(rng):
     """A rod pinned by a Newton ball joint to a free MuJoCo box (:class:`~dismech_newton.coupling.ProxyPins`), no
@@ -326,6 +329,7 @@ def test_proxy_pin(rng):
     assert mb * np.linalg.norm(s0.body_qd.numpy()[body, :3]) > 0.3 * np.linalg.norm(p0), "the rod did not drag the box"
 
 
+@pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda", "mujoco")
 def test_proxy_impact():
     """A free MuJoCo box dropped 1 cm onto a rod clamped along its length through ``SolverCoupledProxy``."""
@@ -356,6 +360,7 @@ def test_proxy_impact():
     assert abs(np.mean(f) - weight) < 1.0e-2 * weight, (np.mean(f), weight)
 
 
+@pytest.mark.slow
 @pytest.mark.usefixtures("needs_cuda", "mujoco")
 def test_proxy_static_load():
     """A rod resting across a free MuJoCo box on MuJoCo's ground, off its centre by ``a``, through

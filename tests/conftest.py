@@ -4,6 +4,7 @@ never shows; run it before merging kernel changes), ``--seeds N`` runs every see
 first is the fast loop's): what the tolerances are checked against. ``--cubin-arch``/``--cubin`` build and load the
 pushed commits' T4 kernel cache (``scripts/warp_cache.py``)."""
 
+import gc
 import re
 import zlib
 
@@ -86,6 +87,19 @@ def rng(request, seed):
     nodeid = re.sub(r"\[seed\d+\]|-seed\d+|seed\d+-", "", request.node.nodeid)
     base = zlib.crc32(nodeid.encode())
     return np.random.default_rng((base, seed) if seed else base)
+
+
+def pytest_runtest_setup(item):
+    """Pause automatic cyclic GC during tests so ``wp.Graph.__del__`` never runs mid-``wp.capture_if``."""
+    gc.disable()
+
+
+def pytest_runtest_teardown(item, nextitem):
+    """Reclaim dead ``wp.Graph`` wrappers outside ``wp.ScopedCapture`` so cyclic GC never runs during capture."""
+    gc.enable()
+    gc.collect(1)
+    if nextitem is None or nextitem.module is not item.module:
+        gc.collect()
 
 
 # -- requirements: skip unless ``--device`` is CUDA (with the library) ----------------------

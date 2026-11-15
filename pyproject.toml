@@ -68,15 +68,18 @@ torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_pla
 dev = [
     "gitpython>=3.2.1",
     "pytest>=9.1.1",
+    "pytest-benchmark>=5.1.0",
     "ruff>=0.16.10",
-    "usd-core>=25.11",  # tests/test_splat.py's USD export
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["examples"]  # tests/test_splat.py: examples/utils/splat.py
-addopts = ["-rs", "-m", "not slow"]  # list why tests skipped (most need CUDA); `-m slow` runs the slow ones
-markers = ["slow: over the fast loop's budget (the examples)"]
+pythonpath = ["examples"]  # utils.common
+addopts = ["-rs", "-m", "not slow and not benchmark_scene"]  # list why tests skipped (most need CUDA); `-m slow` runs the slow ones
+markers = [
+    "slow: over the fast loop's budget (the examples)",
+    "benchmark_scene: end-to-end canonical Newton example benchmarks",
+]
 
 [tool.ruff]
 line-length = 120

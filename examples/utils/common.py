@@ -13,6 +13,7 @@
 - :func:`cached`: results that take minutes, computed once per configuration.
 """
 
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -144,8 +145,14 @@ class FrameGraph:
             return
         self.work()
         if self.enabled and capturable(self.solver):
-            with wp.ScopedCapture() as capture:
-                self.work()
+            was_gc = gc.isenabled()
+            gc.disable()
+            try:
+                with wp.ScopedCapture() as capture:
+                    self.work()
+            finally:
+                if was_gc:
+                    gc.enable()
             self.graph = capture.graph
 
 
@@ -177,11 +184,17 @@ class TapedGraph:
         self.tape.backward()
         if capturable(self.solver):  # a capture runs nothing: the gradients just computed stay
             tape = wp.Tape()
-            with wp.ScopedCapture() as forward:
-                with tape:
-                    output = self.run()
-            with wp.ScopedCapture() as backward:
-                tape.backward()
+            was_gc = gc.isenabled()
+            gc.disable()
+            try:
+                with wp.ScopedCapture() as forward:
+                    with tape:
+                        output = self.run()
+                with wp.ScopedCapture() as backward:
+                    tape.backward()
+            finally:
+                if was_gc:
+                    gc.enable()
             self.tape, self.output, self.graphs = tape, output, (forward.graph, backward.graph)
 
 

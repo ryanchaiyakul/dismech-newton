@@ -50,3 +50,52 @@ def assert_derivative(actual: float, fd: float, est: float, rtol: float, name: s
         f"{rtol:g} * scale {scale:.2e} + {noise:g} * {est:.1e}")
     if resolved is not None:
         assert est <= resolved * abs(fd), f"{name}: differences {fd:.6e} unresolved: error estimate {est:.1e}"
+
+
+def make_probe_dirs(rng, g: np.ndarray, mask: np.ndarray | None = None, k: int = 2) -> np.ndarray:
+    """Return ``(k, g.size)`` probe directions: normalized (masked) gradient plus ``k - 1`` unit random vectors."""
+    g_m = g if mask is None else g * mask
+    g_norm = float(np.linalg.norm(g_m))
+    assert g_norm > 1e-5, f"gradient norm too small to probe: {g_norm}"
+    d = rng.normal(size=(k, g.size))
+    if mask is not None:
+        d *= mask
+    d[0] = g_m / g_norm
+    if k > 1:
+        d[1:] /= np.linalg.norm(d[1:], axis=1, keepdims=True)
+    return d
+
+
+def check_vjp_probe(
+    label: str,
+    dirs: np.ndarray,
+    g_vec: np.ndarray,
+    eval_fn,
+    h_fd: float,
+    rtol: float = 1.0e-3,
+    *,
+    tag: str = "",
+    scale_max: bool = False,
+):
+    """Compare ``dirs @ g_vec`` against central Richardson FD ``jacobian(eval_fn, 0, h_fd)``."""
+    fd_j, est_j = jacobian(eval_fn, np.zeros(dirs.shape[0]), h_fd, error=True)
+    adj = dirs @ np.asarray(g_vec, dtype=np.float64)
+    scale = max(float(np.abs(adj).max()), float(np.abs(fd_j[0]).max())) if scale_max else float(abs(adj[0]))
+    prefix = f"[{tag}] " if tag else ""
+    rel0 = abs(adj[0] - fd_j[0, 0]) / max(abs(fd_j[0, 0]), 1.0e-12)
+    max_rel = float(np.max(np.abs(adj - fd_j[0])) / max(scale, 1.0e-12))
+    print(
+        f"{prefix}{label}: ad0={adj[0]:+.6e} fd0={fd_j[0, 0]:+.6e} est0={est_j[0, 0]:.1e} "
+        f"rel0={rel0:.3e} max_rel={max_rel:.3e}"
+    )
+    for j in range(adj.shape[0]):
+        assert_derivative(
+            float(adj[j]),
+            float(fd_j[0, j]),
+            float(est_j[0, j]),
+            rtol,
+            name=f"{label}_{j}",
+            scale=scale,
+        )
+    if not scale_max:
+        assert abs(adj[0] - fd_j[0, 0]) <= rtol * abs(fd_j[0, 0]) + 4.0 * est_j[0, 0]

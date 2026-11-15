@@ -44,6 +44,7 @@ def test_ground_adjoint_matches_finite_differences(rng, mu, v_mean, checks):
 SLIDE = pytest.mark.parametrize("mu", [0.3], ids=["slide"])
 
 
+@pytest.mark.slow
 @SLIDE
 def test_rod_contact_adjoint_matches_finite_differences(rng, mu, monkeypatch):
     """Rod-rod (edge-edge): the closest points and normal the step takes from ``q_in`` recomputed from it. Half the
@@ -72,7 +73,15 @@ def test_hydroelastic_pad_adjoint_matches_finite_differences(rng, mu, monkeypatc
 
 
 @SLIDE
-@pytest.mark.parametrize("scene", ["ground", "sphere", "foot", "edge"])
+@pytest.mark.parametrize(
+    "scene",
+    [
+        "ground",
+        pytest.param("sphere", marks=pytest.mark.slow),
+        pytest.param("foot", marks=pytest.mark.slow),
+        pytest.param("edge", marks=pytest.mark.slow),
+    ],
+)
 def test_sheet_contact_adjoint_matches_finite_differences(rng, scene, mu, monkeypatch):
     """A sheet's vertex on the ground and on a sphere, a rod's node on a triangle, a rod's edge across the sheet's
     edge. Solved exactly: ADMM's elastic splitting leaves float32 noise that a light sheet's differences do not

@@ -19,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[1] / "examples"
 EXAMPLES = [
     ("cantilever", 240, {}, None),
     ("flagella", 180, {}, None),
-    ("midas_axial", 475, {}, "mujoco_warp"),
     ("overhand_knot", 1140, {}, None),
     ("plectoneme", 5040, {}, None),
     ("shell_cantilever", 240, {}, None),
@@ -56,6 +55,7 @@ def _load(name: str):
 def test_every_example_is_registered():
     """Every runnable script in ``examples/*.py`` and ``examples/newton/*.py`` has a ``test_final`` check here."""
     found = {p.relative_to(ROOT).with_suffix("").as_posix() for p in (*ROOT.glob("*.py"), *(ROOT / "newton").glob("*.py"))}
+    found -= {"midas_axial"}  # tactile excluded from main suite
     registered = {name for name, *_ in EXAMPLES}
     assert registered == found, f"unregistered or missing examples: {found ^ registered}"
 

@@ -10,8 +10,9 @@ import warp as wp
 from newton import Model
 
 from ..constants import ADJ_MODULE_OPTS, vec5f, vec6f, vec10f, vec11f, vec11i, vec12f, vec21f, vec21i
-from ..rod import Rod, rod_dofs, rod_strain_rate
-from ..shell import Shell, shell_dofs, shell_strain_rate
+from ..elements.rod import Rod, rod_dofs, rod_strain_rate
+from ..elements.shell import Shell, shell_dofs, shell_strain_rate
+from ..worlds import elem_world_indices
 
 
 @wp.struct
@@ -69,26 +70,6 @@ def clone_if_bound(obj):
     cloned._src = {}
     cloned._bound = False
     return cloned
-
-
-def model_world_info(model: Model) -> tuple[np.ndarray, bool, int]:
-    """Return ``(particle_world, has_global_particles, num_param_worlds)`` for a Newton ``model``."""
-    pw = model.particle_world.numpy() if model.particle_count else np.zeros(0, np.int32)
-    has_global = bool(model.world_count > 1 and (pw < 0).any())
-    nw = 1 if (has_global or not pw.size) else int(np.maximum(pw, 0).max(initial=0)) + 1
-    return pw, has_global, nw
-
-
-def elem_world_indices(model: Model, elem) -> wp.array:
-    """Per-element parameter world index ``wp.array[wp.int32]`` (``0`` when global particles exist)."""
-    pw, has_global, _ = model_world_info(model)
-    n = int(elem.count)
-    if has_global or not n:
-        ew = np.zeros(n, dtype=np.int32)
-    else:
-        nodes = elem.dofs()[:, 0] // 3
-        ew = np.maximum(pw[nodes], 0).astype(np.int32)
-    return wp.array(ew, dtype=wp.int32, device=elem.params.device)
 
 
 def _to_grad_array(arr, dtype, expected_shapes: tuple[tuple[int, ...], ...], device, name: str) -> wp.array:

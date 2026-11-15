@@ -53,8 +53,7 @@ from .contact import (
     slot_roll,
 )
 from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, proxy_step
-from .linear import _convert, sparse_solver
-from .state import (
+from .dofs import (
     Dofs,
     bind_dofs,
     diagonal_kernel,
@@ -66,6 +65,7 @@ from .state import (
     scatter_node,
     suspended_tape,
 )
+from .linear import _convert, sparse_solver
 
 
 class StepAdjoint:

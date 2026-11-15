@@ -36,7 +36,8 @@ from .constants import (
     SIDES,
 )
 from .contact import Arm, Slots, _barrier_force, clear, contact_point, emit, pair_fixed, pair_point, shape_of
-from .state import node
+from .dofs import node
+from .worlds import world_shift
 
 wp.set_module_options(FWD_MODULE_OPTS)
 
@@ -171,7 +172,7 @@ def _mesh(model: Model, device) -> Mesh:
     ):
         value = np.asarray(value)
         setattr(m, name, wp.array(value if dtype is float else value.astype(np.int32), dtype=dtype, device=device))
-    m.shift = wp.array(_world_shift(model), dtype=wp.vec3, device=device)
+    m.shift = wp.array(world_shift(model), dtype=wp.vec3, device=device)
     ns_attr = getattr(der, "surface_id", None) if der is not None else None
     nu_attr = getattr(der, "surface_u", None) if der is not None else None
     ss_attr = getattr(der, "shape_surface_id", None) if der is not None else None
@@ -195,23 +196,6 @@ def _mesh(model: Model, device) -> Mesh:
     m.shape_surf = wp.array(shape_surf, dtype=wp.int32, device=device)
     m.shape_u = wp.array(shape_u, dtype=wp.vec3, device=device)
     return m
-
-
-def _world_shift(model: Model) -> np.ndarray:
-    """Per node a shift of its world's boxes in the trees: the worlds on a grid of cells 4 times the largest world's
-    extent (plus 1 m) apart, so a query meets only its own world's (fewer, if a world moves that far: then the world
-    filter still holds). None with one world, or with global nodes (they meet every world)."""
-    n, W = model.particle_count, max(model.world_count, 1)
-    shift = np.zeros((max(n, 1), 3))
-    world = model.particle_world.numpy() if n else np.zeros(0, np.int32)
-    if W == 1 or not n or (world < 0).any():
-        return shift
-    x = model.particle_q.numpy()
-    extent = max(np.ptp(x[world == w], axis=0).max() for w in np.unique(world))
-    side = int(np.ceil(W ** (1.0 / 3.0) - 1.0e-9))
-    cell = np.stack([world % side, (world // side) % side, world // (side * side)], axis=1)
-    shift[:n] = cell * (4.0 * extent + 1.0)
-    return shift
 
 
 class Offset:

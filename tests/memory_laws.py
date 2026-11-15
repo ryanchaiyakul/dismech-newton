@@ -9,7 +9,8 @@ import warp as wp
 from newton import Model
 
 from dismech_newton.constants import ADJ_MODULE_OPTS, vec5f, vec6f, vec10f, vec12f
-from dismech_newton.residuals.base import as_world_param, elem_world_indices, model_world_info
+from dismech_newton.residuals.base import as_world_param
+from dismech_newton.worlds import elem_world_indices, model_world_info
 
 
 @cache

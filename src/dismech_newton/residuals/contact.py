@@ -10,7 +10,7 @@ from newton import Model
 from ..collide import Bodies, Mesh, Offset, _slot_edge_t, slot_surface_pair
 from ..constants import ADJ_MODULE_OPTS, vec10f, vec11f
 from ..contact import Arm, Slots, barrier, contact_point, pad_energy, shape_of, slot_map
-from ..state import node
+from ..dofs import node
 from .base import as_rff_weights
 
 

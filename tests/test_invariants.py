@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import solver as solver_module
 from dismech_newton.contact import CURVATURE, Slots, _majorizer, _slots
-from dismech_newton.state import dof_constants
+from dismech_newton.dofs import dof_constants
 
 
 def _free(kind: str):

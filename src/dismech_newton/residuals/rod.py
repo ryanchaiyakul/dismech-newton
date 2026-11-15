@@ -8,8 +8,9 @@ import warp as wp
 from newton import Model
 
 from ..constants import vec5f, vec10f
-from ..rod import Rod
-from .base import as_element_param, as_rff_weights, elem_world_indices, model_world_info
+from ..elements.rod import Rod
+from ..worlds import elem_world_indices, model_world_info
+from .base import as_element_param, as_rff_weights
 from .rff import rod_rff_sum, warp8_bcast
 
 

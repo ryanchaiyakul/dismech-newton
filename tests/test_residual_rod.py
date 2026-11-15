@@ -11,8 +11,8 @@ import dismech_newton.solver as dn_solver
 from dismech_newton import RodResidual, SolverDiSMech
 from dismech_newton.builder import vec5f, vec10f
 from dismech_newton.constants import ADJ_MODULE_OPTS
-from dismech_newton.rod import Rod, rod_dofs, rod_jacobian, vec11f
-from dismech_newton.state import flatten_state
+from dismech_newton.dofs import flatten_state
+from dismech_newton.elements.rod import Rod, rod_dofs, rod_jacobian, vec11f
 
 vec3f = wp.vec3f
 

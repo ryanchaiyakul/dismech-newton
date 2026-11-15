@@ -1,4 +1,4 @@
-"""Midedge shells (Chen et al. 2018) on Newton's cloth mesh, as an element of the generic block (:mod:`.element`).
+"""Midedge shells (Chen et al. 2018) on Newton's cloth mesh, as an element of the generic block (:mod:`.block`).
 
 A face's DOFs are its 3 vertices, the 3 flap vertices across its edges (a boundary edge's flap is the vertex
 itself) and the 3 midedge angles of its hinges (``hinge_q``): 21 DOFs. Its strains are the first and
@@ -12,9 +12,9 @@ import numpy as np
 import warp as wp
 from newton import Model
 
-from .builder import _P
-from .constants import FWD_MODULE_OPTS, mat6x21f, mat23f, mat63f, vec6f, vec9i, vec21f, vec21i
-from .element import element_kernels, rest_strains
+from ..builder import _P
+from ..constants import FWD_MODULE_OPTS, mat6x21f, mat23f, mat63f, vec6f, vec9i, vec21f, vec21i
+from .block import element_kernels, rest_strains
 
 wp.set_module_options(FWD_MODULE_OPTS)
 
@@ -34,7 +34,7 @@ class Shell:
 
 
 class Shells:
-    """The model's faces as an element type of :mod:`.element`: the view (the same for every state) and the rest
+    """The model's faces as an element type of :mod:`.block`: the view (the same for every state) and the rest
     strains (the model's initial shape, angles 0)."""
 
     stored = "face_strain_q"

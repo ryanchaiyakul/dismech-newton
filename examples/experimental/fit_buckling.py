@@ -44,8 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 from utils.common import TapedGraph, cached, capsule_poses, inset, inset_scale, smoothstep
 
 from dismech_newton import SolverDiSMech, add_rod, flatten_state, suspended_tape
-from dismech_newton.builder import vec5f, vec10f
-from dismech_newton.rod import Rod, rod_dofs, rod_jacobian, vec11f
+from dismech_newton.constants import vec5f, vec10f, vec11f
+from dismech_newton.elements.rod import Rod, rod_dofs, rod_jacobian
 
 # -- the rod and the truth -----------------------------------------------------------------
 LENGTH, SEGMENTS, RADIUS = 0.5, 24, 0.01

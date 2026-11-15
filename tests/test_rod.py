@@ -11,7 +11,7 @@ from rollouts import energies, simulate
 
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton.builder import vec5f
-from dismech_newton.rod import Rod, mat5x11f, rod_jacobian, rod_strain, vec5i, vec11f
+from dismech_newton.elements.rod import Rod, mat5x11f, rod_jacobian, rod_strain, vec5i, vec11f
 
 
 # -O2: nvrtc -O3 reads the struct argument through a local-memory pointer (CUDA 700) for sm_75-sm_90 (Warp 1.17).

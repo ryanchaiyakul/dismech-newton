@@ -17,31 +17,34 @@ from .constants import OBJECTIVE_NOISE as _NOISE
 from .constants import PCG_SWEEPS as CG
 from .contact import BarrierBlock, make_arm
 from .coupling import ProxyArm, ProxyPins, _turn
-from .element import ElementBlock
-from .linear import SymmetricCSR, sparse_solver
-from .residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
-from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_proxies_kernel, proxy_joints
-from .shell import Shells
-from .state import (
+from .dofs import (
     Dofs,
-    Worlds,
     _external,
     bind_dofs,
     diagonal_kernel,
     dof_constants,
     dof_mass,
-    dof_worlds,
     end_kernel,
     flatten_state,
     inertia_energy,
     inertia_grad,
-    masked_copy_kernel,
     node,
     padded,
     predict_kernel,
     suspended_tape,
-    world_sum,
 )
+from .elements import (
+    ElementBlock,
+    Rods,
+    Shells,
+    advance_frames_kernel,
+    advance_ref_twist_kernel,
+    pose_proxies_kernel,
+    proxy_joints,
+)
+from .linear import SymmetricCSR, sparse_solver
+from .residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
+from .worlds import Worlds, dof_worlds, masked_copy_kernel, world_sum
 
 wp.set_module_options(FWD_MODULE_OPTS)
 

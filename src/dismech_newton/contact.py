@@ -29,8 +29,9 @@ from .constants import (
     SMOOTH,
     STIFFNESS,
 )
+from .dofs import node, padded, scatter_node
 from .linear import row_slot
-from .state import node, padded, scatter_node, world_sum
+from .worlds import world_sum
 
 wp.set_module_options(FWD_MODULE_OPTS)
 

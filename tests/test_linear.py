@@ -58,7 +58,7 @@ def test_two_sided_pcg_recovers_common_mode(device, rng):
     import newton  # noqa: PLC0415
 
     from dismech_newton import SolverDiSMech, flatten_state  # noqa: PLC0415
-    from dismech_newton.state import bind_dofs  # noqa: PLC0415
+    from dismech_newton.dofs import bind_dofs  # noqa: PLC0415
 
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     th = 0.01

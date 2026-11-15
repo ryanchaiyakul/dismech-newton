@@ -17,8 +17,9 @@ from types import SimpleNamespace
 import warp as wp
 from newton import State
 
-from .linear import SymmetricCSR, triu_slot
-from .state import Worlds, flatten_state, padded, world_sum
+from ..dofs import flatten_state, padded
+from ..linear import SymmetricCSR, triu_slot
+from ..worlds import Worlds, world_sum
 
 
 def rest_strains(elem, model, vec) -> wp.array:

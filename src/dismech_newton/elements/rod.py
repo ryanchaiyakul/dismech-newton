@@ -1,4 +1,4 @@
-"""Discrete elastic rods as an element type of :mod:`.element`: a triplet (two consecutive edges) and its strains
+"""Discrete elastic rods as an element type of :mod:`.block`: a triplet (two consecutive edges) and its strains
 ``[eps_e, eps_f, kappa1, kappa2, tau]``, with the reference frames transported in time; the frame and proxy kernels
 the step ends with."""
 
@@ -6,10 +6,10 @@ import numpy as np
 import warp as wp
 from newton import JointType, Model
 
-from .builder import _P
-from .constants import mat5x11f, vec5f, vec5i, vec8f, vec11f, vec11i
-from .element import element_kernels, rest_strains
-from .state import node
+from ..builder import _P
+from ..constants import mat5x11f, vec5f, vec5i, vec8f, vec11f, vec11i
+from ..dofs import node
+from .block import element_kernels, rest_strains
 
 
 @wp.struct

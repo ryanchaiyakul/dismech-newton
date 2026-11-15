@@ -12,7 +12,7 @@ from utils.common import grid
 
 from dismech_newton import SolverDiSMech, add_cloth_mesh, flatten_state, suspended_tape
 from dismech_newton.contact import SMOOTH
-from dismech_newton.state import dof_constants
+from dismech_newton.dofs import dof_constants
 
 RADIUS = 0.01
 ONSET = 1.0 + SMOOTH  # contacts start this many thicknesses apart: at the barrier's onset, no normal force yet

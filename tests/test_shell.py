@@ -8,8 +8,8 @@ import warp as wp
 from rollouts import cloth, grid, simulate
 
 from dismech_newton import SolverDiSMech, flatten_state
-from dismech_newton import shell as S
 from dismech_newton import solver as solver_module
+from dismech_newton.elements import shell as S
 
 # -- geometry ----------------------------------------------------------------------------------------
 

@@ -9,8 +9,9 @@ from newton import BodyFlags, JointType, Model, State, StateFlags
 from newton.solvers.experimental.coupled import SolverCoupledProxy
 
 from .contact import STIFFNESS, Arm, arm_assemble, arm_move, arm_scatter
+from .dofs import node, padded, scatter_node
 from .linear import row_slot
-from .state import node, padded, scatter_node, world_sum
+from .worlds import world_sum
 
 _lagged_step_coupled = SolverCoupledProxy._step_coupled
 

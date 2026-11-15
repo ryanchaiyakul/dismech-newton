@@ -13,7 +13,7 @@ import numpy as np
 import warp as wp
 from newton import Model, State
 
-from .constants import (
+from ..constants import (
     CURVATURE,
     DECAY,
     FWD_MODULE_OPTS,
@@ -24,309 +24,30 @@ from .constants import (
     MAX_SCALE,
     NONE,
     PAD_FLOOR,
-    SIDES,
     SLIP_SPEED,
     SMOOTH,
     STIFFNESS,
 )
-from .dofs import node, padded, scatter_node
-from .linear import row_slot
-from .worlds import world_sum
+from ..dofs import padded, scatter_node
+from ..solver.linear import row_slot
+from ..worlds import world_sum
+from .slots import (
+    Arm,
+    Slots,
+    _slots,
+    arm_assemble,
+    arm_body,
+    arm_flexibility,
+    arm_scatter,
+    contact_point,
+    flexibility,
+    make_arm,
+    pair_point,
+    slot_map,
+    slot_roll,
+)
 
 wp.set_module_options(FWD_MODULE_OPTS)
-
-
-@wp.struct
-class Slots:
-    """Per contact: ``pair`` with weights ``w``, the normal from ``b`` to ``a``, the anchor, the start ``c0`` of
-    ``C q`` (minus the anchor's motion), the thickness, friction coefficient, lagged normal force ``rho``,
-    stiffness and multiplier ``lam``; ``own``, ``key``: its feature and the other one, which the list is sorted and
-    its multipliers carried by; ``roll``, ``ta``, ``tb``: its rod edges' surface turn (:func:`roll_point`); ``world``:
-    its world."""
-
-    active: wp.array[wp.int32]
-    own: wp.array[wp.int32]
-    world: wp.array[wp.int32]
-    pair: wp.array[wp.vec4i]
-    w: wp.array[wp.vec4]
-    normal: wp.array[wp.vec3]
-    anchor: wp.array[wp.vec3]
-    c0: wp.array[wp.vec3]
-    thickness: wp.array[float]
-    mu: wp.array[float]
-    rho: wp.array[float]
-    stiffness: wp.array[float]
-    lam: wp.array[float]
-    key: wp.array[wp.int32]
-    roll: wp.array[wp.vec4]
-    ta: wp.array[wp.vec3]
-    tb: wp.array[wp.vec3]
-    pad: wp.array[wp.vec4]  # a pad's point: (c, p, h, d), its energy c (th + h - d)^p, Hunt-Crossley's d [s/m]
-    damp: wp.array[float]  # and its damping d f0 / dt (f0 its pressure's force at the step's start)
-    rewound: wp.array[wp.int32]  # sliding pair tried to rewind in this step: use isotropic majorizer
-    aniso: wp.array[wp.vec4]  # (e1.x, e1.y, e1.z, gamma), D_t = e^(g/2) e1 e1^T + e^(-g/2) e2 e2^T
-    base: wp.array[wp.vec2]  # baseline (mu0, pad_c0) saved at emit (for Phase 4C idempotency)
-
-
-@wp.struct
-class Arm:
-    """Bodies that yield to the contacts within the step (:class:`~.coupling.ProxyArm`): ``k`` DOFs ``z`` per world,
-    from DOF ``start``, their moves over the step (their anchors are at its start). Body ``b``'s 6 DOFs start at
-    ``base[b]`` (-1: it does not yield), its centre of mass's move ``dx`` and a small rotation ``dth``, moving its
-    point ``x`` by ``dx + dth x (x - com[b])``; their inertia is ``(z - pred)^T M[w] (z - pred) / 2 h^2``, ``pred``
-    their own step's moves, ``M`` block-diagonal by body (its 6 x 6; the kernels read only those blocks). A shape
-    pair's body is ``shape_body[shape_of(key, key0)]``."""
-
-    k: int
-    start: int
-    key0: int
-    inv_h2: float
-    shape_body: wp.array[wp.int32]
-    base: wp.array[wp.int32]
-    com: wp.array[wp.vec3]
-    M: wp.array3d[float]
-    Minv: wp.array3d[float]
-    pred: wp.array[float]
-
-
-def make_arm(model: Model, key0: int, start: int, k: int) -> Arm:
-    if k % 6:
-        raise ValueError(f"an arm's DOFs are whole bodies, 6 each (M block-diagonal by body), got {k}")
-    a, dev, nb = Arm(), model.device, max(model.body_count, 1)
-    a.k, a.start, a.key0, a.inv_h2 = k, start, key0, 0.0
-    a.shape_body = model.shape_body if model.shape_count else wp.zeros(1, dtype=wp.int32, device=dev)
-    a.base = wp.full(nb, -1, dtype=wp.int32, device=dev)
-    a.com = wp.zeros(nb, dtype=wp.vec3, device=dev)
-    a.M = wp.zeros((max(model.world_count, 1), max(k, 1), max(k, 1)), dtype=float, device=dev)
-    a.Minv = wp.zeros_like(a.M)
-    a.pred = wp.zeros(max(model.world_count, 1) * max(k, 1), dtype=float, device=dev)
-    return a
-
-
-def _slots(n: int, device) -> Slots:
-    s = Slots()
-    for name, var in Slots.vars.items():
-        setattr(s, name, wp.zeros(n, dtype=var.type.dtype, device=device))
-    s.key.fill_(-1)
-    return s
-
-
-# -- pairs: shared with the sources ----------------------------------------------------------------
-
-
-@wp.func
-def contact_point(q: wp.array[float], pair: wp.vec4i, w: wp.vec4, anchor: wp.vec3) -> wp.vec3:
-    """``C q = sum_k w_k x_k - anchor``."""
-    c = -anchor
-    for k in range(4):
-        if pair[k] >= 0:
-            c += w[k] * node(q, pair[k])
-    return c
-
-
-@wp.func
-def roll_point(q: wp.array[float], pair: wp.vec4i, w: wp.vec4, roll: wp.vec4, n: wp.vec3, ta: wp.vec3,
-               tb: wp.vec3) -> wp.vec3:
-    """The rods' surface points' motion beyond their centrelines': a side on a rod edge ``x0 -> x1`` (tangent
-    ``t``, radius ``r``) turns by ``t0 x t``, moving its contact point ``-r n`` by ``r t (n . (x1 - x0)) / L`` to
-    first order (``roll = (-r/L, r/L)`` on the edge's nodes; ``t`` its side's: ``ta`` where ``w > 0``). Tangential
-    (``t`` normal to ``n``): it moves only friction's slip, so a cable on a turning pulley rolls with it, its
-    centreline at ``w (R + r)``."""
-    c = wp.vec3(0.0)
-    for k in range(4):
-        if roll[k] != 0.0:
-            c += roll[k] * wp.dot(n, node(q, pair[k])) * wp.where(w[k] > 0.0, ta, tb)
-    return c
-
-
-@wp.func
-def node_map(w: wp.vec4, roll: wp.vec4, n: wp.vec3, ta: wp.vec3, tb: wp.vec3, k: int) -> wp.mat33:
-    """``d (C q + roll) / d x_k``: ``w_k I + roll_k t n^T``."""
-    return w[k] * wp.identity(3, float) + roll[k] * wp.outer(wp.where(w[k] > 0.0, ta, tb), n)
-
-
-@wp.func
-def slot_map(s: Slots, i: int, k: int) -> wp.mat33:
-    return node_map(s.w[i], s.roll[i], s.normal[i], s.ta[i], s.tb[i], k)
-
-
-@wp.func
-def slot_roll(q: wp.array[float], s: Slots, i: int) -> wp.vec3:
-    return roll_point(q, s.pair[i], s.w[i], s.roll[i], s.normal[i], s.ta[i], s.tb[i])
-
-
-@wp.func
-def shape_of(key: int, key0: int) -> int:
-    """A shape pair's shape from its key ``key0 + SIDES shape + side`` (side 1: a line contact's other end)."""
-    return (key - key0) // SIDES
-
-
-@wp.func
-def arm_body(arm: Arm, s: Slots, i: int) -> int:
-    """Pair ``i``'s yielding body, or -1."""
-    if arm.k == 0 or s.key[i] < arm.key0:
-        return -1
-    b = arm.shape_body[shape_of(s.key[i], arm.key0)]
-    if b < 0 or arm.base[b] < 0:
-        return -1
-    return b
-
-
-@wp.func
-def arm_jacobian(m: int, r: wp.vec3) -> wp.vec3:
-    """The move of a body's point ``com + r`` per unit of its DOF ``m``: ``dx`` (``m < 3``), then ``dth``."""
-    e = wp.vec3(0.0)
-    e[m % 3] = 1.0
-    return wp.where(m < 3, e, wp.cross(e, r))
-
-
-@wp.func
-def arm_move(q: wp.array[float], arm: Arm, b: int, r: wp.vec3) -> wp.vec3:
-    """Body ``b``'s point ``com + r`` moved by its DOFs in ``q``."""
-    i = arm.base[b]
-    return wp.vec3(q[i], q[i + 1], q[i + 2]) + wp.cross(wp.vec3(q[i + 3], q[i + 4], q[i + 5]), r)
-
-
-@wp.func
-def arm_scatter(b: wp.array[wp.float64], arm: Arm, body: int, r: wp.vec3, g: wp.vec3):
-    """``b -= P^T g``: a force ``g`` on the body's point ``com + r`` (``P`` its :func:`arm_move`), into its DOFs."""
-    i = arm.base[body]
-    t = wp.cross(r, g)
-    for c in range(3):
-        wp.atomic_add(b, i + c, wp.float64(-g[c]))
-        wp.atomic_add(b, i + 3 + c, wp.float64(-t[c]))
-
-
-@wp.func
-def arm_assemble(vals: wp.array[wp.float64], indptr: wp.array[wp.int32], indices: wp.array[wp.int32],
-                 fixed: wp.array[wp.int32], arm: Arm, body: int, r: wp.vec3, H: wp.mat33, n: int, Jn: wp.mat33):
-    """Into the upper CSR (all in the pattern: a node and its world's arm), the Hessian blocks of an energy with
-    Hessian ``H`` in a gap ``Jn x_n - P z`` (``P`` the body's :func:`arm_move` at ``r``): node ``n``'s ``-Jn^T H P``,
-    then, with ``n < 0``, the body's ``P^T H P``."""
-    for m in range(6):
-        HP = H * arm_jacobian(m, r)
-        zm = arm.base[body] + m
-        if n >= 0:
-            v = wp.transpose(Jn) * HP
-            for c in range(3):
-                if fixed[3 * n + c] == 0:
-                    wp.atomic_add(vals, row_slot(indptr, indices, 3 * n + c, zm), wp.float64(-v[c]))
-        else:
-            for m2 in range(m, 6):
-                wp.atomic_add(vals, row_slot(indptr, indices, zm, arm.base[body] + m2),
-                              wp.float64(wp.dot(arm_jacobian(m2, r), HP)))
-
-
-@wp.func
-def body_flexibility(arm: Arm, Minv: wp.array3d[float], b: int, n: wp.vec3, r: wp.vec3) -> float:
-    """``n P M^-1 P^T n``: body ``b``'s flexibility along ``n`` at its point ``com + r`` (``Minv``: the arm's)."""
-    w = (arm.base[b] - arm.start) // arm.k
-    o = arm.base[b] - arm.start - w * arm.k  # the body's DOFs in its world's
-    flex = float(0.0)
-    for m in range(6):
-        pm = wp.dot(n, arm_jacobian(m, r))
-        for m2 in range(6):
-            flex += pm * Minv[w, o + m, o + m2] * wp.dot(n, arm_jacobian(m2, r))
-    return flex
-
-
-@wp.func
-def arm_flexibility(arm: Arm, s: Slots, i: int) -> float:
-    """The pair's yielding body's part of its flexibility along its normal (:func:`body_flexibility`)."""
-    b = arm_body(arm, s, i)
-    if b < 0:
-        return 0.0
-    return body_flexibility(arm, arm.Minv, b, s.normal[i], s.anchor[i] - arm.com[b])
-
-
-@wp.func
-def pair_point(q: wp.array[float], s: Slots, i: int, arm: Arm, anchor: wp.vec3) -> wp.vec3:
-    """:func:`contact_point` with the anchor moved by its body's DOFs in ``q`` if it yields, plus the rods' surface
-    turn (:func:`roll_point`)."""
-    c = contact_point(q, s.pair[i], s.w[i], anchor) + slot_roll(q, s, i)
-    b = arm_body(arm, s, i)
-    if b >= 0:
-        c -= arm_move(q, arm, b, s.anchor[i] - arm.com[b])
-    return c
-
-
-@wp.func
-def pair_fixed(fixed: wp.array[wp.int32], pair: wp.vec4i) -> bool:
-    """Nothing in ``pair`` can move."""
-    for k in range(4):
-        n = pair[k]
-        if n >= 0 and fixed[3 * n] * fixed[3 * n + 1] * fixed[3 * n + 2] == 0:
-            return False
-    return True
-
-
-@wp.func
-def emit(
-    s: Slots,
-    i: int,
-    q: wp.array[float],
-    pair: wp.vec4i,
-    w: wp.vec4,
-    n: wp.vec3,
-    xb: wp.vec3,
-    db: wp.vec3,
-    th: float,
-    mu: float,
-    radius: wp.vec4,
-    pad: wp.vec4,
-):
-    """Activate slot ``i``; ``xb``: the anchor at the end of the step, ``db``: its displacement over it; ``radius``:
-    per node its rod's (0 off rods): a side on two rod nodes (an edge) rolls (:func:`roll_point`); ``pad``: a pad's
-    node (:attr:`Slots.pad`), ``th`` to the pad's surface (its core's ``h`` less)."""
-    s.active[i] = 1
-    s.pair[i] = pair
-    s.w[i] = w
-    s.normal[i] = n
-    s.anchor[i] = xb
-    roll = wp.vec4(0.0)
-    s.ta[i] = wp.vec3(0.0)
-    s.tb[i] = wp.vec3(0.0)
-    for side in range(2):
-        k0 = int(-1)
-        k1 = int(-1)
-        count = int(0)
-        for k in range(4):
-            if pair[k] >= 0 and (w[k] > 0.0) == (side == 0):
-                count += 1
-                if k0 < 0:
-                    k0 = k
-                else:
-                    k1 = k
-        if count == 2:
-            if radius[k0] > 0.0 and radius[k1] > 0.0:
-                e = node(q, pair[k1]) - node(q, pair[k0])
-                t = e - wp.dot(e, n) * n
-                if wp.length(t) > 0.0:
-                    rl = 0.5 * (radius[k0] + radius[k1]) / wp.length(e)
-                    roll[k0] = -rl
-                    roll[k1] = rl
-                    if side == 0:
-                        s.ta[i] = wp.normalize(t)
-                    else:
-                        s.tb[i] = wp.normalize(t)
-    s.roll[i] = roll
-    s.c0[i] = contact_point(q, pair, w, xb) + db + slot_roll(q, s, i)
-    s.thickness[i] = th - pad[2]
-    s.pad[i] = pad
-    s.mu[i] = mu
-    s.rewound[i] = 0
-    s.aniso[i] = wp.vec4(0.0)
-    s.base[i] = wp.vec2(mu, pad[0])
-
-
-@wp.func
-def clear(s: Slots, i: int):
-    s.active[i] = 0
-    s.rho[i] = 0.0
-    s.key[i] = -1
-    s.rewound[i] = 0
-    s.aniso[i] = wp.vec4(0.0)
-    s.base[i] = wp.vec2(0.0)
 
 
 # -- contact as an energy: a barrier and lagged friction ------------------------------------------------------------
@@ -602,19 +323,6 @@ def _lift_kernel(q: wp.array[float], lift: float, s: Slots, arm: Arm):
         move = dx + wp.cross(dth, r0)
         s.anchor[i] = s.anchor[i] - move
         s.c0[i] = s.c0[i] + move
-
-
-@wp.func
-def flexibility(pair: wp.vec4i, w: wp.vec4, mass: wp.array[float], fixed: wp.array[wp.int32]) -> float:
-    """``C M^-1 C^T`` (an x-y-z mean over the pair's free DOFs)."""
-    flex = float(0.0)
-    for j in range(4):
-        p = pair[j]
-        if p >= 0:
-            for a in range(3):
-                if fixed[3 * p + a] == 0:
-                    flex += w[j] * w[j] / (3.0 * mass[3 * p + a])
-    return flex
 
 
 @wp.kernel
@@ -1110,7 +818,7 @@ def _compact_kernel(
 
 @wp.func
 def _arm_inertia(q: wp.array[float], arm: Arm, w: int, m: int) -> float:
-    """``(M (z - pred))_m / h^2`` of world ``w``: ``M`` block-diagonal, a body's 6 DOFs (:class:`.coupling.ProxyArm`)."""
+    """``(M (z - pred))_m / h^2`` of world ``w``: ``M`` block-diagonal, a body's 6 DOFs (:class:`~.coupling.ProxyArm`)."""
     v = float(0.0)
     for m2 in range(6 * (m // 6), 6 * (m // 6) + 6):
         j = w * arm.k + m2

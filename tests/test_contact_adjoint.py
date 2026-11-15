@@ -17,7 +17,7 @@ from newton._src.geometry import kernels as G
 from rollouts import CrossingRollout, GroundRollout, PadRollout, SheetContactRollout, SphereRollout
 
 from dismech_newton import SolverDiSMech, flatten_state, solver
-from dismech_newton.adjoint import _closest_weights
+from dismech_newton.solver.adjoint import _closest_weights
 
 # Converged: 12 step lengths, as a step from beyond the barrier's onset can need far shorter steps than 4 give.
 OPTIONS = {"iterations": 500}

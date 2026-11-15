@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import warp as wp
 
-from dismech_newton.linear import cudss
+from dismech_newton.solver.linear import cudss
 
 
 def pytest_addoption(parser):

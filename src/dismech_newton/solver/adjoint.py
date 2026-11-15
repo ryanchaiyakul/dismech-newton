@@ -29,10 +29,10 @@ from typing import Any
 import warp as wp
 from newton import State
 
-from .collide import Bodies, _closest_st, _edge_scan, _shape_gap, _shape_pose
-from .constants import CG_ITERATIONS, CG_TOLERANCE, FLAT, LIFT, OPEN, SIDES
-from .contact import (
+from ..constants import CG_ITERATIONS, CG_TOLERANCE, FLAT, LIFT, OPEN, SIDES, vec6f
+from ..contact import (
     Arm,
+    Bodies,
     Slots,
     _arm_assemble_kernel,
     _barrier_assemble_kernel,
@@ -49,11 +49,13 @@ from .contact import (
     pad_energy,
     roll_point,
     shape_of,
+    shape_pose,
     slot_map,
     slot_roll,
 )
-from .coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, proxy_step
-from .dofs import (
+from ..contact.collide import _closest_st, _edge_scan, _shape_gap
+from ..coupling import Pins, _pin_assemble_kernel, _pin_gap, _proxy_finish_kernel, proxy_step
+from ..dofs import (
     Dofs,
     bind_dofs,
     diagonal_kernel,
@@ -334,12 +336,12 @@ class StepAdjoint:
                 src, q_in = s.contact.source, state_in.dismech.q
                 poses = src.bodies.body_q if self.arm is None else self._snap.poses
                 n_c = c.active.shape[0]
-                t0 = wp.empty(n_c, dtype=float, device=dev)
+                scan = wp.empty(n_c, dtype=vec6f, device=dev)
                 wp.launch(_scan_kernel, dim=n_c, inputs=[c, src.bodies, _detached(poses), src.shape_key0,
-                                                         _detached(q_in)], outputs=[t0], device=dev, record_tape=False)
+                                                         _detached(q_in)], outputs=[scan], device=dev,
+                          record_tape=False)
                 weights = wp.zeros(n_c, dtype=wp.vec4, device=dev, requires_grad=True)
-                wp.launch(_weights_kernel, dim=n_c, inputs=[c, src.bodies, poses, _detached(poses),
-                                                           src.shape_key0, q_in, _detached(q_in), t0],
+                wp.launch(_weights_kernel, dim=n_c, inputs=[c, src.bodies, poses, src.shape_key0, q_in, scan],
                           outputs=[weights], device=dev)
                 # the lever arms from the step's anchors (a body's point, which its surface point at q_in can miss
                 # along the surface): their values, the surface point's derivative
@@ -547,7 +549,7 @@ def _contact_residual_kernel(
         moved = c.c0[i] - contact_point(q_in0, pair, w, c.anchor[i]) - slot_roll(q_in0, c, i)  # the anchor's (the
         # start's surface turn is ``c0``'s, below)
         sk = shape_of(c.key[i], key0)
-        X = _shape_pose(b, sk, poses)  # (``poses``: ``b.body_q``, with its adjoint)
+        X = shape_pose(b, sk, poses)  # (``poses``: ``b.body_q``, with its adjoint)
         w = weights[i]
         x = contact_point(q_in, pair, w, wp.vec3(0.0))
         dist, n = _shape_gap(b, sk, X, x, 1.0e6)
@@ -593,29 +595,110 @@ def _lever_off_kernel(slot: wp.array[wp.vec3], anchor: wp.array[wp.vec3], off: w
     off[i] = slot[i] - anchor[i]
 
 
-@wp.kernel(module="unique", enable_backward=False)
+@wp.func
+def _closest_probe(b: Bodies, k: int, X0: wp.transform, xa0: wp.vec3, xb0: wp.vec3, t: float) -> wp.vec3:
+    """Detached curvature probe at ``t`` (:func:`_edge_closest`): returns ``(u, su, curvature)``, zeros if flat."""
+    h, e = float(1.0e-2), float(1.0e-3)
+    s0, below, above = float(0.0), float(0.0), float(0.0)
+    side, u, su, curvature = float(0.0), float(0.0), float(0.0), float(0.0)
+    active = int(1)
+    for p in range(5):
+        if p == 3:
+            if wp.max(below, above) <= 0.0:
+                active = int(0)
+            else:
+                side = wp.where(above > below, 1.0, -1.0)
+                u = t + side * e
+        if active != 0:
+            tp = t
+            if p == 1:
+                tp = t - h
+            elif p == 2:
+                tp = t + h
+            elif p == 3:
+                tp = u
+            elif p == 4:
+                tp = u + side * e
+            s = _gap_slope(b, k, X0, xa0, xb0, tp)
+            if p == 0:
+                s0 = s
+            elif p == 1:
+                below = s0 - s
+            elif p == 2:
+                above = s - s0
+            elif p == 3:
+                su = s
+            else:
+                curvature = side * (s - su) / e
+    if curvature <= 0.0:
+        return wp.vec3(0.0)
+    return wp.vec3(u, su, curvature)
+
+
+@wp.kernel(module="unique", enable_backward=False, module_options={"max_unroll": 1, "optimization_level": 2})
 def _scan_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], key0: int, q: wp.array[float],
-                 t0: wp.array[float]):
-    """A line contact's other end's closest point, as the step scanned it (:func:`~.collide._edge_scan`)."""
+                 scan: wp.array[vec6f]):
+    """Detached probes ``(t0, u, su, curvature, slope, f0)`` for :func:`_weights_kernel`
+    (:func:`~..contact.collide._edge_scan`)."""
     i = wp.tid()
-    t0[i] = 0.0
+    scan[i] = vec6f(0.0)
     if c.key[i] >= key0 and c.pair[i][1] >= 0 and c.pair[i][2] < 0 and c.pad[i][0] == 0.0:
         sk = shape_of(c.key[i], key0)
+        X0 = shape_pose(b, sk, poses)
+        xa0 = node(q, c.pair[i][0])
+        xb0 = node(q, c.pair[i][1])
+        t = c.w[i][1]
+        t0, slope, f0 = float(0.0), float(0.0), float(0.0)
+        probe_t = t
+        do_probe = int(1)
         if c.key[i] != key0 + SIDES * sk:
-            t0[i] = _edge_scan(b, sk, _shape_pose(b, sk, poses), node(q, c.pair[i][0]), node(q, c.pair[i][1]), 1.0e6)[0]
+            t0 = _edge_scan(b, sk, X0, xa0, xb0, 1.0e6)[0]
+            h = 1.0e-3
+            nt0 = wp.vec3(0.0)
+            f_hi, f_lo = float(0.0), float(0.0)
+            eval_f0 = int(1)
+            for p in range(4):
+                if p == 3:
+                    slope = (f_hi - f_lo) / (2.0 * h)
+                    if wp.abs(slope) <= 1.0e-3:
+                        eval_f0 = int(0)
+                if eval_f0 != 0:
+                    up = t0
+                    if p == 1:
+                        up = t + h
+                    elif p == 2:
+                        up = t - h
+                    elif p == 3:
+                        up = t
+                    d, n = _shape_gap(b, sk, X0, wp.lerp(xa0, xb0, up), 1.0e6)
+                    if p == 0:
+                        nt0 = n
+                    elif p == 1:
+                        f_hi = wp.dot(n, nt0) - (1.0 - FLAT)
+                    elif p == 2:
+                        f_lo = wp.dot(n, nt0) - (1.0 - FLAT)
+                    else:
+                        f0 = wp.dot(n, nt0) - (1.0 - FLAT)
+            probe_t = t0
+            if wp.abs(slope) <= 1.0e-3 or t0 <= OPEN or t0 >= 1.0 - OPEN:
+                do_probe = int(0)
+        probe = wp.vec3(0.0)
+        if do_probe != 0:
+            probe = _closest_probe(b, sk, X0, xa0, xb0, probe_t)
+        scan[i] = vec6f(t0, probe[0], probe[1], probe[2], slope, f0)
 
 
-@wp.kernel(module="unique")
-def _weights_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], poses0: wp.array[wp.transform], key0: int,
-                    q: wp.array[float], q0: wp.array[float], t0: wp.array[float], out: wp.array[wp.vec4]):
+@wp.kernel(module="unique", module_options={"optimization_level": 2})
+def _weights_kernel(c: Slots, b: Bodies, poses: wp.array[wp.transform], key0: int, q: wp.array[float],
+                    scan: wp.array[vec6f], out: wp.array[wp.vec4]):
     """A shape pair's weights: the step's, moving as a rod edge's closest point or a line contact's other end does
-    (:func:`_edge_shape_weights`; ``poses0``, ``q0``: ``poses``, ``q`` without adjoints)."""
+    (:func:`_edge_shape_weights`; ``scan``: detached probes from :func:`_scan_kernel`)."""
     i = wp.tid()
     w = c.w[i]
     if c.key[i] >= key0 and c.pair[i][1] >= 0 and c.pair[i][2] < 0 and c.pad[i][0] == 0.0:
         sk = shape_of(c.key[i], key0)
-        w = _edge_shape_weights(q, q0, c.pair[i], w, b, sk, _shape_pose(b, sk, poses), _shape_pose(b, sk, poses0),
-                                c.key[i] != key0 + SIDES * sk, t0[i])
+        w = _edge_shape_weights(q, c.pair[i], w, b, sk, shape_pose(b, sk, poses), c.key[i] != key0 + SIDES * sk,
+                                scan[i])
     out[i] = w
 
 
@@ -669,24 +752,12 @@ def _gap_slope(b: Bodies, k: int, X: wp.transform, xa: wp.vec3, xb: wp.vec3, t: 
 
 
 @wp.func
-def _edge_closest(xa: wp.vec3, xb: wp.vec3, xa0: wp.vec3, xb0: wp.vec3, t: float, b: Bodies, k: int, X: wp.transform,
-                  X0: wp.transform) -> float:
+def _edge_closest(xa: wp.vec3, xb: wp.vec3, t: float, u: float, su: float, curvature: float, b: Bodies, k: int,
+                  X: wp.transform) -> float:
     """A rod edge's closest point to shape ``k``, the root of the gap's slope ``s`` along the edge, which the step
-    found at ``t``: ``t - (s - s0) / s'`` (``s0``, ``s'`` without adjoints: ``t``'s value, the root's derivative),
-    ``s`` evaluated on the slope's curved side: at a face's end (an edge along the face) it is flat on the other, so
-    the point moves with the face's end. Held on a flat face."""
-    h = 1.0e-2
-    s0 = _gap_slope(b, k, X0, xa0, xb0, t)
-    below = s0 - _gap_slope(b, k, X0, xa0, xb0, t - h)
-    above = _gap_slope(b, k, X0, xa0, xb0, t + h) - s0
-    if wp.max(below, above) > 0.0:
-        side = wp.where(above > below, 1.0, -1.0)
-        e = 1.0e-3  # just past the root, and the curvature there
-        u = t + side * e
-        su = _gap_slope(b, k, X0, xa0, xb0, u)
-        curvature = side * (_gap_slope(b, k, X0, xa0, xb0, u + side * e) - su) / e
-        if curvature > 0.0:
-            t = t - (_gap_slope(b, k, X, xa, xb, u) - su) / curvature
+    found at ``t``: ``t - (s - su) / curvature`` using detached probe ``(u, su, curvature)`` from :func:`_scan_kernel`."""
+    if curvature > 0.0:
+        t = t - (_gap_slope(b, k, X, xa, xb, u) - su) / curvature
     return t
 
 
@@ -697,30 +768,23 @@ def _face_turn(b: Bodies, k: int, X: wp.transform, xa: wp.vec3, xb: wp.vec3, u: 
 
 
 @wp.func
-def _edge_shape_weights(q: wp.array[float], q0: wp.array[float], pair: wp.vec4i, w: wp.vec4, b: Bodies, k: int,
-                        X: wp.transform, X0: wp.transform, other: bool, t0: float) -> wp.vec4:
-    """A rod edge's point against shape ``k`` at ``q``, ``X`` (``q0``, ``X0``: the same without adjoints), the step's
-    ``w`` moving as its closest point does (:func:`_edge_closest`), or a line contact's other end (``other``; ``t0``
-    the closest point the step scanned from, :func:`_scan_kernel`): where the shape's normal leaves the closest
-    point's by :data:`~.collide.FLAT` (a face's end, which moves with the shape), ``t - (f - f0) / f'`` likewise."""
+def _edge_shape_weights(q: wp.array[float], pair: wp.vec4i, w: wp.vec4, b: Bodies, k: int, X: wp.transform,
+                        other: bool, sc: vec6f) -> wp.vec4:
+    """A rod edge's point against shape ``k`` at ``q``, ``X``, the step's ``w`` moving as its closest point does
+    (:func:`_edge_closest`), or a line contact's other end (``other``; ``sc``: detached probes from
+    :func:`_scan_kernel`): where the shape's normal leaves the closest point's by :data:`~..constants.FLAT`."""
     xa = node(q, pair[0])
     xb = node(q, pair[1])
-    xa0 = node(q0, pair[0])
-    xb0 = node(q0, pair[1])
     t = w[1]
+    t0, u, su, curvature, slope, f0 = sc[0], sc[1], sc[2], sc[3], sc[4], sc[5]
+    tc = _edge_closest(xa, xb, wp.where(other, t0, t), u, su, curvature, b, k, X)
     if other:
-        d, nt0 = _shape_gap(b, k, X0, wp.lerp(xa0, xb0, t0), 1.0e6)
-        h = 1.0e-3
-        slope = (_face_turn(b, k, X0, xa0, xb0, t + h, nt0) - _face_turn(b, k, X0, xa0, xb0, t - h, nt0)) / (2.0 * h)
         if wp.abs(slope) > 1.0e-3:  # (else held)
-            tc = t0
-            if t0 > OPEN and t0 < 1.0 - OPEN:  # (an end: the node's)
-                tc = _edge_closest(xa, xb, xa0, xb0, t0, b, k, X, X0)
             d, nt = _shape_gap(b, k, X, wp.lerp(xa, xb, tc), 1.0e6)
             f = _face_turn(b, k, X, xa, xb, t, nt)
-            t = t - (f - _face_turn(b, k, X0, xa0, xb0, t, nt0)) / slope
+            t = t - (f - f0) / slope
     else:
-        t = _edge_closest(xa, xb, xa0, xb0, t, b, k, X, X0)
+        t = tc
     return wp.vec4(1.0 - t, t, 0.0, 0.0)
 
 

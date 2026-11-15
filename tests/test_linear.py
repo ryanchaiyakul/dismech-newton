@@ -4,7 +4,7 @@ import numpy as np
 import warp as wp
 from fd import assert_close
 
-from dismech_newton.linear import CudssSolver, ScipySolver, SymmetricCSR, cudss
+from dismech_newton.solver.linear import CudssSolver, ScipySolver, SymmetricCSR, cudss
 
 
 def _system(rng, device, n: int = 40):

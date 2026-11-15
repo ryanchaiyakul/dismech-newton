@@ -12,8 +12,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
-from dismech_newton.collide import Bodies, _shape_pose
-from dismech_newton.contact import Arm, Slots, contact_force, pair_point, shape_of
+from dismech_newton.contact import Arm, Bodies, Slots, contact_force, pair_point, shape_of, shape_pose
 
 wp.set_module_options({"enable_backward": False})
 
@@ -174,7 +173,7 @@ def _taxel_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int,
                              s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps, s.pad[i], s.damp[i], s.aniso[i])
     if wp.length(g) == 0.0:
         return
-    inv = wp.transform_inverse(_shape_pose(b, shape, b.body_q))  # the sensor's frame at the step's start
+    inv = wp.transform_inverse(shape_pose(b, shape, b.body_q))  # the sensor's frame at the step's start
     x = wp.transform_point(inv, s.anchor[i])
     f = wp.transform_vector(inv, g)  # the force on the sensor
     n = wp.transform_vector(inv, s.normal[i])  # outward from the sensor

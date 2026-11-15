@@ -18,7 +18,7 @@ import warp as wp
 from newton import State
 
 from ..dofs import flatten_state, padded
-from ..linear import SymmetricCSR, triu_slot
+from ..solver.linear import SymmetricCSR, triu_slot
 from ..worlds import Worlds, world_sum
 
 

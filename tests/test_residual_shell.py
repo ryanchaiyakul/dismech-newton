@@ -13,11 +13,11 @@ from utils.common import FrameGraph
 
 from dismech_newton import Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
 from dismech_newton import solver as dn_solver
-from dismech_newton.adjoint import StepAdjoint
 from dismech_newton.builder import Rod, add_rod, fix_segment, vec6f, vec12f
 from dismech_newton.constants import ADJ_MODULE_OPTS
 from dismech_newton.residuals.base import clamp_channel
 from dismech_newton.residuals.rff import shell_rff_sum
+from dismech_newton.solver import StepAdjoint
 
 
 def _cantilever_plate(

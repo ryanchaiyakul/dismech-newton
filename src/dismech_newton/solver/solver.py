@@ -1,7 +1,7 @@
 import logging
 import re
+import sys
 from functools import partial
-from typing import Any
 
 import numpy as np
 import warp as wp
@@ -9,31 +9,24 @@ from newton import BodyFlags, Contacts, Control, Model, ModelFlags, State, State
 from newton.solvers import SolverBase
 from newton.solvers.experimental.coupled import CouplingInterface
 
-from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
-from .collide import Offset
-from .constants import ARMIJO_C1 as _C1
-from .constants import CARRIED, EPS32, FWD_MODULE_OPTS, LINESEARCH, NEST, TOLERANCE, ULP
-from .constants import OBJECTIVE_NOISE as _NOISE
-from .constants import PCG_SWEEPS as CG
-from .contact import BarrierBlock, make_arm
-from .coupling import ProxyArm, ProxyPins, _turn
-from .dofs import (
+from ..builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
+from ..constants import CARRIED, LINESEARCH, NEST, TOLERANCE, ULP
+from ..constants import PCG_SWEEPS as CG
+from ..contact import BarrierBlock, Offset, make_arm
+from ..coupling import ProxyArm, ProxyPins
+from ..dofs import (
     Dofs,
-    _external,
     bind_dofs,
     diagonal_kernel,
     dof_constants,
     dof_mass,
     end_kernel,
     flatten_state,
-    inertia_energy,
-    inertia_grad,
-    node,
     padded,
     predict_kernel,
     suspended_tape,
 )
-from .elements import (
+from ..elements import (
     ElementBlock,
     Rods,
     Shells,
@@ -42,11 +35,46 @@ from .elements import (
     pose_proxies_kernel,
     proxy_joints,
 )
+from ..residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
+from ..worlds import Worlds, dof_worlds, masked_copy_kernel
+from .convergence import (
+    _N,
+    _activate_kernel,
+    _arm_unbalanced_kernel,
+    _count_kernel,
+    _go_kernel,
+    _hinge_size_kernel,
+    _net_kernel,
+    _nonfinite_kernel,
+    _refresh_kernel,
+    _unbalanced_kernel,
+)
 from .linear import SymmetricCSR, sparse_solver
-from .residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
-from .worlds import Worlds, dof_worlds, masked_copy_kernel, world_sum
-
-wp.set_module_options(FWD_MODULE_OPTS)
+from .linesearch import (
+    _arm_cap_kernel,
+    _arm_moved_kernel,
+    _arm_sweep_kernel,
+    _candidates_kernel,
+    _copy_if_kernel,
+    _dof_kernel,
+    _fallback_kernel,
+    _guess_kernel,
+    _moved_kernel,
+    _pick_kernel,
+)
+from .pcg import (
+    _S,
+    _pcg_alpha_kernel,
+    _pcg_beta_kernel,
+    _pcg_dir_kernel,
+    _pcg_end_kernel,
+    _pcg_init_kernel,
+    _pcg_pw_kernel,
+    _pcg_rz_kernel,
+    _pcg_start_kernel,
+    _pcg_update_kernel,
+    _spmv_kernel,
+)
 
 
 class _OwnResetState(logging.Filter):
@@ -138,8 +166,11 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self.theta = float(theta)
         self.iterations, self.exact, self.refactor = int(iterations), bool(exact), bool(refactor)
         self._last_dt: float = 0.0
-        self.tolerance = float(TOLERANCE if tolerance is None else tolerance)  # (read here: tests set the module's)
-        self.ulp = float(ULP if ulp is None else ulp)
+        pkg = sys.modules.get(__package__)
+        default_tol = getattr(pkg, "TOLERANCE", TOLERANCE)
+        default_ulp = getattr(pkg, "ULP", ULP)
+        self.tolerance = float(default_tol if tolerance is None else tolerance)  # (tests may monkeypatch solver.TOLERANCE)
+        self.ulp = float(default_ulp if ulp is None else ulp)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
@@ -665,476 +696,3 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                           self.cap, moved],
                   outputs=[self.contact.source.bodies.sweep, a._q], device=self.device)
 
-
-# -- the global step and its line search ---------------------------------------------------
-
-
-@wp.func
-def _step_length(k: int) -> float:
-    """Candidate 0 is the current iterate, and ``k > 0`` the backtracking steps ``2^(1-k)``."""
-    if k == 0:
-        return 0.0
-    return wp.pow(0.5, float(k - 1))
-
-
-@wp.kernel(module="unique")  # generic: an overload recompiles this, not the module
-def _copy_if_kernel(valid: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp.array(dtype=Any)):
-    i = wp.tid()
-    if valid[0] != 0:
-        dst[i] = src[i]
-
-
-@wp.func
-def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, num_candidates: int) -> int:
-    """World ``w``'s: Newton's full step if its expected decrease is below the objective's float32 rounding (no
-    candidate can be told apart). Else the longest step with sufficient decrease; else the candidate with the lowest
-    objective if it rises by no more than that rounding, or ``0``: no step (a stall)."""
-    o = w * num_candidates
-    f0 = energy[o]
-    s = slope[w]
-    noise = wp.float64(_NOISE) * wp.abs(f0)
-    if s >= wp.float64(0.0) and wp.float64(0.5) * s <= noise and energy[o + 1] <= f0 + noise and wp.isfinite(
-            energy[o + 1]):
-        return 1  # the Newton step's decrease is below the objective's rounding: its full step is taken
-    best = int(0)
-    for k in range(1, num_candidates):
-        if wp.isfinite(energy[o + k]) and energy[o + k] <= f0 - wp.float64(_C1 * _step_length(k)) * s:
-            return k
-        if wp.isfinite(energy[o + k]) and (best == 0 or energy[o + k] < energy[o + best]):
-            best = k
-    if best > 0 and energy[o + best] <= f0 + wp.float64(_NOISE) * wp.abs(f0):
-        return best
-    return 0
-
-
-# -- SPD PCG on two-sided contacts: per world its scalars at c[w * _S + k] ------------------------
-_RZ, _RZ0, _PW, _RZN, _ALPHA, _BETA, _STOP = range(7)
-_S = 7
-
-
-@wp.kernel
-def _pcg_start_kernel(b: wp.array[wp.float64], dq: wp.array[float], wd: Worlds, x: wp.array[wp.float64],
-                      r: wp.array[wp.float64], p: wp.array[wp.float64], c: wp.array[wp.float64]):
-    i = wp.tid()
-    w = wd.of[i]
-    x[i] = wp.float64(0.0)
-    r[i] = b[i]
-    d = wp.float64(dq[i])
-    p[i] = d
-    if wd.active[w] != 0:
-        wp.atomic_add(c, w * _S + _RZ0, b[i] * d)
-
-
-@wp.kernel
-def _pcg_init_kernel(wd: Worlds, c: wp.array[wp.float64]):
-    w = wp.tid()
-    o = w * _S
-    rz0 = c[o + _RZ0]
-    c[o + _RZ] = rz0
-    c[o + _STOP] = wp.where(wd.active[w] != 0 and rz0 > wp.float64(0.0), wp.float64(0.0), wp.float64(1.0))
-
-
-@wp.kernel
-def _spmv_kernel(indptr: wp.array[wp.int32], indices: wp.array[wp.int32], vals: wp.array[wp.float64],
-                 p: wp.array[wp.float64], c: wp.array[wp.float64], wd: Worlds, y: wp.array[wp.float64]):
-    """``y += A p`` for an upper-triangle symmetric CSR ``A`` in the running worlds."""
-    i = wp.tid()
-    if c[wd.of[i] * _S + _STOP] != wp.float64(0.0):
-        return
-    pi = p[i]
-    yi = wp.float64(0.0)
-    for slot in range(indptr[i], indptr[i + 1]):
-        j = indices[slot]
-        v = vals[slot]
-        yi += v * p[j]
-        if j > i:
-            wp.atomic_add(y, j, v * pi)
-    wp.atomic_add(y, i, yi)
-
-
-@wp.kernel
-def _pcg_rz_kernel(r: wp.array[wp.float64], z: wp.array[float], wd: Worlds, c: wp.array[wp.float64]):
-    i = wp.tid()
-    o = wd.of[i] * _S
-    if c[o + _STOP] == wp.float64(0.0):
-        wp.atomic_add(c, o + _RZN, r[i] * wp.float64(z[i]))
-
-
-@wp.kernel
-def _pcg_beta_kernel(c: wp.array[wp.float64]):
-    w = wp.tid()
-    o = w * _S
-    if c[o + _STOP] != wp.float64(0.0):
-        return
-    rzn = c[o + _RZN]
-    c[o + _RZN] = wp.float64(0.0)
-    if rzn <= wp.float64(1.0e-4) * c[o + _RZ0]:
-        c[o + _STOP] = wp.float64(1.0)
-        return
-    c[o + _BETA] = rzn / c[o + _RZ]
-    c[o + _RZ] = rzn
-
-
-@wp.kernel
-def _pcg_dir_kernel(c: wp.array[wp.float64], z: wp.array[float], wd: Worlds, p: wp.array[wp.float64]):
-    i = wp.tid()
-    o = wd.of[i] * _S
-    if c[o + _STOP] == wp.float64(0.0):
-        p[i] = wp.float64(z[i]) + c[o + _BETA] * p[i]
-
-
-@wp.kernel
-def _pcg_pw_kernel(p: wp.array[wp.float64], w: wp.array[wp.float64], wd: Worlds, c: wp.array[wp.float64]):
-    i = wp.tid()
-    o = wd.of[i] * _S
-    if c[o + _STOP] == wp.float64(0.0):
-        wp.atomic_add(c, o + _PW, p[i] * w[i])
-
-
-@wp.kernel
-def _pcg_alpha_kernel(m: int, c: wp.array[wp.float64], go: wp.array[wp.int32]):
-    w = wp.tid()
-    o = w * _S
-    c[o + _ALPHA] = wp.float64(0.0)
-    if c[o + _STOP] != wp.float64(0.0):
-        return
-    pw = c[o + _PW]
-    c[o + _PW] = wp.float64(0.0)
-    rz = c[o + _RZ]
-    if pw <= wp.float64(0.0):
-        c[o + _STOP] = wp.float64(1.0)
-        if m == 0:
-            c[o + _ALPHA] = wp.float64(1.0)
-        return
-    c[o + _ALPHA] = rz / pw
-    go[0] = 1
-
-
-@wp.kernel
-def _pcg_update_kernel(c: wp.array[wp.float64], p: wp.array[wp.float64], w: wp.array[wp.float64], wd: Worlds,
-                       x: wp.array[wp.float64], r: wp.array[wp.float64]):
-    i = wp.tid()
-    a = c[wd.of[i] * _S + _ALPHA]
-    if a != wp.float64(0.0):
-        x[i] = x[i] + a * p[i]
-        r[i] = r[i] - a * w[i]
-
-
-@wp.kernel
-def _pcg_end_kernel(x: wp.array[wp.float64], c: wp.array[wp.float64], wd: Worlds, dq: wp.array[float]):
-    i = wp.tid()
-    w = wd.of[i]
-    if wd.active[w] != 0 and c[w * _S + _RZ0] > wp.float64(0.0):
-        dq[i] = float(x[i])
-
-
-@wp.kernel
-def _dof_kernel(
-    q: wp.array[float],
-    q_pred: wp.array[float],
-    f: Dofs,
-    b: wp.array[wp.float64],
-    energy: wp.array[wp.float64],
-    slope: wp.array[wp.float64],
-):
-    """``b += M (q - q_pred) / dt^2 - f_ext`` (``0`` on fixed DOFs); zero the line search's sums."""
-    i = wp.tid()
-    if i < energy.shape[0]:
-        energy[i] = wp.float64(0.0)
-    if i < slope.shape[0]:
-        slope[i] = wp.float64(0.0)
-    if i >= b.shape[0]:
-        return
-    if f.fixed[i] != 0:
-        b[i] = wp.float64(0.0)
-    else:
-        b[i] = b[i] + wp.float64(inertia_grad(f, i, q[i] - q_pred[i]))
-
-
-@wp.kernel
-def _candidates_kernel(
-    q: wp.array[float],
-    dq: wp.array[float],
-    t: wp.array[float],
-    q_pred: wp.array[float],
-    f: Dofs,
-    q0: wp.array[float],
-    cap: float,
-    limit: wp.array[float],
-    arm_start: int,
-    arm_radius: wp.array[float],
-    wd: Worlds,
-    q_cand: wp.array2d[float],
-    b: wp.array[wp.float64],
-    energy: wp.array[wp.float64],
-    slope: wp.array[wp.float64],
-):
-    """``q_cand[k] = q - t_k t dq`` (``t``: the longest step), the DOF part of each candidate's objective,
-    ``slope = b . (q - q_cand[1])``, then ``b = 0``; a node's move from ``q0`` capped to ``limit`` (a midedge angle's
-    past its barrier is the energy's to reject), a proxy body's so its farthest point moves at most ``cap``. Launched
-    over ``(k, padded(n))``."""
-    k, i = wp.tid()
-    e = wp.float64(0.0)
-    s = wp.float64(0.0)
-    w = int(-1)
-    if i < q.shape[0]:
-        w = wd.of[i]
-        tw = t[w]
-        d = dq[i] * tw
-        step = d
-        qk = q[i]
-        if k > 0:  # (candidate 0 the iterate itself, whatever dq is)
-            qk = q[i] - _step_length(k) * d
-        if cap > 0.0 and i < f.num_node_dofs and f.fixed[i] == 0:  # the node's move from the start, at most cap
-            n = i // 3
-            cap = wp.min(cap, limit[n])
-            move = wp.vec3(0.0)
-            for c in range(3):
-                j = 3 * n + c
-                move[c] = q[j] - _step_length(k) * (dq[j] * tw) - q0[j]
-            length = wp.length(move)
-            if length > cap:
-                qk = q0[i] + move[i - 3 * n] * (cap / length)
-                step = q[i] - qk
-        elif cap > 0.0 and i >= arm_start and arm_radius.shape[0] > 0:
-            j0 = arm_start + 6 * ((i - arm_start) // 6)
-            dx, dth = wp.vec3(0.0), wp.vec3(0.0)
-            for c in range(3):
-                dx[c] = q[j0 + c] - _step_length(k) * (dq[j0 + c] * tw) - q0[j0 + c]
-                dth[c] = q[j0 + 3 + c] - _step_length(k) * (dq[j0 + 3 + c] * tw) - q0[j0 + 3 + c]
-            sweep = wp.length(dx) + wp.length(dth) * arm_radius[(i - arm_start) // 6]
-            if sweep > cap:
-                qk = q0[i] + (qk - q0[i]) * (cap / sweep)
-                step = q[i] - qk
-        q_cand[k, i] = qk
-        if f.fixed[i] == 0:
-            e = wp.float64(inertia_energy(f, i, qk - q_pred[i]))
-            if k == 1:
-                s = b[i] * wp.float64(step)
-                b[i] = wp.float64(0.0)
-    world_sum(energy, w, k, wd.stride, e)
-    world_sum(slope, w, 0, 1, s)
-
-
-@wp.kernel
-def _moved_kernel(q: wp.array[float], q0: wp.array[float], dq: wp.array[float], limit: wp.array[float], wd: Worlds,
-                  moved: wp.array[wp.int32], dq_max: wp.array[float]):
-    n = wp.tid()
-    w = wd.of[3 * n]
-    if wp.length(node(q, n) - node(q0, n)) > 0.5 * limit[n]:
-        moved[w] = 1
-        moved[wd.count] = 1
-    wp.atomic_max(dq_max, w, wp.length(node(dq, n)))
-
-
-@wp.func
-def _arm_sweep(q: wp.array[float], q0: wp.array[float], j0: int, radius: float) -> float:
-    """How far a proxy body's farthest point moves from ``q0`` to ``q`` (its DOFs from ``j0``), at most."""
-    dx, dth = wp.vec3(0.0), wp.vec3(0.0)
-    for c in range(3):
-        dx[c] = q[j0 + c] - q0[j0 + c]
-        dth[c] = q[j0 + 3 + c] - q0[j0 + 3 + c]
-    return wp.length(dx) + wp.length(dth) * radius
-
-
-@wp.kernel
-def _arm_cap_kernel(q: wp.array[float], q0: wp.array[float], start: int, radius: wp.array[float], cap: float,
-                    out: wp.array[float]):
-    b = wp.tid()
-    j0 = start + 6 * b
-    sweep = _arm_sweep(q, q0, j0, radius[b])
-    if sweep > cap:
-        for c in range(6):
-            out[j0 + c] = q0[j0 + c] + (q[j0 + c] - q0[j0 + c]) * (cap / sweep)
-
-
-@wp.kernel
-def _arm_sweep_kernel(q: wp.array[float], body: wp.array[wp.int32], base: wp.array[wp.int32],
-                      com: wp.array[wp.vec3], body_com: wp.array[wp.vec3], start_q: wp.array[wp.transform],
-                      cap: float, moved: int, sweep: wp.array[float], body_q: wp.array[wp.transform]):
-    """Pose each proxy body at ``q`` (``moved``) or back at its step start, and set its reach ``cap``."""
-    p = wp.tid()
-    b = body[p]
-    j0 = base[b]
-    sweep[b] = cap
-    q0 = start_q[b]
-    if moved != 0:
-        dx = wp.vec3(q[j0], q[j0 + 1], q[j0 + 2])
-        dth = wp.vec3(q[j0 + 3], q[j0 + 4], q[j0 + 5])
-        rot = _turn(dth, wp.transform_get_rotation(q0))
-        q0 = wp.transform(com[b] + dx - wp.quat_rotate(rot, body_com[b]), rot)
-    body_q[b] = q0
-
-
-@wp.kernel
-def _arm_moved_kernel(q: wp.array[float], q0: wp.array[float], start: int, radius: wp.array[float], limit: float,
-                      wd: Worlds, moved: wp.array[wp.int32]):
-    """A proxy body moved more than ``limit`` since the pairs were found: find them again (as a node)."""
-    b = wp.tid()
-    if _arm_sweep(q, q0, start + 6 * b, radius[b]) > limit:
-        moved[wd.of[start + 6 * b]] = 1
-        moved[wd.count] = 1
-
-
-@wp.kernel
-def _hinge_size_kernel(dq: wp.array[float], offset: int, thickness: wp.array[float], wd: Worlds,
-                       dq_max: wp.array[float]):
-    """A midedge angle's step as the move of its offset midpoint ``h/2 |d theta|`` (Chen et al. 2026, Sec. 7.3)."""
-    h = wp.tid()
-    wp.atomic_max(dq_max, wd.of[offset + h], 0.5 * thickness[h] * wp.abs(dq[offset + h]))
-
-
-_NET, _LOAD, _FLOOR, _ANCHOR2, _N = 0, 3, 4, 5, 6  # a world's net force (3), load, floor, anchor floor²
-
-
-@wp.kernel
-def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
-                       load: wp.array[float], anchor: wp.array[float], wd: Worlds, ulp: float,
-                       net: wp.array[wp.float64]):
-    """The nodes' force balance at ``q``, summed per world into ``net`` (net force, its loads, float32's floor):
-    ``b``, the step's gradient, is the unbalanced force; the loads are magnitudes: its contacts' forces (``load``,
-    opposed pairs adding), its inertia and external force; the elastic forces are internal: they carry the load, they
-    are not it. Summed, not node by node: a stiff rod's nodes resolve their elastic forces only to its stiffness times
-    float32's resolution of a coordinate, but those cancel in the sum (each force is added once with each sign); the
-    net, the momentum's balance, does not, nor does a fixed DOF's reaction: it is resolved only to its coupling to a
-    node (``anchor``, the assembly's) times the node's ulp, summed in quadrature (independent round-offs: 2x the
-    net's change under random 1-ulp moves on a clamped woven sheet).
-    Midedge angles and twists: internal, left to the step test."""
-    n = wp.tid()
-    i = 3 * n
-    if f.fixed[i] != 0 and f.fixed[i + 1] != 0 and f.fixed[i + 2] != 0:
-        return
-    w = wd.of[i]
-    r = wp.vec3(q[i] - q_pred[i], q[i + 1] - q_pred[i + 1], q[i + 2] - q_pred[i + 2])
-    ext = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
-    k = f.mass[i] * f.inv_dt2
-    o = _N * w
-    for c in range(3):
-        wp.atomic_add(net, o + _NET + c, b[i + c])
-    x = wp.vec3(q[i], q[i + 1], q[i + 2])
-    wp.atomic_add(net, o + _LOAD, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
-    a = wp.vec3(anchor[i], anchor[i + 1], anchor[i + 2])
-    s = EPS32 * wp.length(a) * wp.length(x)
-    wp.atomic_add(net, o + _ANCHOR2, wp.float64(s * s))
-    wp.atomic_add(net, o + _FLOOR, wp.float64(k * ulp * (wp.length(x) + wp.length(r))))
-
-
-@wp.kernel
-def _arm_unbalanced_kernel(b: wp.array[wp.float64], load: wp.array[float], floor: wp.array[float], start: int,
-                           k: int, tolerance: float, unbalanced: wp.array[float]):
-    """A proxy body's force and torque balance: ``|b|`` within ``tolerance`` of its contacts' and inertia's, or below
-    float32's reach."""
-    w, p = wp.tid()
-    i = start + w * k + 6 * p
-    for o in range(0, 6, 3):
-        u = wp.length(wp.vec3(float(b[i + o]), float(b[i + o + 1]), float(b[i + o + 2])))
-        wp.atomic_max(unbalanced, w, u / (tolerance * load[i + o] + floor[i + o] + 1.0e-30))
-
-
-@wp.kernel
-def _net_kernel(net: wp.array[wp.float64], tolerance: float, unbalanced: wp.array[float]):
-    """Per world, the nodes' net force against ``tolerance`` of their loads (plus float32's floor)."""
-    o = _N * wp.tid()
-    u = wp.sqrt(net[o] * net[o] + net[o + 1] * net[o + 1] + net[o + 2] * net[o + 2])
-    tol = wp.float64(tolerance) * net[o + _LOAD] + net[o + _FLOOR] + wp.sqrt(net[o + _ANCHOR2]) + wp.float64(1.0e-30)
-    unbalanced[wp.tid()] = wp.max(unbalanced[wp.tid()], float(u / tol))
-
-
-@wp.kernel
-def _go_kernel(dq_max: wp.array[float], unbalanced: wp.array[float], pick: wp.array[wp.int32],
-               moved: wp.array[wp.int32], failed: wp.array[wp.int32], tol: float, wd: Worlds,
-               go: wp.array[wp.int32], stalled: wp.array[wp.int32], settle: wp.array[wp.int32]):
-    """Per iterating world: iterate on while the Newton step moves a node more than ``tol`` and the line search took a
-    step, or the pairs were just found again (the objective changed); a step that finds no decrease short of that has
-    stalled. ``settle``: the worlds that stopped at this iterate (``[count]``: any; ``go[count]``: any goes; both
-    zeroed before)."""
-    w = wp.tid()
-    n = wd.count
-    settle[w] = 0
-    if wd.active[w] != 0:
-        far = dq_max[w] > tol or unbalanced[w] > 1.0  # the step still moves, or the forces do not balance
-        go[w] = wp.where(far and (pick[w] != 0 or moved[w] != 0) and failed[w] == 0, 1, 0)
-        if far and pick[w] == 0 and moved[w] == 0:
-            stalled[w] = 1
-        if go[w] == 0:
-            settle[w] = 1
-            settle[n] = 1
-    if go[w] != 0:
-        go[n] = 1
-
-
-@wp.kernel
-def _count_kernel(go: wp.array[wp.int32], stalled: wp.array[wp.int32], failed: wp.array[wp.int32],
-                  counts: wp.array[wp.int32]):
-    """The step's end: the worlds unconverged (their iterations spent) or stalled, counted."""
-    w = wp.tid()
-    if go[w] != 0:
-        wp.atomic_add(counts, 0, 1)
-    if stalled[w] != 0:
-        wp.atomic_add(counts, 1, 1)
-    if failed[w] != 0:
-        wp.atomic_add(counts, 2, 1)
-    stalled[w] = 0
-    failed[w] = 0
-
-
-@wp.kernel
-def _activate_kernel(go: wp.array[wp.int32], active: wp.array[wp.int32]):
-    """The worlds that iterate: those not converged."""
-    w = wp.tid()
-    active[w] = go[w]
-
-
-@wp.kernel
-def _nonfinite_kernel(dq: wp.array[float], wd: Worlds, q: wp.array[float], failed: wp.array[wp.int32]):
-    """A non-finite Newton step (a singular or overflowed solve) is taken, not skipped: the line search would pick no
-    candidate and the step read as converged, the state silently frozen (its world's)."""
-    i = wp.tid()
-    w = wd.of[i]
-    if wd.active[w] != 0 and not wp.isfinite(dq[i]):
-        q[i] = dq[i]
-        failed[w] = 1
-
-
-@wp.kernel
-def _refresh_kernel(go: wp.array[wp.int32], touching: wp.array[wp.int32], exact: int, refresh: wp.array[wp.int32]):
-    refresh[0] = wp.where(go[0] != 0 and (touching[0] != 0 or exact != 0), 1, 0)
-
-
-@wp.kernel
-def _guess_kernel(fixed: wp.array[wp.int32], q0: wp.array[float], limit: wp.array[float], q: wp.array[float]):
-    n = wp.tid()
-    cap = limit[n]
-    if fixed[3 * n] == 0:
-        move = node(q, n) - node(q0, n)
-        length = wp.length(move)
-        if length > cap:
-            for c in range(3):
-                q[3 * n + c] = q0[3 * n + c] + move[c] * (cap / length)
-
-
-@wp.kernel
-def _fallback_kernel(energy: wp.array[wp.float64], wd: Worlds, q0: wp.array[float], q: wp.array[float]):
-    i = wp.tid()
-    if not wp.isfinite(energy[wd.of[i] * wd.stride]):
-        q[i] = q0[i]
-
-
-@wp.kernel
-def _pick_kernel(
-    energy: wp.array[wp.float64],
-    slope: wp.array[wp.float64],
-    wd: Worlds,
-    q_cand: wp.array2d[float],
-    q: wp.array[float],
-    pick: wp.array[wp.int32],
-):
-    """Each iterating world's candidate (``pick[w]``, written alike by its DOFs' threads); the others keep ``q``."""
-    i = wp.tid()
-    w = wd.of[i]
-    if wd.active[w] == 0:
-        pick[w] = 0
-        return
-    k = _armijo(energy, slope, w, wd.stride)
-    pick[w] = k
-    q[i] = q_cand[k, i]

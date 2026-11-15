@@ -16,10 +16,10 @@ try:
 except ImportError:
     cudss = None
 
-from .constants import CUDA_R_32F as _CUDA_R_32F
-from .constants import CUDA_R_32I as _CUDA_R_32I
-from .constants import CUDA_R_64F as _CUDA_R_64F
-from .constants import FWD_MODULE_OPTS
+from ..constants import CUDA_R_32F as _CUDA_R_32F
+from ..constants import CUDA_R_32I as _CUDA_R_32I
+from ..constants import CUDA_R_64F as _CUDA_R_64F
+from ..constants import FWD_MODULE_OPTS
 
 wp.set_module_options(FWD_MODULE_OPTS)
 

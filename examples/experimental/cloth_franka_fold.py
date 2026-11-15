@@ -21,8 +21,8 @@ Shows: a two-way pinch grasp of a sheet. Tests: while pinched, each finger's gri
 napkin's contact thickness (10%; measured 4% over 4 runs); folded in half: the hem's corner within 2 cm of the
 napkin's far corner (measured 0.8 cm), the flap flat on the other half (within 2 cm of the table); no crossings.
 
-    uv run --extra mujoco examples/cloth_franka_fold.py
-    uv run --extra mujoco examples/cloth_franka_fold.py --viewer null --test
+    uv run --extra mujoco examples/experimental/cloth_franka_fold.py
+    uv run --extra mujoco examples/experimental/cloth_franka_fold.py --viewer null --test
 """
 
 import sys
@@ -37,7 +37,7 @@ from newton.examples.multiphysics.example_franka_cable_ik_pick_place import GRIP
 from newton.solvers import SolverMuJoCo
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # examples/: utils
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
 from utils.common import TCP, CableExample, Crossings, add_franka, grid, pads, set_franka_targets
 

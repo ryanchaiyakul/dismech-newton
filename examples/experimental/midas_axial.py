@@ -13,13 +13,15 @@ Sliding, the push is Coulomb's mu sum(N), the contacts' normal forces (``rho``, 
 hand's 1.0); the push measured on MuJoCo's side (the slide servo) equals the rod's axial force on ours (EA x strain
 between clamp and hand). The taxels' forces sum to their sensor's contact force.
 
-    uv run --extra mujoco examples/midas_axial.py
-    uv run --extra mujoco examples/midas_axial.py --viewer null --test
+    uv run --extra mujoco examples/experimental/midas_axial.py
+    uv run --extra mujoco examples/experimental/midas_axial.py --viewer null --test
 """
 
 import io
+import sys
 import urllib.request
 import zipfile
+from pathlib import Path
 
 import newton
 import newton.examples
@@ -27,6 +29,9 @@ import numpy as np
 import warp as wp
 from newton.solvers import SolverMuJoCo
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+
 from utils import tactile
 from utils.common import CACHE, MUTED, SIM, THEORY, CableExample, inset, pads
 

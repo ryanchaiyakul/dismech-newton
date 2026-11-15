@@ -22,7 +22,7 @@ its docstring says how and why.
 
 Not ported: `cloth_rollers` (rollers turning the cloth by friction: its steps stop converging once the tail is
 pulled round the second roller), `cloth_poker_cards` (dynamic rigid bodies pushed by the cloth), `cloth_franka` (a
-kinematic robot, one-way, in Newton; see [`../cloth_franka_fold.py`](../cloth_franka_fold.py)), `cloth_h1` (Style3D's jacket on a humanoid driven by IK: the cloth is
+kinematic robot, one-way, in Newton; see [`../experimental/cloth_franka_fold.py`](../experimental/cloth_franka_fold.py)), `cloth_h1` (Style3D's jacket on a humanoid driven by IK: the cloth is
 supported, the IK-driven kinematic robot is not ported).
 
 ```bash

@@ -1,4 +1,4 @@
-import time
+import gc
 
 import newton
 import numpy as np
@@ -779,7 +779,10 @@ def test_rod_residual_framegraph_w256(device, rng):
     R = 64
     w_nz = rng.normal(0.0, 0.05, size=(R, 5)).astype(np.float32)
     dt = 0.01
-    warmup_iters, rounds, substeps = 15, 5, 4
+    warmup_iters, iters, rounds, substeps = 15, 20, 7, 4
+    stream = wp.get_stream(model.device)
+    e0 = wp.Event(device=model.device, enable_timing=True)
+    e1 = wp.Event(device=model.device, enable_timing=True)
 
     def _compile_warm(solver: SolverDiSMech):
         s0, s1 = model.state(), model.state()
@@ -795,13 +798,14 @@ def test_rod_residual_framegraph_w256(device, rng):
         assert fg.graph is not None
         return fg, s0
 
-    def _run_block(fg: FrameGraph, iters: int = 10) -> float:
+    def _run_block(fg: FrameGraph) -> float:
         wp.synchronize()
-        t0 = time.perf_counter()
+        stream.record_event(e0)
         for _ in range(iters):
             fg()
+        stream.record_event(e1)
         wp.synchronize()
-        return 1000.0 * (time.perf_counter() - t0) / (substeps * iters)
+        return float(wp.get_event_elapsed_time(e0, e1)) / (substeps * iters)
 
     print()
     for sc in (False, True):
@@ -809,14 +813,20 @@ def test_rod_residual_framegraph_w256(device, rng):
         s_res = SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, seed=5))
         fg_base, s0_base = _compile_warm(s_base)
         fg_res, s0_res = _compile_warm(s_res)
-        times_base, times_res = [], []
-        for _ in range(rounds):
-            times_base.append(_run_block(fg_base))
-            times_res.append(_run_block(fg_res))
-        ms_base = float(np.median(times_base))
-        ms_res = float(np.median(times_res))
+        round_pairs = []
+        gc.collect()
+        for r in range(rounds):
+            if r % 2 == 0:
+                tb = _run_block(fg_base)
+                tr = _run_block(fg_res)
+            else:
+                tr = _run_block(fg_res)
+                tb = _run_block(fg_base)
+            round_pairs.append((tb, tr))
+        ms_base = float(np.median([tb for tb, _ in round_pairs]))
+        ms_res = float(np.median([tr for _, tr in round_pairs]))
         q_base, q_res = s0_base.particle_q.numpy(), s0_res.particle_q.numpy()
-        overhead_pct = 100.0 * (ms_res - ms_base) / ms_base
+        overhead_pct = float(np.median([100.0 * (tr - tb) / tb for tb, tr in round_pairs]))
         print(
             f"[FrameGraph W={worlds} N={n_seg} self_contact={sc}] "
             f"base={ms_base:.3f} ms/step, res={ms_res:.3f} ms/step, overhead={overhead_pct:+.2f}%"

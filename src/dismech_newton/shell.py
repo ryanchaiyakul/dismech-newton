@@ -94,7 +94,9 @@ class Shells:
         return params, rest
 
     def carry(self, p, s, dt: float = 0.0) -> None:
-        pass
+        """``s``'s carried face memory as the step from ``p`` leaves it."""
+        if self.count and self._residual is not None and self._residual.shell_mem_mode:
+            self._residual.carry_shell(self, p, s, dt)
 
     def bind(self, s) -> Shell:
         return self.view

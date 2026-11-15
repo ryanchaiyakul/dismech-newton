@@ -189,8 +189,9 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
         self.residual = ConstitutiveResidual(model, residual, device=dev) if residual is not None else None
         if self.residual is not None:
-            self.triplets.bind_residual(self.residual)
-            if self.shells.count:
+            if self.residual.has_rod:
+                self.triplets.bind_residual(self.residual)
+            if self.residual.has_shell:
                 self.shells.bind_residual(self.residual)
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types

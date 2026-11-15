@@ -67,6 +67,8 @@ class Rods:
 
     def bind_residual(self, res) -> None:
         """Bind a constitutive residual so :meth:`effective` evaluates it (fused with Dahl when active)."""
+        if self._has_dahl and getattr(res, "rod_mem_mode", 0):
+            raise ValueError("Cannot combine Dahl rod friction with another memory mode")
         self._residual = res
         res._rods = self
         if self.count:
@@ -89,8 +91,12 @@ class Rods:
         return params, rest
 
     def carry(self, p, s, dt: float = 0.0) -> None:
-        """``s``'s Dahl stresses as the step from ``p`` leaves them (both with their stored strains)."""
-        if self._has_dahl and self.count:
+        """``s``'s carried memory / Dahl stresses as the step from ``p`` leaves them (both with their stored strains)."""
+        if not self.count:
+            return
+        if self._residual is not None and self._residual.rod_mem_mode:
+            self._residual.carry_rod(self, p, s, dt)
+        elif self._has_dahl:
             wp.launch(dahl_update_kernel, dim=self.count, inputs=[p.triplet_strain_q, s.triplet_strain_q,
                       self.params, self.dahl, p.triplet_mem_q], outputs=[s.triplet_mem_q],
                       device=self.params.device)

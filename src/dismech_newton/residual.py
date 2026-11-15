@@ -1,8 +1,9 @@
 """Pure-Warp constitutive residual operators (5D DER rods and 6D BAC shells)."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
+from functools import cache
+from types import SimpleNamespace
+from typing import Literal
 
 import numpy as np
 import warp as wp
@@ -13,6 +14,21 @@ from .rod import Rod, _dkappa, _dphi, _geometry, _oriented, rod_dofs, vec11f
 from .shell import Shell, _angles, _forms, _points, _row, _whiten, shell_dofs, vec21f, vec21i
 
 _ADJ_OPTS = {"enable_backward": True, "max_unroll": 32, "optimization_level": 2}
+_MEM_MODES = {"none": 0, "dahl": 0, "elastoplastic": 1, "prony": 2, "bouc_wen": 3}
+_MEM_ATTRS = {1: ("flow", "yield_weight"), 2: ("k_mem", "tau"), 3: ("k_mem", "flow", "bw_sat")}
+
+@dataclass
+class MemorySpec:
+    """Configuration for carried internal constitutive memory ``h_t`` (elastoplastic, Prony, Bouc-Wen)."""
+    mode: Literal["none", "dahl", "elastoplastic", "bouc_wen", "prony"] = "none"
+    yield_eps: float = 0.0
+    yield_delta: float = 1.0e-3
+    enabled_dims: tuple[int, ...] = (2, 3, 4)
+    k_mem: float | np.ndarray | wp.array = 0.25
+    flow: float | np.ndarray | wp.array = 0.5
+    tau: float | np.ndarray | wp.array = 0.1
+    bw_sat: float | np.ndarray | wp.array = 0.1
+    yield_weight: float | np.ndarray | wp.array = 1.0
 
 @dataclass
 class ResidualSpec:
@@ -30,17 +46,25 @@ class ResidualSpec:
     shell_scales: tuple[float, ...] = (0.05, 0.05, 0.05, 2.0, 2.0, 2.0, 0.5, 0.5, 0.5, 20.0, 20.0, 20.0)
     w_shell: np.ndarray | wp.array | None = None
     shell_spatial_rest_delta: np.ndarray | wp.array | None = None
+    memory: MemorySpec | None = None
+    shell_memory: MemorySpec | None = None
 
 def _as_vec_grad(val, dt, nv: int, n0: int, n1: int | None, dev, name: str) -> wp.array:
-    """Validate/convert a NumPy or Warp array to a differentiable vector ``wp.array`` on ``dev``."""
+    """Validate/convert scalar, NumPy, or Warp array to a differentiable vector ``wp.array`` on ``dev``."""
+    mem, r0, rg = (n0 < 0), max(n0, 0), (n1 is not None)
     if val is None:
-        return wp.zeros((1, n0) if n1 is not None else 1, dtype=dt, device=dev, requires_grad=n1 is not None)
-    sh, w = (((n0,),) if n1 is None else ((1, n0), (n1, n0))), isinstance(val, wp.array)
-    a = val if w else np.asarray(val, dtype=np.float32)
-    a = (a.reshape((1,) + a.shape) if w else a[None]) if n1 is not None and a.shape in ((n0,), (n0, nv)) else a
-    a = (a if a.dtype == dt else (a.view(dt) if a.dtype == wp.float32 and a.shape[-1] == nv else None)) if w else a
-    if a is None or not (a.shape in sh if w else a.shape in tuple(s + (nv,) for s in sh)):
-        raise ValueError(f"{name} shape/dtype mismatch: shape={val.shape}")
+        return wp.zeros((1, r0) if (not mem and rg) else 1, dtype=dt, device=dev, requires_grad=rg)
+    w = isinstance(val, wp.array)
+    a = val if w else np.asarray(val, np.float32)
+    if not w and mem:
+        a = np.full((1, nv), a.item(), "f4") if a.size == 1 else (a[None] if a.shape == (nv,) else a)
+    elif not mem and rg and a.shape in ((r0,), (r0, nv)):
+        a = a.reshape((1,) + a.shape) if w else a[None]
+    a = ((a.reshape(-1) if mem and a.ndim == 2 else a).view(dt) if a.dtype == wp.float32 and a.shape[-1] == nv
+         else (a if a.dtype == dt else None)) if w else a
+    sh = ((1,), (n1,)) if mem else (((r0,),) if not rg else ((1, r0), (n1, r0)))
+    if a is None or a.shape not in (sh if w else tuple(s + (nv,) for s in sh)):
+        raise ValueError(f"{name} shape/dtype mismatch: shape={getattr(val, 'shape', np.shape(val))}")
     out = a if (w and a.device == dev) else wp.array(a.numpy() if w else a, dtype=dt, device=dev)
     out.requires_grad = True
     return out
@@ -60,9 +84,21 @@ def _psi_dpsi(u: float, cn: float) -> wp.vec2:
     eu = wp.exp(-0.5 * u * u)
     return wp.vec2(cn * (wp.sin(u) - u * eu), cn * (wp.cos(u) - (1.0 - u * u) * eu))
 
-@wp.func
-def _ts(x: float) -> float:
-    return wp.tile_sum(wp.tile(x))[0]
+@wp.func_native(snippet=(
+    "#if defined(__CUDA_ARCH__)\nunsigned m = 0xffu << (threadIdx.x & 24);\nx += __shfl_down_sync(m, x, 4, 8); "
+    "x += __shfl_down_sync(m, x, 2, 8); x += __shfl_down_sync(m, x, 1, 8);\n#endif\nreturn x;\n"),
+    adj_snippet=("#if defined(__CUDA_ARCH__)\nadj_x += __shfl_sync(0xffu << (threadIdx.x & 24), adj_ret, 0, 8);\n"
+                 "#else\nadj_x += adj_ret;\n#endif\n"))
+def _ts(x: float) -> float: ...
+
+@wp.func_native(snippet=(
+    "#if defined(__CUDA_ARCH__)\nreturn __shfl_sync(0xffu << (threadIdx.x & 24), x, 0, 8);\n"
+    "#else\nreturn x;\n#endif\n"),
+    adj_snippet=("#if defined(__CUDA_ARCH__)\nunsigned m = 0xffu << (threadIdx.x & 24); float s = adj_ret;\n"
+                 "s += __shfl_down_sync(m, s, 4, 8); s += __shfl_down_sync(m, s, 2, 8); "
+                 "s += __shfl_down_sync(m, s, 1, 8);\nif ((threadIdx.x & 7) == 0) adj_x += s;\n"
+                 "#else\nadj_x += adj_ret;\n#endif\n"))
+def _bcast8(x: float) -> float: ...
 
 @wp.func
 def _clamp_ch(k0: float, c0: float, sig: float, dkr: float, dcr: float, r0: float, er: float, ed: float,
@@ -73,6 +109,90 @@ def _clamp_ch(k0: float, c0: float, sig: float, dkr: float, dcr: float, r0: floa
     dc = wp.where(c0 > 0.0, wp.clamp(dcr, clo * c0, chi * c0),
                   wp.where(k0 > 0.0, wp.clamp(dcr, 0.0, chi * k0 * dt), 0.0))
     return wp.vec3(ks, c0 + dc + d_c, wp.where(ks > 0.0, r0 - mem_i / den - (sig - dk * er - dc * ed) / den, r0))
+
+@cache
+def _mem_ops(N: int, md: int):
+    """Mode-specialized ``module='unique'`` memory step helper and carry kernel for 5D rods and 6D shells."""
+    vt, pt = (vec5f, vec10f) if N == 5 else (vec6f, vec12f)
+    @wp.func(name=f"_gv_{N}_{md}")
+    def _gv(a: wp.array[vt], w: int) -> vt:
+        return a[wp.where(a.shape[0] > 1, w, 0)]
+    @wp.func(name=f"_yg_{N}_{md}")
+    def _yg(d: vt, mk: vt, yv: vt, ye: float, yd: float) -> wp.vec3:
+        r2 = float(0.0)
+        for j in range(N):
+            r2 = r2 + yv[j] * yv[j] * mk[j] * d[j] * d[j]
+        if r2 <= ye * ye:
+            return wp.vec3(0.0)
+        ex = wp.sqrt(r2) - ye
+        return wp.vec3(ex + ye, ex * ex / (ex + yd), ex * (ex + 2.0 * yd) / ((ex + yd) * (ex + yd)))
+    @wp.func(name=f"_mem_step_{N}_{md}")
+    def mem_step(pb: pt, rb_i: vt, dr_i: vt, hdr: int, za: vt, ep: vt, h: vt, sp: vt, dk: vt, dc: vt, ls: vt, sa: vt,
+                 sb: vt, dm0: vt, dc0: vt, w: int, km: wp.array[vt], fl: wp.array[vt], ta: wp.array[vt],
+                 bs: wp.array[vt], yw: wp.array[vt], mk: vt, ye: float, yd: float, clo: float, chi: float, dt: float):
+        po, ro = pt(), vt()
+        r0 = rb_i + dr_i if hdr != 0 else rb_i
+        er, ef = wp.cw_mul(za, sa), vt(0.0)
+        if not wp.isnan(ep[0]):
+            ef = (er + r0 - ep) / dt
+        if wp.static(md == 1):
+            flv, yg = _gv(fl, w), _yg(er - h, mk, _gv(yw, w), ye, yd)
+        if wp.static(md == 2):
+            kmv, tav = _gv(km, w), _gv(ta, w)
+        if wp.static(md == 3):
+            kmv, flv, bsv = _gv(km, w), _gv(fl, w), _gv(bs, w)
+        for j in range(N):
+            k0, dkj, dcj, mvj = pb[j], 0.0, 0.0, 0.0
+            if wp.static(md != 0):
+                if mk[j] != 0.0:
+                    if wp.static(md == 1):
+                        dkj, mvj = -k0 * wp.max(flv[j], 0.0) * yg[2], -k0 * h[j]
+                    if wp.static(md == 2):
+                        dkj = wp.max(kmv[j], 0.0) * k0 * wp.exp(-dt / wp.max(tav[j], 1.0e-6))
+                        mvj = dkj * (er[j] - h[j])
+                    if wp.static(md == 3):
+                        kp, u = wp.max(kmv[j], 0.0) * k0, wp.clamp(h[j] / wp.max(bsv[j], 1.0e-6), -1.0, 1.0)
+                        dcj, mvj = wp.min(dt * kp * wp.max(flv[j], 0.0) * (1.0 - 0.5 * u * u), chi * k0 * dt), kp * h[j]
+            r = _clamp_ch(k0, pb[N + j], ls[j] * sp[j], ls[j] * dk[j] / sa[j] + dkj, ls[j] * dc[j] / sb[j],
+                          r0[j], er[j], ef[j], dm0[j] + mvj, dc0[j] + dcj, clo, chi, dt)
+            po[j] = r[0]
+            po[N + j] = r[1]
+            ro[j] = r[2]
+        return po, ro
+    if not md:
+        return mem_step, None
+    @wp.kernel(name=f"_mem_carry_{N}_{md}", module="unique", module_options=_ADJ_OPTS)
+    def mem_carry(prev: wp.array[vt], strain: wp.array[vt], rb: wp.array[vt], dr: wp.array[vt], hdr: int,
+                  mem: wp.array[vt], ew: wp.array[wp.int32], fl: wp.array[vt], ta: wp.array[vt], bs: wp.array[vt],
+                  yw: wp.array[vt], mk: vt, ye: float, yd: float, dt: float, mem_out: wp.array[vt]):
+        t = wp.tid()
+        h, out = mem[t], vt(0.0)
+        if dt > 0.0:
+            ep, w, r0 = strain[t], ew[t], (rb[t] + dr[t] if hdr != 0 else rb[t])
+            if wp.static(md == 1):
+                flv, yg = _gv(fl, w), _yg(ep - r0 - h, mk, _gv(yw, w), ye, yd)
+            if wp.static(md == 2):
+                tav = _gv(ta, w)
+            if wp.static(md == 3):
+                flv, bsv = _gv(fl, w), _gv(bs, w)
+            for j in range(N):
+                v = h[j]
+                if mk[j] != 0.0:
+                    if wp.static(md == 1):
+                        if yg[0] > 0.0:
+                            v = h[j] + wp.max(flv[j], 0.0) * yg[1] * (ep[j] - r0[j] - h[j]) / yg[0]
+                    if wp.static(md == 2):
+                        v = h[j] + (1.0 - wp.exp(-dt / wp.max(tav[j], 1.0e-6))) * (ep[j] - r0[j] - h[j])
+                    if wp.static(md == 3):
+                        d, B, ad = ep[j] - prev[t][j], wp.max(bsv[j], 1.0e-6), wp.abs(ep[j] - prev[t][j])
+                        if ad > ye:
+                            sm = ad if ye <= 0.0 else (ad - ye) * (ad - ye) / (ad - ye + yd)
+                            u, sn = wp.clamp(h[j] / B, -1.0, 1.0), wp.where(d >= 0.0, 1.0, -1.0)
+                            f = 1.0 - 0.5 * u * u * (1.0 + sn * wp.where(h[j] >= 0.0, 1.0, -1.0))
+                            v = wp.clamp(h[j] + sn * sm * wp.max(flv[j], 0.0) * f, -B, B)
+                out[j] = v
+        mem_out[t] = out if dt > 0.0 else h
+    return mem_step, mem_carry
 
 @wp.func
 def _rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
@@ -109,7 +229,9 @@ def _rff_loop(z_a: vec5f, z_b: vec5f, fr: wp.array[vec10f], wr: wp.array2d[vec5f
         sp = sp + vec5f(w[0] * pd[0], w[1] * pd[0], s2, s3, w[4] * pd[0])
         dk = dk + vec5f(w[0] * f[0] * pd[1], w[1] * f[1] * pd[1], k2, k3, w[4] * f[4] * pd[1])
         dc = dc + vec5f(w[0] * f[5] * pd[1], w[1] * f[6] * pd[1], c2, c3, w[4] * f[9] * pd[1])
-    return sp, dk, dc
+    return (vec5f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4])),
+            vec5f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4])),
+            vec5f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4])))
 
 @wp.func
 def _shell_rff_loop(z_a: vec6f, z_b: vec6f, fr: wp.array[vec12f], wr: wp.array2d[vec6f],
@@ -121,56 +243,57 @@ def _shell_rff_loop(z_a: vec6f, z_b: vec6f, fr: wp.array[vec12f], wr: wp.array2d
         fa, fb = vec6f(f[0], f[1], f[2], f[3], f[4], f[5]), vec6f(f[6], f[7], f[8], f[9], f[10], f[11])
         pd = _psi_dpsi(wp.dot(fa, z_a) + wp.dot(fb, z_b), cn)
         sp, dk, dc = sp + pd[0] * w, dk + pd[1] * wp.cw_mul(w, fa), dc + pd[1] * wp.cw_mul(w, fb)
-    return sp, dk, dc
+    return (vec6f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4]), _ts(sp[5])),
+            vec6f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4]), _ts(dk[5])),
+            vec6f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4]), _ts(dc[5])))
 
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
-def _rod_prep_kernel(q: wp.array[float], u: wp.array[float], v: Rod, rb: wp.array[vec5f], sq: wp.array[vec5f],
-                     dr: wp.array[vec5f], sc: vec10f, has_dr: int, dt: float, za: wp.array[vec5f],
-                     zb: wp.array[vec5f], ef: wp.array[vec5f], r0o: wp.array[vec5f]):
-    """Compute dimensionless triplet strain/rate coordinates ``(z_a, z_b)`` and rest state per rod triplet."""
-    t = wp.tid()
-    d = rod_dofs(v, t)
-    x = vec11f(q[d[0]], q[d[1]], q[d[2]], q[d[3]], q[d[4]], q[d[5]], q[d[6]], q[d[7]], q[d[8]], q[d[9]], q[d[10]])
-    xd = vec11f(u[d[0]], u[d[1]], u[d[2]], u[d[3]], u[d[4]], u[d[5]], u[d[6]], u[d[7]], u[d[8]], u[d[9]], u[d[10]])
-    eps, ed = _rod_strain_rate(x, xd, v, t)
-    ep, r0, c = sq[t], (rb[t] + dr[t] if has_dr != 0 else rb[t]), v.conn[t]
-    ef[t] = vec5f(0.0)
-    if not wp.isnan(ep[0]):
-        ef[t] = (eps - ep) / dt
-    r0o[t] = r0
-    er, dl = eps - r0, 0.5 * (float(v.edge_length[c[0]]) + float(v.edge_length[c[1]]))
-    za[t] = vec5f(er[0] / sc[0], er[1] / sc[1], er[2] / (dl * sc[2]), er[3] / (dl * sc[3]), er[4] / (dl * sc[4]))
-    zb[t] = vec5f(ed[0] / sc[5], ed[1] / sc[6], ed[2] / (dl * sc[7]), ed[3] / (dl * sc[8]), ed[4] / (dl * sc[9]))
-
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
-def _rod_constit_step_kernel(v: Rod, p_base: wp.array[vec10f], dahl: wp.array[wp.vec2], mem: wp.array[vec5f],
-    fr: wp.array[vec10f], w_rod: wp.array2d[vec5f], ew: wp.array[wp.int32], share: wp.array[wp.vec2],
-    za_in: wp.array[vec5f], zb_in: wp.array[vec5f], ef_in: wp.array[vec5f], r0_in: wp.array[vec5f], sc: vec10f,
-    iso: int, stride: int, clo: float, chi: float, dt: float, p_out: wp.array[vec10f], r_out: wp.array[vec5f]):
-    """Tiled 5D DER rod RFF evaluation, warp-tile reduction, SPD tangent clamping, and additive Dahl."""
-    t, lane = wp.tid()
-    R_, z_a, wi = fr.shape[0], za_in[t], wp.where(w_rod.shape[0] > 1, ew[t], 0)
-    sp, dk, dc = _rff_loop(z_a, zb_in[t], fr, w_rod, wi, R_, lane, stride, wp.sqrt(2.0 / float(R_)), iso)
-    sp = vec5f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4]))
-    dk = vec5f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4]))
-    dc = vec5f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4]))
-    if lane == 0:
-        c, sv, dv = v.conn[t], share[t], dahl[t]
-        le, lf = float(v.edge_length[c[0]]), float(v.edge_length[c[1]])
-        dl, ls = 0.5 * (le + lf), vec5f(sv[0] * le, sv[1] * lf, 1.0, 1.0, 1.0)
-        sa = vec5f(sc[0], sc[1], dl * sc[2], dl * sc[3], dl * sc[4])
-        sb = vec5f(sc[5], sc[6], dl * sc[7], dl * sc[8], dl * sc[9])
-        on, po, ro = wp.where(dv[0] > 0.0 and dv[1] > 0.0, 1.0, 0.0), vec10f(), vec5f()
-        rate, pb, r0, ef, mv = on * dt * dv[0] / wp.max(dv[1], 1.0e-30), p_base[t], r0_in[t], ef_in[t], mem[t]
-        for i in range(5):
-            r = _clamp_ch(pb[i], pb[5 + i], ls[i] * sp[i], ls[i] * dk[i] / sa[i], ls[i] * dc[i] / sb[i],
-                          r0[i], z_a[i] * sa[i], ef[i], on * mv[i] if i >= 2 else 0.0,
-                          rate * pb[i] if i >= 2 else 0.0, clo, chi, dt)
-            po[i] = r[0]
-            po[5 + i] = r[1]
-            ro[i] = r[2]
-        p_out[t] = po
-        r_out[t] = ro
+@cache
+def _rod_step_fn(md: int):
+    """Fused 5D DER rod strain/rate, RFF reduction, SPD clamping, Dahl, and memory kernel."""
+    mem_step, _ = _mem_ops(5, md)
+    @wp.kernel(name=f"_rod_step_m{md}", module="unique", module_options=_ADJ_OPTS)
+    def step(q: wp.array[float], u: wp.array[float], v: Rod, pb: wp.array[vec10f], rb: wp.array[vec5f],
+             sq: wp.array[vec5f], dr: wp.array[vec5f], has_dr: int, dahl: wp.array[wp.vec2], fr: wp.array[vec10f],
+             wr: wp.array2d[vec5f], ew: wp.array[wp.int32], share: wp.array[wp.vec2], mem: wp.array[vec5f],
+             km: wp.array[vec5f], fl: wp.array[vec5f], ta: wp.array[vec5f], bs: wp.array[vec5f], yw: wp.array[vec5f],
+             mk: vec5f, ye: float, yd: float, sc: vec10f, iso: int, st: int, clo: float, chi: float, dt: float,
+             pout: wp.array[vec10f], rout: wp.array[vec5f]):
+        t, lane, za, zb = wp.tid() // st, wp.tid() % st, vec5f(0.0), vec5f(0.0)
+        le, lf, dl = float(0.0), float(0.0), float(0.0)
+        if lane == 0:
+            c, d = v.conn[t], rod_dofs(v, t)
+            x = vec11f(q[d[0]], q[d[1]], q[d[2]], q[d[3]], q[d[4]], q[d[5]],
+                       q[d[6]], q[d[7]], q[d[8]], q[d[9]], q[d[10]])
+            xd = vec11f(u[d[0]], u[d[1]], u[d[2]], u[d[3]], u[d[4]], u[d[5]],
+                        u[d[6]], u[d[7]], u[d[8]], u[d[9]], u[d[10]])
+            eps, ed = _rod_strain_rate(x, xd, v, t)
+            er = eps - (rb[t] + dr[t] if has_dr != 0 else rb[t])
+            le, lf = float(v.edge_length[c[0]]), float(v.edge_length[c[1]])
+            dl = 0.5 * (le + lf)
+            za = vec5f(er[0] / sc[0], er[1] / sc[1], er[2] / (dl * sc[2]), er[3] / (dl * sc[3]), er[4] / (dl * sc[4]))
+            zb = vec5f(ed[0] / sc[5], ed[1] / sc[6], ed[2] / (dl * sc[7]), ed[3] / (dl * sc[8]), ed[4] / (dl * sc[9]))
+        z_a, z_b = za, zb
+        if st > 1:
+            z_a = vec5f(_bcast8(za[0]), _bcast8(za[1]), _bcast8(za[2]), _bcast8(za[3]), _bcast8(za[4]))
+            z_b = vec5f(_bcast8(zb[0]), _bcast8(zb[1]), _bcast8(zb[2]), _bcast8(zb[3]), _bcast8(zb[4]))
+        R_, wi = fr.shape[0], (ew[t] if wr.shape[0] > 1 else 0)
+        sp, dk, dc = vec5f(0.0), vec5f(0.0), vec5f(0.0)
+        if R_ > 0:
+            sp, dk, dc = _rff_loop(z_a, z_b, fr, wr, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)), iso)
+        if lane == 0:
+            sv, dv, p0, mv = share[t], dahl[t], pb[t], mem[t]
+            ls = vec5f(sv[0] * le, sv[1] * lf, 1.0, 1.0, 1.0)
+            on = wp.where(dv[0] > 0.0 and dv[1] > 0.0, 1.0, 0.0)
+            rt = on * dt * dv[0] / wp.max(dv[1], 1.0e-30)
+            dm0 = vec5f(0.0, 0.0, on * mv[2], on * mv[3], on * mv[4])
+            dc0 = vec5f(0.0, 0.0, rt * p0[2], rt * p0[3], rt * p0[4])
+            sa = vec5f(sc[0], sc[1], dl * sc[2], dl * sc[3], dl * sc[4])
+            sb = vec5f(sc[5], sc[6], dl * sc[7], dl * sc[8], dl * sc[9])
+            po, ro = mem_step(p0, rb[t], dr[t], has_dr, z_a, sq[t], mv, sp, dk, dc, ls, sa, sb, dm0, dc0,
+                              ew[t], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
+            pout[t] = po
+            rout[t] = ro
+    return step
 
 @wp.func
 def _v21(a: wp.array[float], d: vec21i) -> vec21f:
@@ -202,56 +325,51 @@ def _shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
         dg[i] = c * (dnn - h * wp.dot(tn, dpk - dpj)) / L + h * (1.0 + c * c) * (dpsi + float(v.sign[f][i]) * dth[i])
     return _whiten(v, f, m, g), _whiten(v, f, dm, dg)
 
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
-def _shell_prep_kernel(q: wp.array[float], qd: wp.array[float], v: Shell, rb: wp.array[vec6f], sq: wp.array[vec6f],
-                       dr: wp.array[vec6f], sc: vec12f, has_dr: int, dt: float, za: wp.array[vec6f],
-                       zb: wp.array[vec6f], ef: wp.array[vec6f], r0o: wp.array[vec6f]):
-    """Compute dimensionless face strain/rate coordinates ``(z_a, z_b)`` and rest state per shell face."""
-    f = wp.tid()
-    d = shell_dofs(v, f)
-    eps, ed = _shell_strain_rate(_v21(q, d), _v21(qd, d), v, f)
-    ep, r0 = sq[f], (rb[f] + dr[f] if has_dr != 0 else rb[f])
-    ef[f] = vec6f(0.0)
-    if not wp.isnan(ep[0]):
-        ef[f] = (eps - ep) / dt
-    r0o[f] = r0
-    er = eps - r0
-    za[f] = vec6f(er[0] / sc[0], er[1] / sc[1], er[2] / sc[2], er[3] / sc[3], er[4] / sc[4], er[5] / sc[5])
-    zb[f] = vec6f(ed[0] / sc[6], ed[1] / sc[7], ed[2] / sc[8], ed[3] / sc[9], ed[4] / sc[10], ed[5] / sc[11])
-
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
-def _shell_constit_step_kernel(pb: wp.array[vec12f], ar: wp.array[float], fr: wp.array[vec12f], ws: wp.array2d[vec6f],
-    ew: wp.array[wp.int32], za: wp.array[vec6f], zb: wp.array[vec6f], ef: wp.array[vec6f], r0i: wp.array[vec6f],
-    sc: vec12f, st: int, clo: float, chi: float, dt: float, pout: wp.array[vec12f], rout: wp.array[vec6f]):
-    """Tiled 6D BAC shell RFF evaluation, warp-tile reduction, area scaling, and SPD tangent clamping."""
-    f, lane = wp.tid()
-    R_, z_a, wi = fr.shape[0], za[f], wp.where(ws.shape[0] > 1, ew[f], 0)
-    sp, dk, dc = _shell_rff_loop(z_a, zb[f], fr, ws, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)))
-    sp = vec6f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4]), _ts(sp[5]))
-    dk = vec6f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4]), _ts(dk[5]))
-    dc = vec6f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4]), _ts(dc[5]))
-    if lane == 0:
-        af, p0, r0, ef_, po, ro = ar[f], pb[f], r0i[f], ef[f], vec12f(), vec6f()
-        for i in range(6):
-            r = _clamp_ch(p0[i], p0[6 + i], af * sp[i], af * dk[i] / sc[i], af * dc[i] / sc[6 + i],
-                          r0[i], z_a[i] * sc[i], ef_[i], 0.0, 0.0, clo, chi, dt)
-            po[i] = r[0]
-            po[6 + i] = r[1]
-            ro[i] = r[2]
-        pout[f] = po
-        rout[f] = ro
+@cache
+def _shell_step_fn(md: int):
+    """Fused 6D BAC shell strain/rate, RFF reduction, SPD clamping, and memory kernel."""
+    mem_step, _ = _mem_ops(6, md)
+    @wp.kernel(name=f"_shell_step_m{md}", module="unique", module_options=_ADJ_OPTS)
+    def step(q: wp.array[float], qd: wp.array[float], v: Shell, pb: wp.array[vec12f], rb: wp.array[vec6f],
+             sq: wp.array[vec6f], dr: wp.array[vec6f], has_dr: int, ar: wp.array[float], fr: wp.array[vec12f],
+             ws: wp.array2d[vec6f], ew: wp.array[wp.int32], mem: wp.array[vec6f], km: wp.array[vec6f],
+             fl: wp.array[vec6f], ta: wp.array[vec6f], bs: wp.array[vec6f], yw: wp.array[vec6f], mk: vec6f,
+             ye: float, yd: float, sc: vec12f, st: int, clo: float, chi: float, dt: float, pout: wp.array[vec12f],
+             rout: wp.array[vec6f]):
+        f, lane, za, zb = wp.tid() // st, wp.tid() % st, vec6f(0.0), vec6f(0.0)
+        if lane == 0:
+            d = shell_dofs(v, f)
+            eps, ed = _shell_strain_rate(_v21(q, d), _v21(qd, d), v, f)
+            er = eps - (rb[f] + dr[f] if has_dr != 0 else rb[f])
+            za = vec6f(er[0] / sc[0], er[1] / sc[1], er[2] / sc[2], er[3] / sc[3], er[4] / sc[4], er[5] / sc[5])
+            zb = vec6f(ed[0] / sc[6], ed[1] / sc[7], ed[2] / sc[8], ed[3] / sc[9], ed[4] / sc[10], ed[5] / sc[11])
+        z_a, z_b = za, zb
+        if st > 1:
+            z_a = vec6f(_bcast8(za[0]), _bcast8(za[1]), _bcast8(za[2]), _bcast8(za[3]), _bcast8(za[4]), _bcast8(za[5]))
+            z_b = vec6f(_bcast8(zb[0]), _bcast8(zb[1]), _bcast8(zb[2]), _bcast8(zb[3]), _bcast8(zb[4]), _bcast8(zb[5]))
+        R_, wi = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0)
+        sp, dk, dc = vec6f(0.0), vec6f(0.0), vec6f(0.0)
+        if R_ > 0:
+            sp, dk, dc = _shell_rff_loop(z_a, z_b, fr, ws, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)))
+        if lane == 0:
+            sa, sb = vec6f(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5]), vec6f(sc[6], sc[7], sc[8], sc[9], sc[10], sc[11])
+            po, ro = mem_step(pb[f], rb[f], dr[f], has_dr, z_a, sq[f], mem[f], sp, dk, dc, vec6f(ar[f]), sa, sb,
+                              vec6f(0.0), vec6f(0.0), ew[f], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
+            pout[f] = po
+            rout[f] = ro
+    return step
 
 class ConstitutiveResidual:
-    """Pre-allocated pure-Warp 5D DER rod and 6D BAC shell constitutive residual evaluator."""
+    """Pre-allocated pure-Warp 5D DER rod and 6D BAC shell constitutive residual and memory evaluator."""
     def __init__(self, model: Model, spec: ResidualSpec, device=None):
-        if (min(spec.rod_rff_dim, spec.shell_rff_dim, *spec.rod_scales, *spec.shell_scales) <= 0.0
+        if (min(spec.rod_rff_dim, spec.shell_rff_dim) < 0 or min(*spec.rod_scales, *spec.shell_scales) <= 0.0
                 or len(spec.rod_scales) != 10 or len(spec.shell_scales) != 12
                 or not (-1.0 < spec.clamp_lo <= spec.clamp_hi)):
             raise ValueError("Invalid ResidualSpec parameters")
         self.spec, self.device = spec, wp.get_device(model.device if device is None else device)
         self.clamp_lo, self.clamp_hi = float(spec.clamp_lo), float(spec.clamp_hi)
         self.scales, self.shell_scales = vec10f(*map(float, spec.rod_scales)), vec12f(*map(float, spec.shell_scales))
-        self._rods, self._shells, self.iso_bending = None, None, int(bool(spec.iso_bending))
+        self.iso_bending = int(bool(spec.iso_bending))
         d, pw = model.dismech, (model.particle_world.numpy() if model.particle_count else np.zeros(0, np.int32))
         gm = model.world_count > 1 and (pw < 0).any()
         self._nw = 1 if (gm or not pw.size) else int(np.maximum(pw, 0).max(initial=0)) + 1
@@ -261,55 +379,75 @@ class ConstitutiveResidual:
         cnt = np.bincount(np.concatenate([e, f]), minlength=d.edge_length.shape[0]) if nt else None
         es = np.column_stack([1.0 / cnt[e], 1.0 / cnt[f]]).astype(np.float32) if nt else np.zeros((0, 2), np.float32)
         self.edge_share = wp.array(es, dtype=wp.vec2, device=self.device)
-        rn, fn = (d.edge_node0.numpy()[e] if nt else None), (d.face_node0.numpy() if nf else None)
-        (self.elem_world, self.params_step, self.rest_step, self._rb, self.rff_freq, self.w_rod, self.has_d_rest,
-         self.d_rest) = self._elem(nt, vec10f, vec5f, 5, rn, pw, gm, False)
-        (self.shell_elem_world, self.shell_params_step, self.shell_rest_step, self._sb, self.shell_rff_freq,
-         self.w_shell, self.has_d_rest_shell, self.d_rest_shell) = self._elem(nf, vec12f, vec6f, 6, fn, pw, gm, True)
+        rc = self._elem(nt, d.edge_node0.numpy()[e] if nt else None, pw, gm, False)
+        sc = self._elem(nf, d.face_node0.numpy() if nf else None, pw, gm, True)
+        (self.elem_world, self.params_step, self.rest_step, self.rff_freq, self.w_rod, self.has_d_rest,
+         self.d_rest, self.mem_rod) = rc
+        (self.shell_elem_world, self.shell_params_step, self.shell_rest_step, self.shell_rff_freq,
+         self.w_shell, self.has_d_rest_shell, self.d_rest_shell, self.mem_shell) = sc
+        self.rod_mem_mode, self.shell_mem_mode, self._ctx = self.mem_rod.mode, self.mem_shell.mode, (rc, sc)
+        self.has_rod = bool(nt and (spec.rod_rff_dim > 0 or self.has_d_rest or self.rod_mem_mode != 0))
+        self.has_shell = bool(nf and (spec.shell_rff_dim > 0 or self.has_d_rest_shell or self.shell_mem_mode != 0))
 
-    def _elem(self, n: int, p_dt, v_dt, nv: int, nodes, pw, gm, shell: bool):
-        dev, sp = self.device, self.spec
-        dim, seed, w_v, dr_v, tag = ((sp.shell_rff_dim, sp.seed + 1, sp.w_shell, sp.shell_spatial_rest_delta, "shell")
-                                     if shell else (sp.rod_rff_dim, sp.seed, sp.w_rod, sp.spatial_rest_delta, "rod"))
-        rff = np.random.default_rng(seed).normal(0.0, sp.rff_bandwidth, (dim, 2 * nv))
-        bufs = tuple(wp.empty(n, dtype=v_dt, device=dev, requires_grad=True) for _ in range(4))
-        ew = np.zeros(n, np.int32) if (gm or not n) else np.maximum(pw[nodes], 0)
-        has_dr = int(dr_v is not None and n > 0)
-        return (wp.array(ew.astype(np.int32), dtype=wp.int32, device=dev), wp.empty(n, dtype=p_dt, device=dev),
-                wp.empty(n, dtype=v_dt, device=dev), bufs, wp.array(rff.astype(np.float32), dtype=p_dt, device=dev),
-                _as_vec_grad(w_v, v_dt, nv, dim, self._nw, dev, f"w_{tag}"), has_dr,
-                _as_vec_grad(dr_v if has_dr else None, v_dt, nv, n, None, dev, f"{tag}_spatial_rest_delta"))
+    def _elem(self, n: int, nodes, pw, gm, shell: bool):
+        dev, sp, (nv, p_dt, v_dt) = self.device, self.spec, (6, vec12f, vec6f) if shell else (5, vec10f, vec5f)
+        dim, seed, w_v, dr_v, ms = ((sp.shell_rff_dim, sp.seed + 1, sp.w_shell, sp.shell_spatial_rest_delta,
+            sp.shell_memory) if shell else (sp.rod_rff_dim, sp.seed, sp.w_rod, sp.spatial_rest_delta, sp.memory))
+        ms = ms or MemorySpec()
+        if (ms.mode not in _MEM_MODES or (shell and ms.mode == "dahl") or ms.yield_eps < 0.0 or ms.yield_delta <= 0.0
+                or any(i < 0 or i >= nv for i in ms.enabled_dims)):
+            raise ValueError(f"Invalid MemorySpec: {ms}")
+        md, pfx, hdr = _MEM_MODES[ms.mode], ("shell_" if shell else ""), int(dr_v is not None and n > 0)
+        mem = SimpleNamespace(mode=md, mk=v_dt(*(float(i in ms.enabled_dims) for i in range(nv))),
+            ye=float(ms.yield_eps), yd=float(ms.yield_delta), pr=wp.empty(n if md == 3 else 0, dtype=v_dt,
+            device=dev, requires_grad=True), **{k: _as_vec_grad(getattr(ms, k), v_dt, nv, -1, self._nw, dev, k)
+            for k in ("k_mem", "flow", "tau", "bw_sat", "yield_weight")})
+        rff = np.random.default_rng(seed).normal(0.0, sp.rff_bandwidth, (dim, 2 * nv)).astype(np.float32)
+        ew = np.zeros(n, np.int32) if (gm or not n) else np.maximum(pw[nodes], 0).astype(np.int32)
+        return (wp.array(ew, dtype=wp.int32, device=dev), wp.empty(n, dtype=p_dt, device=dev),
+                wp.empty(n, dtype=v_dt, device=dev), wp.array(rff, dtype=p_dt, device=dev),
+                _as_vec_grad(w_v, v_dt, nv, dim, self._nw, dev, "w_shell" if shell else "w_rod"), hdr,
+                _as_vec_grad(dr_v if hdr else None, v_dt, nv, n, None, dev, f"{pfx}spatial_rest_delta"), mem)
 
     def grad_inputs(self) -> list[wp.array]:
         """Differentiable parameter arrays tracked by ``SolverDiSMech._record``."""
-        return [a for c, a in ((self.rod_count or self.spec.w_rod is not None, self.w_rod),
-                               (self.has_d_rest, self.d_rest), (self.has_d_rest_shell, self.d_rest_shell),
-                               (self.shell_count or self.spec.w_shell is not None, self.w_shell)) if c]
+        c = ((self.spec.rod_rff_dim and (self.rod_count or self.spec.w_rod is not None), self.w_rod),
+             (self.has_d_rest, self.d_rest), (self.has_d_rest_shell, self.d_rest_shell),
+             (self.spec.shell_rff_dim and (self.shell_count or self.spec.w_shell is not None), self.w_shell))
+        return [a for k, a in c if k] + [getattr(m, k) for n, m in ((self.rod_count, self.mem_rod),
+                (self.shell_count, self.mem_shell)) if n for k in _MEM_ATTRS.get(m.mode, ())]
 
     def _eval(self, shell: bool, el, s, dt: float, pb, rb, po, ro) -> None:
-        if not hasattr(el, "bind"):
-            el, s, dt, pb, rb, po, ro = (self._shells if shell else self._rods), el, s, dt, pb, rb, po
         if not el.count:
             return
-        d_p, d_r, bufs, pk, sk = (
-            (self.shell_params_step, self.shell_rest_step, self._sb, _shell_prep_kernel, _shell_constit_step_kernel)
-            if shell else (self.params_step, self.rest_step, self._rb, _rod_prep_kernel, _rod_constit_step_kernel))
-        po, ro = (d_p if po is None else po), (d_r if ro is None else ro)
-        for b in (b for b in (bufs if po.requires_grad or ro.requires_grad else ()) if b.grad is not None):
-            b.grad.zero_()
-        eb, t = el.bind(s), (1 if self.device.is_cpu else 32, self.clamp_lo, self.clamp_hi, dt)
-        pin = ([s.q, s.qd, eb, rb, s.face_strain_q, self.d_rest_shell, self.shell_scales, self.has_d_rest_shell, dt]
-               if shell else [s.q, s.qd, eb, rb, s.triplet_strain_q, self.d_rest, self.scales, self.has_d_rest, dt])
-        sin = ([pb, el.area, self.shell_rff_freq, self.w_shell, self.shell_elem_world, *bufs, self.shell_scales, *t]
-               if shell else [eb, pb, el.dahl, s.triplet_mem_q, self.rff_freq, self.w_rod, self.elem_world,
-                              self.edge_share, *bufs, self.scales, self.iso_bending, *t])
-        wp.launch(pk, dim=el.count, device=self.device, inputs=pin, outputs=list(bufs))
-        wp.launch_tiled(sk, dim=[el.count], block_dim=32, device=self.device, inputs=sin, outputs=[po, ro])
+        ew, dp, dr, rff, w_arr, hdr, d_rest, m = self._ctx[shell]
+        st, bd = (1, 1) if self.device.is_cpu else ((1, 128) if not rff.shape[0] else (8, 128))
+        ma = (getattr(s, el.memory), m.k_mem, m.flow, m.tau, m.bw_sat, m.yield_weight, m.mk, m.ye, m.yd)
+        sk, xs = (_shell_step_fn(m.mode), [el.area, rff, w_arr, ew, *ma, self.shell_scales]) if shell else (
+            _rod_step_fn(m.mode), [el.dahl, rff, w_arr, ew, self.edge_share, *ma, self.scales, self.iso_bending])
+        wp.launch(sk, el.count * st, block_dim=bd, device=self.device, outputs=[dp if po is None else po,
+                  dr if ro is None else ro], inputs=[s.q, s.qd, el.bind(s), pb, rb, getattr(s, el.stored),
+                  d_rest, hdr, *xs, st, self.clamp_lo, self.clamp_hi, dt])
+
+    def _carry(self, shell: bool, el, p, s, dt: float) -> None:
+        ew, _, _, _, _, hdr, d_rest, m = self._ctx[shell]
+        if not el.count or not m.mode:
+            return
+        out, prev = getattr(s, el.memory), getattr(p, el.stored)
+        if m.mode == 3 and dt > 0.0:
+            if out.requires_grad and m.pr.grad is not None:
+                m.pr.grad.zero_()
+            wp.launch(el.kernels.previous, el.count, inputs=[prev, p.q, el.bind(p)], outputs=[m.pr], device=self.device)
+            prev = m.pr
+        wp.launch(_mem_ops(6 if shell else 5, m.mode)[1], el.count, block_dim=1 if self.device.is_cpu else 128,
+                  device=self.device, outputs=[out], inputs=[prev, getattr(s, el.stored), el.rest, d_rest, hdr,
+                  getattr(p, el.memory), ew, m.flow, m.tau, m.bw_sat, m.yield_weight, m.mk, m.ye, m.yd, dt])
 
     def eval_rod(self, rods, s, dt: float, params_base, rest_base, params_out=None, rest_out=None) -> None:
-        """Compute step-effective ``(params_out, rest_out)`` for DER rods from state ``s``."""
         self._eval(False, rods, s, dt, params_base, rest_base, params_out, rest_out)
-
     def eval_shell(self, shells, s, dt: float, params_base, rest_base, params_out=None, rest_out=None) -> None:
-        """Compute step-effective ``(params_out, rest_out)`` for BAC shells from state ``s``."""
         self._eval(True, shells, s, dt, params_base, rest_base, params_out, rest_out)
+    def carry_rod(self, rods, p, s, dt: float) -> None:
+        self._carry(False, rods, p, s, dt)
+    def carry_shell(self, shells, p, s, dt: float) -> None:
+        self._carry(True, shells, p, s, dt)

@@ -1,6 +1,7 @@
 """Phase 2 tests for 6D BAC ``Shells`` constitutive residual, $SE(3)$ invariance, adjoint FD, and FrameGraph."""
 
-import time
+import gc
+from functools import cache
 
 import newton
 import numpy as np
@@ -15,7 +16,7 @@ from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import solver as dn_solver
 from dismech_newton.adjoint import StepAdjoint
 from dismech_newton.builder import Rod, add_rod, fix_segment, vec6f, vec12f
-from dismech_newton.residual import ResidualSpec
+from dismech_newton.residual import _ADJ_OPTS, ResidualSpec, _mem_ops, _shell_rff_loop
 
 
 def _finalize_multiworld(sub: newton.ModelBuilder, worlds: int, device) -> newton.Model:
@@ -287,29 +288,44 @@ def test_shell_origin_and_se3_invariance(device, rng):
 
     # 2) Odd/even parity on (z_a, z_b) -> (-z_a, -z_b) AND physical small-deflection parity
     res = solver.residual
+    m = res.mem_shell
+    mem_zero = wp.zeros(solver.shells.count, dtype=vec6f, device=device)
+    za_t = wp.empty(solver.shells.count, dtype=vec6f, device=device)
+    zb_t = wp.empty(solver.shells.count, dtype=vec6f, device=device)
     za_np = rng.normal(0.0, 0.5, size=(solver.shells.count, 6)).astype(np.float32)
     zb_np = rng.normal(0.0, 0.5, size=(solver.shells.count, 6)).astype(np.float32)
+    step_kernel = _get_shell_step_kernel()
     for sign, store in ((1.0, "pos"), (-1.0, "neg")):
-        res._sb[0].assign(sign * za_np)
-        res._sb[1].assign(sign * zb_np)
-        res._sb[2].assign(np.zeros((solver.shells.count, 6), dtype=np.float32))
-        res._sb[3].assign(solver.shells.rest.numpy())
+        za_t.assign(sign * za_np)
+        zb_t.assign(sign * zb_np)
         p_t = wp.empty_like(solver.shells.params)
         r_t = wp.empty_like(solver.shells.rest)
-        stride = 1 if wp.get_device(device).is_cpu else 32
-        wp.launch_tiled(
-            res._shell_step_kernel if hasattr(res, "_shell_step_kernel") else _get_shell_step_kernel(),
-            dim=solver.shells.count,
+        stride = 1 if wp.get_device(device).is_cpu else 8
+        wp.launch(
+            step_kernel,
+            dim=solver.shells.count * stride,
             inputs=[
                 solver.shells.params,
+                solver.shells.rest,
+                wp.full(solver.shells.count, float("nan"), dtype=vec6f, device=device),
+                res.d_rest_shell,
+                res.has_d_rest_shell,
                 solver.shells.area,
                 res.shell_rff_freq,
                 res.w_shell,
                 res.shell_elem_world,
-                res._sb[0],
-                res._sb[1],
-                res._sb[2],
-                res._sb[3],
+                za_t,
+                zb_t,
+                mem_zero,
+                m.k_mem,
+                m.flow,
+                m.tau,
+                m.bw_sat,
+                m.yield_weight,
+                m.mk,
+                m.mode,
+                m.ye,
+                m.yd,
                 res.shell_scales,
                 stride,
                 res.spec.clamp_lo,
@@ -317,7 +333,7 @@ def test_shell_origin_and_se3_invariance(device, rng):
                 dt,
             ],
             outputs=[p_t, r_t],
-            block_dim=32,
+            block_dim=1 if wp.get_device(device).is_cpu else 128,
             device=device,
         )
         if store == "pos":
@@ -384,8 +400,80 @@ def test_shell_origin_and_se3_invariance(device, rng):
     np.testing.assert_allclose(sb.particle_qd.numpy(), sa.particle_qd.numpy() @ rot_m.T, atol=1e-4, rtol=1e-3)
 
 
+@cache
 def _get_shell_step_kernel():
-    from dismech_newton.residual import _shell_constit_step_kernel
+    mem_step6_0, _ = _mem_ops(6, 0)
+
+    @wp.kernel(module="unique", module_options=_ADJ_OPTS)
+    def _shell_constit_step_kernel(
+        pb: wp.array[vec12f],
+        rb: wp.array[vec6f],
+        sq: wp.array[vec6f],
+        dr: wp.array[vec6f],
+        has_dr: int,
+        ar: wp.array[float],
+        fr: wp.array[vec12f],
+        ws: wp.array2d[vec6f],
+        ew: wp.array[wp.int32],
+        za: wp.array[vec6f],
+        zb: wp.array[vec6f],
+        mem: wp.array[vec6f],
+        km: wp.array[vec6f],
+        fl: wp.array[vec6f],
+        ta: wp.array[vec6f],
+        bs: wp.array[vec6f],
+        yw: wp.array[vec6f],
+        mk: vec6f,
+        md: int,
+        ye: float,
+        yd: float,
+        sc: vec12f,
+        st: int,
+        clo: float,
+        chi: float,
+        dt: float,
+        pout: wp.array[vec12f],
+        rout: wp.array[vec6f],
+    ):
+        f, lane = wp.tid() // st, wp.tid() % st
+        R_, wi, z_a = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0), za[f]
+        sp, dk, dc = _shell_rff_loop(
+            z_a, zb[f], fr, ws, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)) if R_ > 0 else 0.0
+        )
+        if lane == 0:
+            sa = vec6f(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5])
+            sb = vec6f(sc[6], sc[7], sc[8], sc[9], sc[10], sc[11])
+            po, ro = mem_step6_0(
+                pb[f],
+                rb[f],
+                dr[f],
+                has_dr,
+                z_a,
+                sq[f],
+                mem[f],
+                sp,
+                dk,
+                dc,
+                vec6f(ar[f]),
+                sa,
+                sb,
+                vec6f(0.0),
+                vec6f(0.0),
+                ew[f],
+                km,
+                fl,
+                ta,
+                bs,
+                yw,
+                mk,
+                ye,
+                yd,
+                clo,
+                chi,
+                dt,
+            )
+            pout[f] = po
+            rout[f] = ro
 
     return _shell_constit_step_kernel
 
@@ -693,7 +781,10 @@ def test_shell_residual_framegraph_w256(device, rng):
         np.float32
     )
     dt = 0.01
-    warmup_iters, rounds, substeps = 15, 7, 4
+    warmup_iters, iters, rounds, substeps = 15, 20, 7, 4
+    stream = wp.get_stream(model.device)
+    e0 = wp.Event(device=model.device, enable_timing=True)
+    e1 = wp.Event(device=model.device, enable_timing=True)
 
     def _compile_warm(solver: SolverDiSMech):
         s0, s1 = model.state(), model.state()
@@ -709,13 +800,14 @@ def test_shell_residual_framegraph_w256(device, rng):
         assert fg.graph is not None
         return fg, s0
 
-    def _run_block(fg: FrameGraph, iters: int = 15) -> float:
+    def _run_block(fg: FrameGraph) -> float:
         wp.synchronize()
-        t0 = time.perf_counter()
+        stream.record_event(e0)
         for _ in range(iters):
             fg()
+        stream.record_event(e1)
         wp.synchronize()
-        return 1000.0 * (time.perf_counter() - t0) / (substeps * iters)
+        return float(wp.get_event_elapsed_time(e0, e1)) / (substeps * iters)
 
     print()
     for sc in (False, True):
@@ -723,14 +815,20 @@ def test_shell_residual_framegraph_w256(device, rng):
         s_res = SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(shell_rff_dim=R, w_shell=w_nz, seed=5))
         fg_base, s0_base = _compile_warm(s_base)
         fg_res, s0_res = _compile_warm(s_res)
-        times_base, times_res = [], []
-        for _ in range(rounds):
-            times_base.append(_run_block(fg_base))
-            times_res.append(_run_block(fg_res))
-        ms_base = float(np.median(times_base))
-        ms_res = float(np.median(times_res))
+        round_pairs = []
+        gc.collect()
+        for r in range(rounds):
+            if r % 2 == 0:
+                tb = _run_block(fg_base)
+                tr = _run_block(fg_res)
+            else:
+                tr = _run_block(fg_res)
+                tb = _run_block(fg_base)
+            round_pairs.append((tb, tr))
+        ms_base = float(np.median([tb for tb, _ in round_pairs]))
+        ms_res = float(np.median([tr for _, tr in round_pairs]))
         q_base, q_res = s0_base.particle_q.numpy(), s0_res.particle_q.numpy()
-        overhead_pct = 100.0 * (ms_res - ms_base) / ms_base
+        overhead_pct = float(np.median([100.0 * (tr - tb) / tb for tb, tr in round_pairs]))
         print(
             f"[Shell FrameGraph W={worlds} tris/world=32 self_contact={sc}] "
             f"base={ms_base:.3f} ms/step, res={ms_res:.3f} ms/step, overhead={overhead_pct:+.2f}%"

@@ -408,8 +408,10 @@ def test_se3_covariance(device, rng, monkeypatch, kind):
         su[0] = u_sh0  # shape_surface_u is in shape-local frame and co-rotates via _shape_pose
         m.dismech.shape_surface_id.assign(ss)
         m.dismech.shape_surface_u.assign(su)
-        spec = ContactResidual(
-            rff_dim=24, v_ref=0.5, num_materials=2, embeddings=emb, w_contact=wc if use_res else None, seed=23
+        spec = (
+            ContactResidual(rff_dim=24, v_ref=0.5, num_materials=2, embeddings=emb, w_contact=wc, seed=23)
+            if use_res
+            else None
         )
         sim = SolverDiSMech(m, exact=True, iterations=80, self_contact=False, residual=spec)
         st = m.state()
@@ -437,7 +439,7 @@ def test_se3_covariance(device, rng, monkeypatch, kind):
 def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     """Single-step ``StepAdjoint`` VJP wrt ``w_contact``, ``embeddings``, ``q_in``, and ``qd_in`` matches central
     Richardson FD (``rtol <= 5e-3``) for both ``kh = 0`` barrier contact and ``kh > 0`` hydroelastic pad."""
-    monkeypatch.setattr(solver, "TOLERANCE", 1.0e-6 if kh > 0.0 else 2.0e-5)
+    monkeypatch.setattr(solver, "TOLERANCE", 3.0e-6 if kh > 0.0 else 5.0e-5)
 
     z0 = 0.80 * RADIUS if kh > 0.0 else 1.0165 * RADIUS
     m = _rod_ground_model(
@@ -452,9 +454,9 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     spec = ContactResidual(
         rff_dim=R, rho_ref=1.0, v_ref=0.1, num_materials=M, embeddings=emb0.copy(), w_contact=wc0.copy(), seed=19
     )
-    sim = SolverDiSMech(m, exact=True, iterations=1500, self_contact=False, residual=spec)
+    sim = SolverDiSMech(m, exact=True, iterations=2500, self_contact=False, residual=spec)
     dt = 5.0e-3
-    v0 = np.tile([0.35, 0.15, -0.05 if kh > 0.0 else 0.0], (m.particle_count, 1)).astype(np.float32)
+    v0 = np.tile([0.65, 0.25, -0.05 if kh > 0.0 else 0.0], (m.particle_count, 1)).astype(np.float32)
 
     s_init = m.state(requires_grad=True)
     s_init.particle_qd.assign(v0)
@@ -464,8 +466,11 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     qd0_base = s_init.dismech.qd.numpy().copy()
 
     rng_l = np.random.default_rng(rng.integers(0, 1 << 30))
-    wq_np = rng_l.normal(0.0, 0.6, n_dof).astype(np.float32)
-    wqd_np = rng_l.normal(0.0, 0.25, n_dof).astype(np.float32)
+    loss_scale = 512.0
+    wq_np = loss_scale * rng_l.normal(0.0, 0.6, n_dof).astype(np.float32)
+    wqd_np = loss_scale * (dt * rng_l.normal(0.0, 0.25, n_dof)).astype(np.float32)
+    c_q = loss_scale * 0.05
+    c_qd = loss_scale * 0.02 * dt * dt
     wq_wp = wp.array(wq_np, dtype=float, device=device)
     wqd_wp = wp.array(wqd_np, dtype=float, device=device)
     q_ref_wp = wp.zeros(n_dof, dtype=float, device=device)
@@ -494,7 +499,7 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
                 wp.launch(
                     dismech_loss_kernel,
                     n_dof,
-                    inputs=[states[-1].dismech.q, states[-1].dismech.qd, q_ref_wp, wq_wp, wqd_wp, 1.0, 0.05, 0.02],
+                    inputs=[states[-1].dismech.q, states[-1].dismech.qd, q_ref_wp, wq_wp, wqd_wp, 1.0, c_q, c_qd],
                     outputs=[loss],
                     device=device,
                 )
@@ -504,7 +509,7 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
             assert int(sim.counts.numpy()[0]) == 0
         q_f = states[-1].dismech.q.numpy().astype(np.float64)
         qd_f = states[-1].dismech.qd.numpy().astype(np.float64)
-        return float(wq_np @ q_f + 0.05 * np.dot(q_f, q_f) + wqd_np @ qd_f + 0.02 * np.dot(qd_f, qd_f))
+        return float(wq_np @ q_f + c_q * np.dot(q_f, q_f) + wqd_np @ qd_f + c_qd * np.dot(qd_f, qd_f))
 
     _, tape, loss_arr, s0_rec = _run_loss(True)
     tape.backward(loss_arr)
@@ -552,8 +557,8 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
         g_pad = g_wc * pad_mask
         _probe("w_contact_pad_only", g_wc, _eval_wc, 5.0e-3, dirs_override=(g_pad / np.linalg.norm(g_pad))[None])
     _probe("embeddings", g_emb, _eval_emb, 3.0e-3)
-    _probe("q_in", g_qin, lambda d: _run_loss(False, q_np=q0_base + d), 3.0e-6)
-    _probe("qd_in", g_qdin, lambda d: _run_loss(False, qd_np=qd0_base + d), 1.0e-3)
+    _probe("q_in", g_qin, lambda d: _run_loss(False, q_np=q0_base + d), 3.0e-6 if kh > 0.0 else 5.0e-7)
+    _probe("qd_in", g_qdin, lambda d: _run_loss(False, qd_np=qd0_base + d), 3.0e-4)
 
     # Multi-step (2 steps) rollout check wrt w_contact to confirm clean cross-step gradient accumulation
     _, tape2, loss2, _ = _run_loss(True, steps=2)

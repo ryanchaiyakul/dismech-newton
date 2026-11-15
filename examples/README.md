@@ -6,13 +6,14 @@ examples run on `SolverDiSMech`; start there with `newton/cable_twist.py` for th
 
 | Example | What it adds |
 | --- | --- |
-| [`cantilever.py`](cantilever.py) | ADMM on implicit Euler and `exact=True` Gauss-Newton on implicit midpoint (`theta=0.5`) beside Newton's VBD, against a beam formula: numerical damping against none. |
+| [`cantilever.py`](cantilever.py) | Chord Gauss-Newton on implicit Euler and `exact=True` Gauss-Newton on implicit midpoint (`theta=0.5`) beside Newton's VBD, against a beam formula: numerical damping against none. |
 | [`overhand_knot.py`](overhand_knot.py) | Self-contact with friction, both ends clamped and pulled, a measured force against theory. |
 | [`plectoneme.py`](plectoneme.py) | A rod from material constants (`newton.Rod`), frictionless self-contact under twist, against Clauvelin et al. (2009). |
 | [`flagella.py`](flagella.py) | External forces on the nodes (`state.particle_f`: fluid drag) and contact between rods. |
 | [`shell_cantilever.py`](shell_cantilever.py) | `cantilever.py` for midedge shells (`add_cloth_mesh`) beside VBD cloth from the same parameters, against plate theory; what Newton's `edge_ke` means as a plate stiffness. |
 | [`shell_fold.py`](shell_fold.py) | A cloth strip flopped over onto itself: it falls, lands on its own lower half and settles into an open fold (an eyelet), held by self-contact with friction, its fall calmed by air drag on the nodes (`state.particle_f`), against the frictionless heavy elastica (height `0.907 (D / rho g)^(1/3)`). |
 | [`midas_axial.py`](midas_axial.py) | Two-way coupling with a MuJoCo hand (the MIDAS hand, fetched on first run): its contact bodies proxies in our solve (`SolverCoupledProxy`); PaXini tactile fingertips (taxel readout at 83.3 Hz, shown live). The clamped rod sags under gravity (Euler-Bernoulli); the fingers' sensor pads press it into the palm, the hand lifts it, ring and index let go and take it again, and pushes it along its axis until the grip slides at Coulomb's mu sum(N), the push on MuJoCo's side equal to the rod's axial force on ours. Friction converged to the step's force balance (30 iterations). Needs `--extra mujoco`. |
+| [`cloth_franka_fold.py`](cloth_franka_fold.py) | Two-way coupling with a MuJoCo Franka folding a small napkin in half over a table's edge (`SolverCoupledProxy`): the hand slides from the side onto the hanging hem's corner, pinches it, turns the flap round the edge like a page, and releases above the far corner. Needs `--extra mujoco`. |
 
 ```bash
 uv run examples/cantilever.py

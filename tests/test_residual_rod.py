@@ -458,7 +458,9 @@ def test_se3_invariance(device, rng):
 @pytest.mark.slow
 def test_continuum_convergence(device, rng):
     """Continuum mesh refinement convergence N=(8, 16, 32, 64) over fixed physical clamped zone [0, L/8]."""
+    rff_f = np.random.default_rng(11).normal(0.0, 1.5, (16, 10)).astype(np.float32)
     w_cont = rng.normal(0.0, 15.0, size=(16, 5)).astype(np.float32)
+    w_cont[:, 2] = np.abs(w_cont[:, 2]) * np.sign(rff_f[:, 2])
     tips_zero = {}
     tips_res = {}
     for n in (8, 16, 32, 64):

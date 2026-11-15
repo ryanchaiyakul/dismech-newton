@@ -22,12 +22,11 @@ import newton.usd
 import newton.utils
 import numpy as np
 import warp as wp
-from cloth_twist import Crossings
 from pxr import Usd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import CableExample
+from utils.common import CableExample, Crossings
 
 from dismech_newton import SolverDiSMech
 

@@ -68,7 +68,9 @@ def _run_one(name: str, path: Path) -> None:
 
     newton.examples.run = recording_run
     script = ROOT / "examples" / ("experimental" if name.startswith("fit_") else "") / f"{name}.py"  # name may be newton/...
-    sys.path.insert(0, str(script.parent))
+    for folder in (ROOT / "examples", script.parent):
+        if str(folder) not in sys.path:
+            sys.path.insert(0, str(folder))
     sys.argv = [str(script), "--viewer", "null", "--test", *EXTRA_ARGS.get(name, [])]
     runpy.run_path(str(script), run_name="__main__")
 

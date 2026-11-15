@@ -31,73 +31,14 @@ from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import THEORY, CableExample, Drive, default_frames, inset, inset_scale
+from utils.common import THEORY, CableExample, Crossings, Drive, default_frames, inset, inset_scale
 
 from dismech_newton import SolverDiSMech
 
 
-@wp.kernel
-def _boxes_kernel(x: wp.array[wp.vec3], tris: wp.array[wp.vec3i], lo: wp.array[wp.vec3], hi: wp.array[wp.vec3]):
-    t = wp.tid()
-    a, b, c = x[tris[t][0]], x[tris[t][1]], x[tris[t][2]]
-    lo[t] = wp.min(wp.min(a, b), c)
-    hi[t] = wp.max(wp.max(a, b), c)
-
-
-@wp.kernel
-def _crossings_kernel(bvh: wp.uint64, x: wp.array[wp.vec3], edges: wp.array[wp.vec2i], tris: wp.array[wp.vec3i],
-                      count: wp.array[wp.int32], hits: wp.array[wp.vec2i]):
-    """Per edge: the faces it shares no vertex with that it passes through (its ends on either side of the face's
-    plane, where it meets the plane inside the face)."""
-    e = wp.tid()
-    i, j = edges[e][0], edges[e][1]
-    a, b = x[i], x[j]
-    query = wp.bvh_query_aabb(bvh, wp.min(a, b), wp.max(a, b))
-    t = int(0)
-    while wp.bvh_query_next(query, t):
-        f = tris[t]
-        if f[0] == i or f[1] == i or f[2] == i or f[0] == j or f[1] == j or f[2] == j:
-            continue
-        v0, v1, v2 = x[f[0]], x[f[1]], x[f[2]]
-        n = wp.cross(v1 - v0, v2 - v0)
-        da, db = wp.dot(a - v0, n), wp.dot(b - v0, n)
-        if da * db >= 0.0:
-            continue
-        y = a + da / (da - db) * (b - a)
-        if (wp.dot(wp.cross(v1 - v0, y - v0), n) >= 0.0 and wp.dot(wp.cross(v2 - v1, y - v1), n) >= 0.0
-                and wp.dot(wp.cross(v0 - v2, y - v2), n) >= 0.0):
-            k = wp.atomic_add(count, 0, 1)
-            if k < hits.shape[0]:
-                hits[k] = wp.vec2i(e, t)
-
-
-class Crossings:
-    """How many mesh edges pass through a face they share no vertex with, on the device; ``hits``: the first
-    (edge, face) pairs found."""
-
-    def __init__(self, edges: np.ndarray, tris: np.ndarray, device):
-        self.edges = wp.array(edges.astype(np.int32), dtype=wp.vec2i, device=device)
-        self.tris = wp.array(tris.astype(np.int32), dtype=wp.vec3i, device=device)
-        self.lo, self.hi = (wp.zeros(len(tris), dtype=wp.vec3, device=device) for _ in range(2))
-        self.bvh = None
-        self.count = wp.zeros(1, dtype=wp.int32, device=device)
-        self.hits = wp.zeros(64, dtype=wp.vec2i, device=device)
-
-    def __call__(self, x: wp.array) -> int:
-        wp.launch(_boxes_kernel, dim=self.tris.shape[0], inputs=[x, self.tris, self.lo, self.hi])
-        if self.bvh is None:
-            self.bvh = wp.Bvh(self.lo, self.hi)
-        else:
-            self.bvh.refit()
-        self.count.zero_()
-        wp.launch(_crossings_kernel, dim=self.edges.shape[0],
-                  inputs=[self.bvh.id, x, self.edges, self.tris, self.count, self.hits])
-        return int(self.count.numpy()[0])
-
-
 class Example(CableExample):
     duration, substeps = 5.0, 10  # [s]: Newton's 300 frames at 60 fps, 10 substeps
-    plot_every, plot_name = 6, "twist"
+    plot_every, plot_name = 0, "twist"
     cols = 50  # the mesh's vertices along the twist axis (and across it)
     rate, end = np.pi / 3.0, 10.0  # each end's spin [rad/s], until [s]
     # Newton's example: density [kg/m^2], tri_ke, tri_ka [N/m], tri_kd, edge_ke, edge_kd; its self-contact gap
@@ -139,6 +80,8 @@ class Example(CableExample):
         mid = n // 2 - 1, n // 2  # the two columns either side of the middle, top and bottom rows
         self.middle = np.array([[c, (n - 1) * n + c] for c in mid])
         self.t, self.angle, self.mid_angle, self.gap, self.cross = [0.0], [0.0], [0.0], [np.inf], [0]
+        if getattr(args, "plot", False):
+            self.plot_every = 6
         if viewer is not None and hasattr(viewer, "set_camera"):
             viewer.set_camera(wp.vec3(2.25, 0.0, 0.0), 0.0, -180.0)  # Newton's
 
@@ -215,6 +158,7 @@ class Example(CableExample):
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--plot", action="store_true", help="Overlay live theory curves in the viewer.")
     default_frames(parser, lambda args: Example.duration)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

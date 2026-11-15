@@ -93,7 +93,7 @@ logging.getLogger("newton._src.solvers.coupled.solver_coupled").addFilter(_OwnRe
 
 class SolverDiSMech(SolverBase, CouplingInterface):
     """Implicit discrete elastic rods and midedge shells with contact and friction: the elastic elements by
-    strain-space ADMM, contact and friction as barrier energies in the same step objective.
+    projected strain-space Gauss-Newton, contact and friction as barrier energies in the same step objective.
 
     Fixed DOFs are prescribed through ``state_in.dismech.q``. Under a ``wp.Tape`` a step is recorded as its adjoint
     (:meth:`vjp`; recording reads on the host whether a contact touches). Rods and shells collide with Newton's
@@ -104,11 +104,11 @@ class SolverDiSMech(SolverBase, CouplingInterface):
 
     Args:
         iterations: Iterations per step (a fixed count, graph-capturable).
-        exact: Gauss-Newton on the step's energy, ``A`` refactorised every iteration (no elastic splitting).
+        exact: Assemble and refactorise ``A`` at every iteration even without touching contacts (else chord at prediction).
         self_contact: Rod-rod and shell-shell contacts (rod-shell and shape contacts are always on).
         theta: The theta method, in ``[1/2, 1]``: ``1`` implicit Euler, ``1/2`` implicit midpoint (the implicit
             Euler step ``theta dt``, extrapolated). Below ``1`` for contact-free scenes: the extrapolation can step
-            into contact; undamped, ADMM's leftover residual can pump the stiff modes (``exact`` does not).
+            into contact; undamped, a chord step's leftover residual can pump the stiff modes (``exact`` does not).
         refactor: With contacts, ``A`` assembled and factorised anew at each iterate while a contact touches; else
             once per step, at the prediction. Rods converge better with it (their factorizations are cheap); sheets,
             whose factorizations dominate a step, are as accurate without it given 10-20 iterations and 1.5-3.5x

@@ -23,8 +23,6 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from cloth_hanging import newton_grid
-from cloth_twist import Crossings
 from newton.examples.multiphysics.example_vbd_dat_rigid_soft import PARAMS
 from newton.examples.multiphysics.example_vbd_dat_rigid_soft import Example as Newton
 from newton.solvers import SolverMuJoCo
@@ -32,7 +30,7 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import CableExample
+from utils.common import CableExample, Crossings, newton_grid
 
 from dismech_newton import SolverDiSMech
 

@@ -21,8 +21,8 @@ Shows: a two-way pinch grasp of a sheet. Tests: while pinched, each finger's gri
 napkin's contact thickness (10%; measured 4% over 4 runs); folded in half: the hem's corner within 2 cm of the
 napkin's far corner (measured 0.8 cm), the flap flat on the other half (within 2 cm of the table); no crossings.
 
-    uv run --extra mujoco examples/newton/cloth_franka_fold.py
-    uv run --extra mujoco examples/newton/cloth_franka_fold.py --viewer null --test
+    uv run --extra mujoco examples/cloth_franka_fold.py
+    uv run --extra mujoco examples/cloth_franka_fold.py --viewer null --test
 """
 
 import sys
@@ -32,16 +32,14 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from cloth_twist import Crossings
-from franka_cable_ik_pick_place import TCP, _set_targets, add_franka
 from newton import ik
 from newton.examples.multiphysics.example_franka_cable_ik_pick_place import GRIP_HOLD, GRIP_OPEN, GRIP_STIFFNESS
 from newton.solvers import SolverMuJoCo
 from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProxy
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # examples/: utils
 
-from utils.common import CableExample, grid, pads
+from utils.common import TCP, CableExample, Crossings, add_franka, grid, pads, set_franka_targets
 
 from dismech_newton import SolverDiSMech
 
@@ -209,7 +207,7 @@ class Example(CableExample):
 
     def simulate(self):
         self.ik.step(self.ik_q, self.ik_q, iterations=24)
-        wp.launch(_set_targets, dim=self.n_coords, inputs=[self.ik_q, self.finger], outputs=[self.target_q])
+        wp.launch(set_franka_targets, dim=self.n_coords, inputs=[self.ik_q, self.finger], outputs=[self.target_q])
         super().simulate()
 
     def step(self):

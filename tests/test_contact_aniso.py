@@ -262,14 +262,16 @@ def test_aniso_kernels_hessian_energy_majorizer_and_fallback(rng):
         def _dir_fd(h_step: float) -> float:
             dc = np.zeros((N, 3), dtype=np.float32)
             dc[i] = (h_step * d).astype(np.float32)
+            cp, cm = (c + dc).astype(np.float32), (c - dc).astype(np.float32)
             ep, em = wp.zeros(N, dtype=float), wp.zeros(N, dtype=float)
-            wp.launch(_eval_kernels, dim=N, inputs=[wp.array(c + dc, dtype=wp.vec3), s, eps],
+            wp.launch(_eval_kernels, dim=N, inputs=[wp.array(cp, dtype=wp.vec3), s, eps],
                       outputs=[out_g, out_h, out_m, ep, out_frame])
-            wp.launch(_eval_kernels, dim=N, inputs=[wp.array(c - dc, dtype=wp.vec3), s, eps],
+            wp.launch(_eval_kernels, dim=N, inputs=[wp.array(cm, dtype=wp.vec3), s, eps],
                       outputs=[out_g, out_h, out_m, em, out_frame])
-            return float(ep.numpy()[i] - em.numpy()[i]) / (2.0 * h_step)
+            step = float(np.dot(cp[i].astype(np.float64) - cm[i].astype(np.float64), d))
+            return float(ep.numpy()[i] - em.numpy()[i]) / step
 
-        c_v, f_v = _dir_fd(4.0e-5), _dir_fd(2.0e-5)
+        c_v, f_v = _dir_fd(8.0e-5), _dir_fd(4.0e-5)
         de_fd = (4.0 * f_v - c_v) / 3.0
         est = abs(c_v - f_v)
         ft = g_all[i] - np.dot(g_all[i], normals[i]) * normals[i]

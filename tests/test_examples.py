@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1] / "examples"
 # (example path under examples/, frames, extra attributes on args, optional dependency)
 EXAMPLES = [
     ("cantilever", 240, {}, None),
+    ("cloth_franka_fold", 720, {}, "mujoco_warp"),
     ("flagella", 180, {}, None),
     ("overhand_knot", 1140, {}, None),
     ("plectoneme", 5040, {}, None),
@@ -31,7 +32,6 @@ EXAMPLES = [
     ("newton/cable_twist", 100, {}, None),
     ("newton/cable_y_junction", 120, {}, None),
     ("newton/cloth_bending", 600, {}, None),
-    ("newton/cloth_franka_fold", 720, {}, "mujoco_warp"),
     ("newton/cloth_hanging", 300, {}, None),
     ("newton/cloth_rigid_trampoline", 300, {}, "mujoco_warp"),
     ("newton/cloth_style3d", 100, {}, "git"),

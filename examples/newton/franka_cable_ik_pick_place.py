@@ -17,14 +17,12 @@ from pathlib import Path
 
 import newton
 import newton.examples
-import newton.utils
 import numpy as np
 import warp as wp
 from newton import ik
 from newton.examples.multiphysics.example_franka_cable_ik_pick_place import (
     CABLE_CENTER,
     CABLE_LENGTH,
-    FRANKA_Q,
     GRIP_CLOSE,
     GRIP_HOLD,
     GRIP_OPEN,
@@ -36,21 +34,9 @@ from newton.solvers.experimental.coupled import SolverCoupled, SolverCoupledProx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import SIM, THEORY, CableExample, inset, pads
+from utils.common import SIM, TCP, THEORY, CableExample, add_franka, inset, pads, set_franka_targets
 
 from dismech_newton import SolverDiSMech
-
-TCP = 0.107  # hand origin to the point between the fingertips [m]
-
-
-def add_franka(builder: newton.ModelBuilder, base_z: float) -> None:
-    builder.add_urdf(newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
-                     xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()), floating=False,
-                     enable_self_collisions=False, parse_visuals_as_colliders=False,
-                     joint_damping_mode="drive")  # Newton 1.6's mapping (the URDF damping drives the joints)
-    n = len(FRANKA_Q)
-    builder.joint_q[-n:] = FRANKA_Q
-    builder.joint_target_q[-n:] = FRANKA_Q
 
 
 class Example(CableExample):
@@ -104,6 +90,8 @@ class Example(CableExample):
         mass = float(model.particle_mass.numpy().sum())
         self.weight = 9.81 * mass
         self.history = []  # (time, grip per finger, lift)
+        if getattr(args, "plot", False):
+            self.plot_every = 6
         if viewer is not None and hasattr(viewer, "set_camera"):
             viewer.set_camera(pos=wp.vec3(0.9, -1.4, 0.9), pitch=-22.0, yaw=120.0)
 
@@ -178,7 +166,7 @@ class Example(CableExample):
 
     def simulate(self):
         self.ik.step(self.ik_q, self.ik_q, iterations=24)
-        wp.launch(_set_targets, dim=self.n_coords, inputs=[self.ik_q, self.finger], outputs=[self.target_q])
+        wp.launch(set_franka_targets, dim=self.n_coords, inputs=[self.ik_q, self.finger], outputs=[self.target_q])
         super().simulate()
 
     def step(self):
@@ -230,18 +218,9 @@ class Example(CableExample):
         assert abs(lift - self.weight) < 0.2 * self.weight, f"lift {lift:.4f} N, weight {self.weight:.4f} N"
 
 
-@wp.kernel
-def _set_targets(ik_q: wp.array2d[float], finger: wp.array[float], target: wp.array2d[float]):
-    """The IK's arm joints, the drive's finger opening."""
-    k = wp.tid()
-    if k < ik_q.shape[1] - 2:
-        target[0, k] = ik_q[0, k]
-    else:
-        target[0, k] = finger[0]
-
-
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument("--plot", action="store_true", help="Overlay live theory curves in the viewer.")
     parser.set_defaults(num_frames=330)
     viewer, args = newton.examples.init(parser)
     newton.examples.run(Example(viewer, args), args)

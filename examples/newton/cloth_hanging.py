@@ -26,24 +26,12 @@ import newton
 import newton.examples
 import numpy as np
 import warp as wp
-from cloth_twist import Crossings
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # examples/: utils
 
-from utils.common import CableExample
+from utils.common import CableExample, Crossings, newton_grid
 
 from dismech_newton import SolverDiSMech
-
-
-def newton_grid(**grid):
-    """Vertices (world), faces, fixed vertices and panel coordinates (the grid's x, y) of Newton's
-    ``add_cloth_grid``."""
-    b = newton.ModelBuilder()
-    b.add_cloth_grid(**grid)
-    fixed = (np.asarray(b.particle_flags) & int(newton.ParticleFlags.ACTIVE)) == 0
-    x = np.asarray(b.particle_q)
-    panel = (x - np.asarray(grid["pos"])) @ np.asarray(wp.quat_to_matrix(grid["rot"])).reshape(3, 3)
-    return x, np.asarray(b.tri_indices).reshape(-1, 3), np.flatnonzero(fixed), panel[:, :2]
 
 
 class Example(CableExample):

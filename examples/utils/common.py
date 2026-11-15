@@ -7,8 +7,9 @@
 - :func:`default_frames`: the ``--num-frames`` default from a simulated duration.
 - :func:`smoothstep`: a smooth ramp from 0 to 1.
 - :func:`grid`: a triangulated plate.
-- :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`: geometry checks; :func:`capsule_poses`: capsules
-  along a polyline, for drawing recorded node positions.
+- :func:`close_pairs`, :func:`segment_distance`, :func:`capsules`, :class:`Crossings`, :func:`newton_grid`: geometry
+  checks & grids; :func:`capsule_poses`: capsules along a polyline, for drawing recorded node positions.
+- :data:`TCP`, :func:`add_franka`, :func:`set_franka_targets`: shared Franka URDF & IK target helpers.
 - :func:`inset`: the theory plots drawn in the viewer.
 - :func:`cached`: results that take minutes, computed once per configuration.
 """
@@ -78,6 +79,37 @@ def pads(model, bodies, kh: float = PAD_KH, dissipation: float = 0.0) -> int:
     model.shape_material_kh.assign(np.where(on, kh, k).astype(k.dtype))
     model.shape_pad_dissipation = np.where(on, dissipation, 0.0)
     return int(on.sum())
+
+
+TCP = 0.107  # hand origin to the point between the fingertips [m]
+
+
+def add_franka(builder, base_z: float) -> None:
+    """Add the Franka FR3 + hand URDF at ``base_z``, initialised at ``FRANKA_Q``."""
+    import newton.utils  # noqa: PLC0415
+    from newton.examples.multiphysics.example_franka_cable_ik_pick_place import FRANKA_Q  # noqa: PLC0415
+
+    builder.add_urdf(
+        newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+        xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()),
+        floating=False,
+        enable_self_collisions=False,
+        parse_visuals_as_colliders=False,
+        joint_damping_mode="drive",  # Newton 1.6's mapping (the URDF damping drives the joints)
+    )
+    n = len(FRANKA_Q)
+    builder.joint_q[-n:] = FRANKA_Q
+    builder.joint_target_q[-n:] = FRANKA_Q
+
+
+@wp.kernel
+def set_franka_targets(ik_q: wp.array2d[float], finger: wp.array[float], target: wp.array2d[float]):
+    """The IK's arm joints, the drive's finger opening."""
+    k = wp.tid()
+    if k < ik_q.shape[1] - 2:
+        target[0, k] = ik_q[0, k]
+    else:
+        target[0, k] = finger[0]
 
 
 def segment_dofs(model, body: int, twist_only: bool = False) -> list[int]:
@@ -285,6 +317,78 @@ def frame_box(viewer, left: float, right: float, bottom: float, top: float, *, y
 
 
 # -- geometry checks ----------------------------------------------------------------------
+
+
+@wp.kernel
+def _boxes_kernel(x: wp.array[wp.vec3], tris: wp.array[wp.vec3i], lo: wp.array[wp.vec3], hi: wp.array[wp.vec3]):
+    t = wp.tid()
+    a, b, c = x[tris[t][0]], x[tris[t][1]], x[tris[t][2]]
+    lo[t] = wp.min(wp.min(a, b), c)
+    hi[t] = wp.max(wp.max(a, b), c)
+
+
+@wp.kernel
+def _crossings_kernel(bvh: wp.uint64, x: wp.array[wp.vec3], edges: wp.array[wp.vec2i], tris: wp.array[wp.vec3i],
+                      count: wp.array[wp.int32], hits: wp.array[wp.vec2i]):
+    """Per edge: the faces it shares no vertex with that it passes through (its ends on either side of the face's
+    plane, where it meets the plane inside the face)."""
+    e = wp.tid()
+    i, j = edges[e][0], edges[e][1]
+    a, b = x[i], x[j]
+    query = wp.bvh_query_aabb(bvh, wp.min(a, b), wp.max(a, b))
+    t = int(0)
+    while wp.bvh_query_next(query, t):
+        f = tris[t]
+        if f[0] == i or f[1] == i or f[2] == i or f[0] == j or f[1] == j or f[2] == j:
+            continue
+        v0, v1, v2 = x[f[0]], x[f[1]], x[f[2]]
+        n = wp.cross(v1 - v0, v2 - v0)
+        da, db = wp.dot(a - v0, n), wp.dot(b - v0, n)
+        if da * db >= 0.0:
+            continue
+        y = a + da / (da - db) * (b - a)
+        if (wp.dot(wp.cross(v1 - v0, y - v0), n) >= 0.0 and wp.dot(wp.cross(v2 - v1, y - v1), n) >= 0.0
+                and wp.dot(wp.cross(v0 - v2, y - v2), n) >= 0.0):
+            k = wp.atomic_add(count, 0, 1)
+            if k < hits.shape[0]:
+                hits[k] = wp.vec2i(e, t)
+
+
+class Crossings:
+    """How many mesh edges pass through a face they share no vertex with, on the device; ``hits``: the first
+    (edge, face) pairs found."""
+
+    def __init__(self, edges: np.ndarray, tris: np.ndarray, device):
+        self.edges = wp.array(edges.astype(np.int32), dtype=wp.vec2i, device=device)
+        self.tris = wp.array(tris.astype(np.int32), dtype=wp.vec3i, device=device)
+        self.lo, self.hi = (wp.zeros(len(tris), dtype=wp.vec3, device=device) for _ in range(2))
+        self.bvh = None
+        self.count = wp.zeros(1, dtype=wp.int32, device=device)
+        self.hits = wp.zeros(64, dtype=wp.vec2i, device=device)
+
+    def __call__(self, x: wp.array) -> int:
+        wp.launch(_boxes_kernel, dim=self.tris.shape[0], inputs=[x, self.tris, self.lo, self.hi])
+        if self.bvh is None:
+            self.bvh = wp.Bvh(self.lo, self.hi)
+        else:
+            self.bvh.refit()
+        self.count.zero_()
+        wp.launch(_crossings_kernel, dim=self.edges.shape[0],
+                  inputs=[self.bvh.id, x, self.edges, self.tris, self.count, self.hits])
+        return int(self.count.numpy()[0])
+
+
+def newton_grid(**kwargs):
+    """Vertices (world), faces, fixed vertices and panel coordinates (the grid's x, y) of Newton's
+    ``add_cloth_grid``."""
+    import newton  # noqa: PLC0415
+
+    b = newton.ModelBuilder()
+    b.add_cloth_grid(**kwargs)
+    fixed = (np.asarray(b.particle_flags) & int(newton.ParticleFlags.ACTIVE)) == 0
+    x = np.asarray(b.particle_q)
+    panel = (x - np.asarray(kwargs["pos"])) @ np.asarray(wp.quat_to_matrix(kwargs["rot"])).reshape(3, 3)
+    return x, np.asarray(b.tri_indices).reshape(-1, 3), np.flatnonzero(fixed), panel[:, :2]
 
 
 def grid(nx: int, ny: int, lx: float, ly: float, rng=None, jitter: float = 0.0):

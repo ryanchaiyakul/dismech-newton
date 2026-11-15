@@ -52,9 +52,6 @@ def elem_worlds(model: Model, elem) -> wp.array:
     return wp.array(ew, dtype=wp.int32, device=elem.params.device)
 
 
-elem_world_indices = elem_worlds
-
-
 def world_shift(model: Model) -> np.ndarray:
     """Per node a shift of its world's boxes in the trees: the worlds on a grid of cells 4 times the largest world's
     extent (plus 1 m) apart, so a query meets only its own world's (fewer, if a world moves that far: then the world

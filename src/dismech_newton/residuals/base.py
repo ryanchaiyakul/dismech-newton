@@ -12,7 +12,7 @@ from newton import Model
 from ..constants import ADJ_MODULE_OPTS, vec5f, vec6f, vec10f, vec11f, vec11i, vec12f, vec21f, vec21i
 from ..elements.rod import Rod, rod_dofs, rod_strain_rate
 from ..elements.shell import Shell, shell_dofs, shell_strain_rate
-from ..worlds import elem_world_indices
+from ..worlds import elem_worlds
 
 
 @wp.struct
@@ -420,8 +420,8 @@ class Residual:
             self.contact = clone_if_bound(self.contact).bind(model, device=dev)
             params.extend(self.contact.params)
 
-        self._elem_world[5] = elem_world_indices(model, triplets)
-        self._elem_world[6] = elem_world_indices(model, shells)
+        self._elem_world[5] = elem_worlds(model, triplets)
+        self._elem_world[6] = elem_worlds(model, shells)
         self._zero_aux[5] = wp.zeros(0, dtype=wp.vec2, device=dev) if not triplets.count else (
             self.rod.edge_share if self.rod is not None else wp.zeros(triplets.count, dtype=wp.vec2, device=dev)
         )

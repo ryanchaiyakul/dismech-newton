@@ -6,13 +6,12 @@ import newton
 import numpy as np
 import pytest
 import warp as wp
-from fd import assert_close, jacobian
+from fd import assert_close, assert_derivative, jacobian
 from memory_laws import BoucWen, Elastoplastic, Prony
 from rollouts import cloth, finalize_worlds, simulate
 from utils.common import FrameGraph, capturable, grid
 
 from dismech_newton import Dahl, Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
-from dismech_newton import solver as dn_solver
 from dismech_newton.builder import register_custom_attributes, vec5f, vec6f
 
 
@@ -541,9 +540,8 @@ def test_masked_reset_rod_and_shell(device):
         pytest.param("shell", "prony", 2, marks=pytest.mark.slow),
     ],
 )
-def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, worlds: int):
+def test_adjoint_fd_memory(device, elem_kind: str, mode: str, worlds: int):
     """Multi-step StepAdjoint VJP through carried h_t wrt learnable memory params and initial (q0, h0)."""
-    monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
     gz = -40.0 if mode == "elastoplastic" else -18.0
     kw = (
         {"stretch_k": 40.0, "bend_k": 0.08, "twist_k": 0.08, "gravity": (0.0, 0.0, gz)}
@@ -726,12 +724,13 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
                     vals.append([_run_forward(False)])
                 return np.asarray(vals, dtype=np.float64)
 
-            fd_g = jacobian(_f_dir, np.zeros(1), step_h).reshape(-1)
+            fd_g, est_g = jacobian(_f_dir, np.zeros(1), step_h, error=True)
             arr.assign(orig)
             ad_dir = float(np.sum(d * grad_ad))
-            assert_close(
-                np.array([ad_dir]),
-                fd_g,
+            assert_derivative(
+                ad_dir,
+                float(fd_g.reshape(-1)[0]),
+                float(est_g.reshape(-1)[0]),
                 rtol=5.0e-3,
                 name=f"{elem_kind}/{mode}/W={worlds}/{name}",
                 scale=max(abs(ad_dir), 1.0e-6),
@@ -752,14 +751,21 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
                     vals.append([_run_forward(False)])
                 return np.asarray(vals, dtype=np.float64)
 
-            fd_g = jacobian(_f_vec, base_flat[active], step_h).reshape(-1)
+            fd_g, est_g = jacobian(_f_vec, base_flat[active], step_h, error=True)
+            fd_g = fd_g.reshape(-1)
+            est_g = est_g.reshape(-1)
             arr.assign(orig)
-            assert_close(
-                flat_g[active].astype(np.float64),
-                fd_g,
-                rtol=5.0e-3,
-                name=f"{elem_kind}/{mode}/W={worlds}/{name}",
-            )
+            ad_vec = flat_g[active].astype(np.float64)
+            scale = max(float(np.abs(fd_g).max()), 1.0e-12)
+            for idx in range(ad_vec.size):
+                assert_derivative(
+                    float(ad_vec[idx]),
+                    float(fd_g[idx]),
+                    float(est_g[idx]),
+                    rtol=5.0e-3,
+                    name=f"{elem_kind}/{mode}/W={worlds}/{name}_{idx}",
+                    scale=scale,
+                )
 
 
 @pytest.mark.usefixtures("needs_cudss")
@@ -853,9 +859,8 @@ def test_framegraph_memory_capture(device, elem_kind: str):
     np.testing.assert_allclose(mem_arr, _mem_np(s_eag, a_eag, elem_kind), atol=1.0e-6)
 
 
-def test_dahl_explicit_adjoint_fd(device, monkeypatch):
+def test_dahl_explicit_adjoint_fd(device):
     """Multi-step StepAdjoint VJP through explicit ``Dahl(eps_max, tau)`` wrt ``eps_max_arr`` and ``tau_arr``."""
-    monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
     model = finalize_worlds(_build_rod(n=8, stretch_k=40.0, bend_k=0.08, twist_k=0.08, gravity=(0.0, 0.0, -18.0)), 1, device)
     dahl = Dahl(eps_max=0.03, tau=0.05)
     solver = SolverDiSMech(model, iterations=50, exact=True, self_contact=False, residual=dahl)

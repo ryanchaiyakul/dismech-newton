@@ -9,7 +9,7 @@ import warp as wp
 from newton import Model
 
 from ...constants import ADJ_MODULE_OPTS, DAHL_DEADBAND, vec5f, vec6f, vec10f, vec12f
-from ...worlds import elem_world_indices, model_world_info
+from ...worlds import elem_worlds, model_world_info
 
 
 @wp.func
@@ -194,7 +194,7 @@ class Dahl:
 
         self._dim = dim
         self._device = dev
-        self._elem_world = elem_world_indices(model, elem)
+        self._elem_world = elem_worlds(model, elem)
         self.eps_max_arr = eps_arr
         self.tau_arr = tau_arr
         self.data = d

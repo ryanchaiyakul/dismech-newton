@@ -9,7 +9,7 @@ from newton import Model
 
 from ..constants import vec6f, vec12f
 from ..elements.shell import Shell
-from ..worlds import elem_world_indices, model_world_info
+from ..worlds import elem_worlds, model_world_info
 from .base import as_element_param, as_rff_weights
 from .rff import shell_rff_sum, warp8_bcast
 
@@ -143,7 +143,7 @@ class ShellResidual:
         self.has_d_rest = bool(self.spatial_rest_delta is not None and n > 0)
         dr_val = self.spatial_rest_delta if self.has_d_rest else None
         self.d_rest = as_element_param(dr_val, vec6f, 6, n, dev, "spatial_rest_delta")
-        self.elem_world = elem_world_indices(model, elem)
+        self.elem_world = elem_worlds(model, elem)
 
         data = ShellResidualData()
         data.rff_freq = self.rff_freq

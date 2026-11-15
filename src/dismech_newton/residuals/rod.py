@@ -9,7 +9,7 @@ from newton import Model
 
 from ..constants import vec5f, vec10f
 from ..elements.rod import Rod
-from ..worlds import elem_world_indices, model_world_info
+from ..worlds import elem_worlds, model_world_info
 from .base import as_element_param, as_rff_weights
 from .rff import rod_rff_sum, warp8_bcast
 
@@ -154,7 +154,7 @@ class RodResidual:
         self.has_d_rest = bool(self.spatial_rest_delta is not None and n > 0)
         dr_val = self.spatial_rest_delta if self.has_d_rest else None
         self.d_rest = as_element_param(dr_val, vec5f, 5, n, dev, "spatial_rest_delta")
-        self.elem_world = elem_world_indices(model, elem)
+        self.elem_world = elem_worlds(model, elem)
 
         data = RodResidualData()
         data.rff_freq = self.rff_freq

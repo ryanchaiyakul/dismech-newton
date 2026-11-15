@@ -10,7 +10,7 @@ from newton import Model
 
 from dismech_newton.constants import ADJ_MODULE_OPTS, vec5f, vec6f, vec10f, vec12f
 from dismech_newton.residuals.base import as_world_param
-from dismech_newton.worlds import elem_world_indices, model_world_info
+from dismech_newton.worlds import elem_worlds, model_world_info
 
 
 @cache
@@ -167,7 +167,7 @@ class _MemoryLawMixin:
         self.params = tuple(getattr(d, k) for k in self._param_names) if elem.count else ()
         self._dim = dim
         self._device = dev
-        self._elem_world = elem_world_indices(model, elem)
+        self._elem_world = elem_worlds(model, elem)
         self._step_fn = step_fn
         self._carry_kernel = carry_kernel
         self._prev_buf = wp.empty(int(elem.count) if self._mode == 3 else 0, dtype=vt, device=dev, requires_grad=True)

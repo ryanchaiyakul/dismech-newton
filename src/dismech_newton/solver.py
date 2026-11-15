@@ -203,6 +203,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         # every pair within twice its thickness; a node moves at most its smallest radius per detection
         source = Offset(model, self.fixed, self_contact=self_contact, world=of)
         self.contact = BarrierBlock(model, self.fixed, source, of, nc)
+        if self.residual is not None:
+            self.contact.residual = self.residual.contact
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
             arm.bind(self.contact.arm)
@@ -312,6 +314,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             *(a for e in self.elements for a in (e.params, e.rest)),
             *(self.residual.grad_inputs() if self.residual is not None else ()),
         ]
+        if self.residual is not None and self.residual.contact is not None and self._proxy_arm is None:
+            inputs += [state_in.body_q, state_in.body_qd]
         arm = None
         if self._proxy_arm is not None:  # the proxies' step, held for its adjoint
             inputs += [state_in.body_q, state_in.body_qd]

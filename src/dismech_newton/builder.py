@@ -76,6 +76,17 @@ def register_custom_attributes(builder: ModelBuilder) -> None:
                 namespace=NAMESPACE, default=default,
             )
         )
+    for frequency, name, dtype, default in (
+        (Model.AttributeFrequency.PARTICLE, "surface_id", wp.int32, 0),
+        (Model.AttributeFrequency.PARTICLE, "surface_u", wp.vec3, wp.vec3(0.0)),
+        (Model.AttributeFrequency.SHAPE, "shape_surface_id", wp.int32, 0),
+        (Model.AttributeFrequency.SHAPE, "shape_surface_u", wp.vec3, wp.vec3(0.0)),
+    ):
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name=name, dtype=dtype, frequency=frequency, namespace=NAMESPACE, default=default
+            )
+        )
 
 
 def complete(ns, attributes: list, device) -> None:

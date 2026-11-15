@@ -357,6 +357,12 @@ class StepAdjoint:
                               outputs=[wp.zeros_like(self.residual), anchors], device=dev, record_tape=False)
                     wp.launch(_lever_off_kernel, dim=n_c, inputs=[c.anchor, anchors], outputs=[off], device=dev,
                               record_tape=False)
+                if s.residual is not None and s.residual.contact is not None:
+                    bqd = (state_in.body_qd if state_in.body_qd is not None and state_in.body_qd.shape[0] > 0
+                           else src.bodies.body_qd)
+                    c.mu, c.pad, c.aniso = s.residual.contact.replay_contact(
+                        c, q_in, state_in.dismech.qd, poses, bqd, src, dt, q_in0=_detached(q_in)
+                    )
                 wp.launch(_contact_residual_kernel, dim=n_c, inputs=[*inputs, off], outputs=[self.residual, anchors],
                           device=dev)
         return tape

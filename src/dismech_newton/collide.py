@@ -68,6 +68,11 @@ class Mesh:
     edge_dir: wp.array[float]
     world: wp.array[wp.int32]
     shift: wp.array[wp.vec3]  # per node, its world's place in the trees (each world apart: no other world's pairs)
+    node_surf: wp.array[wp.int32]
+    node_u: wp.array[wp.vec3]
+    node_face: wp.array[wp.int32]
+    shape_surf: wp.array[wp.int32]
+    shape_u: wp.array[wp.vec3]
 
 
 def _mu_shape(model: Model) -> tuple[np.ndarray, np.ndarray]:
@@ -164,6 +169,28 @@ def _mesh(model: Model, device) -> Mesh:
         value = np.asarray(value)
         setattr(m, name, wp.array(value if dtype is float else value.astype(np.int32), dtype=dtype, device=device))
     m.shift = wp.array(_world_shift(model), dtype=wp.vec3, device=device)
+    ns_attr = getattr(der, "surface_id", None) if der is not None else None
+    nu_attr = getattr(der, "surface_u", None) if der is not None else None
+    ss_attr = getattr(der, "shape_surface_id", None) if der is not None else None
+    su_attr = getattr(der, "shape_surface_u", None) if der is not None else None
+    node_surf = ns_attr.numpy().astype(np.int32) if ns_attr is not None and n else np.zeros(max(n, 1), np.int32)
+    node_u = nu_attr.numpy().astype(np.float32) if nu_attr is not None and n else np.zeros((max(n, 1), 3), np.float32)
+    sc = model.shape_count
+    shape_surf = ss_attr.numpy().astype(np.int32) if ss_attr is not None and sc else np.zeros(max(sc, 1), np.int32)
+    shape_u = (su_attr.numpy().astype(np.float32) if su_attr is not None and sc
+               else np.zeros((max(sc, 1), 3), np.float32))
+    if n and sc:
+        mask = (mu_shape >= 0) & (node_surf == 0)
+        if np.any(mask):
+            node_surf[mask] = shape_surf[mu_shape[mask]]
+    node_face = np.full(max(n, 1), -1, dtype=np.int32)
+    if nf and n:
+        node_face[tris] = np.arange(nf, dtype=np.int32)[:, None]
+    m.node_surf = wp.array(node_surf, dtype=wp.int32, device=device)
+    m.node_u = wp.array(node_u, dtype=wp.vec3, device=device)
+    m.node_face = wp.array(node_face, dtype=wp.int32, device=device)
+    m.shape_surf = wp.array(shape_surf, dtype=wp.int32, device=device)
+    m.shape_u = wp.array(shape_u, dtype=wp.vec3, device=device)
     return m
 
 
@@ -422,6 +449,112 @@ def _shape_pose(b: Bodies, k: int, poses: wp.array[wp.transform]) -> wp.transfor
     if b.body[k] < 0:
         return b.xform[k]
     return wp.transform_multiply(poses[b.body[k]], b.xform[k])
+
+
+@wp.func
+def _unit3(v: wp.vec3) -> wp.vec3:
+    return v / wp.sqrt(wp.max(wp.length_sq(v), 1.0e-24))
+
+
+@wp.func
+def _face_u(q: wp.array[float], m: Mesh, f: int, u: wp.vec3) -> wp.vec3:
+    """Push rest anisotropy vector ``u`` forward from rest triangle ``f`` to deformed frame at ``q``."""
+    if wp.length_sq(u) == 0.0:
+        return wp.vec3(0.0)
+    tri = m.faces[f]
+    r0, e1r, e2r = node(m.rest, tri[0]), node(m.rest, tri[1]), node(m.rest, tri[2])
+    re1, re2 = e1r - r0, e2r - r0
+    rn = _unit3(wp.cross(re1, re2))
+    rt1 = _unit3(re1)
+    rt2 = wp.cross(rn, rt1)
+    x0, e1q, e2q = node(q, tri[0]), node(q, tri[1]), node(q, tri[2])
+    qe1, qe2 = e1q - x0, e2q - x0
+    qn = _unit3(wp.cross(qe1, qe2))
+    qt1 = _unit3(qe1)
+    qt2 = wp.cross(qn, qt1)
+    return wp.dot(u, rt1) * qt1 + wp.dot(u, rt2) * qt2 + wp.dot(u, rn) * qn
+
+
+@wp.func
+def _prim_surf(q: wp.array[float], m: Mesh, idx: int, st: wp.vec3, num_nodes: int):
+    """Resolve material ID and world surface axis for deformable node, edge, or triangle ``idx``."""
+    ne = m.edges.shape[0]
+    if idx < num_nodes:
+        p = idx
+        if m.rod[p] >= 0:
+            if wp.length_sq(st) > 0.0:
+                return m.node_surf[p], st
+            if m.adj_ptr[p + 1] > m.adj_ptr[p]:
+                return m.node_surf[p], node(q, m.adj[m.adj_ptr[p]]) - node(q, p)
+            return m.node_surf[p], m.node_u[p]
+        f = m.node_face[p]
+        if f >= 0:
+            return m.node_surf[p], _face_u(q, m, f, m.node_u[p])
+        return m.node_surf[p], m.node_u[p]
+    if idx < num_nodes + ne:
+        ev = m.edges[idx - num_nodes]
+        p = ev[0]
+        if m.rod[p] >= 0:
+            return m.node_surf[p], wp.where(wp.length_sq(st) > 0.0, st, node(q, ev[1]) - node(q, p))
+        f = wp.where(m.edge_face[idx - num_nodes] >= 0, m.edge_face[idx - num_nodes], m.node_face[p])
+        if f >= 0:
+            return m.node_surf[p], _face_u(q, m, f, m.node_u[p])
+        return m.node_surf[p], m.node_u[p]
+    f = idx - num_nodes - ne
+    p = m.faces[f][0]
+    return m.node_surf[p], _face_u(q, m, f, m.node_u[p])
+
+
+@wp.func
+def _slot_edge_t(
+    q: wp.array[float],
+    pair: wp.vec4i,
+    w: wp.vec4,
+    n: wp.vec3,
+    side: int,
+    fallback: wp.vec3,
+) -> wp.vec3:
+    """Recompute projected edge tangent on ``q`` for two-node rod slots during adjoint replay."""
+    out = fallback
+    if wp.length_sq(fallback) > 0.0:
+        k0, k1, count = int(-1), int(-1), int(0)
+        for k in range(4):
+            if pair[k] >= 0 and (w[k] > 0.0) == (side == 0):
+                count += 1
+                if k0 < 0:
+                    k0 = k
+                else:
+                    k1 = k
+        if count == 2:
+            e = node(q, pair[k1]) - node(q, pair[k0])
+            t = e - wp.dot(e, n) * n
+            if wp.length_sq(t) > 1.0e-16:
+                out = wp.normalize(t)
+    return out
+
+
+@wp.func
+def slot_surface_pair(
+    q: wp.array[float],
+    poses: wp.array[wp.transform],
+    m: Mesh,
+    b: Bodies,
+    num_nodes: int,
+    shape_key0: int,
+    own: int,
+    key: int,
+    ta: wp.vec3,
+    tb: wp.vec3,
+):
+    """Resolve ``(m_A, m_B, u_A, u_B)`` in O(1) registers with SE(3) covariance and swap symmetry."""
+    ma, ua = _prim_surf(q, m, own, ta, num_nodes)
+    if key >= shape_key0:
+        sk = shape_of(key, shape_key0)
+        mb = m.shape_surf[sk]
+        ub = wp.transform_vector(_shape_pose(b, sk, poses), m.shape_u[sk])
+        return ma, mb, ua, ub
+    mb, ub = _prim_surf(q, m, key, tb, num_nodes)
+    return ma, mb, ua, ub
 
 
 @wp.func

@@ -367,6 +367,7 @@ class BarrierBlock:
         self.left = wp.zeros(nw, dtype=wp.int32, device=self.device)  # per world, the step's updates left
         self.unsettled = wp.zeros(nw, dtype=wp.int32, device=self.device)  # begin_step's
         self.arm = make_arm(model, getattr(source, "shape_key0", 0), 0, 0)  # no yielding bodies (the solver's to set)
+        self.residual = None
 
     def _launch(self, kernel, inputs, dim=None):
         if self.count:
@@ -408,6 +409,8 @@ class BarrierBlock:
         self._launch(_lift_kernel, [q, lift, self.s, self.arm])
         self._launch(_lag_kernel, [self.stiffness / (self.dt * self.dt), self.dt, self.mass, self.fixed, self.scale,
                                    int(start), self.unsettled, self.s, self.arm])
+        if self.residual is not None:
+            self.residual.apply_contact(self.s, state_in, self.source, self.arm, self.dt)
 
     def snapshot(self) -> Slots | None:
         """This step's active pairs, gathered for its adjoint if any carries force at its end (one host read; two if
@@ -682,7 +685,10 @@ def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam:
     e1, e2, d1, d2 = _aniso_axes(n, aniso)
     s1 = wp.dot(e1, slip)
     s2 = wp.dot(e2, slip)
-    yt = wp.sqrt(d1 * d1 * s1 * s1 + d2 * d2 * s2 * s2)
+    yt2 = d1 * d1 * s1 * s1 + d2 * d2 * s2 * s2
+    yt = float(0.0)
+    if yt2 > 0.0:
+        yt = wp.sqrt(yt2)
     friction = mu_rho * slip_energy(yt, eps)[1]
     ft = friction * (d1 * d1 * s1 * e1 + d2 * d2 * s2 * e2)
     return e[1] * n + ft, e[2], friction

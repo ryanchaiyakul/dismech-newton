@@ -8,16 +8,16 @@ from utils.common import FrameGraph
 
 import dismech_newton as dn
 import dismech_newton.solver as dn_solver
+from dismech_newton import RodResidual, SolverDiSMech
 from dismech_newton.builder import vec5f, vec10f
-from dismech_newton.residual import _ADJ_OPTS, ResidualSpec
+from dismech_newton.constants import ADJ_MODULE_OPTS
 from dismech_newton.rod import Rod, rod_dofs, rod_jacobian, vec11f
-from dismech_newton.solver import SolverDiSMech
 from dismech_newton.state import flatten_state
 
 vec3f = wp.vec3f
 
 
-@wp.kernel(module="unique", module_options=_ADJ_OPTS)
+@wp.kernel(module="unique", module_options=ADJ_MODULE_OPTS)
 def _rod_strain_kernel(
     q: wp.array(dtype=float),
     qd: wp.array(dtype=float),
@@ -242,7 +242,7 @@ def test_zero_weights_bit_identical(device, dahl: bool, worlds: int):
 
     R = 32
     w_shape = (R, 5) if worlds == 1 else (worlds, R, 5)
-    spec = ResidualSpec(rod_rff_dim=R, w_rod=np.zeros(w_shape, dtype=np.float32), spatial_rest_delta=None)
+    spec = RodResidual(rff_dim=R, w_rod=np.zeros(w_shape, dtype=np.float32), spatial_rest_delta=None)
     s_base = SolverDiSMech(model, residual=None)
     s_res = SolverDiSMech(model, residual=spec)
 
@@ -291,7 +291,7 @@ def test_origin_orthogonality_and_symmetries(device, rng):
     w_nz = rng.normal(0.0, 0.4, size=(R, 5)).astype(np.float32)
     dt = 0.01
 
-    solver_iso = SolverDiSMech(model, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, iso_bending=True, seed=7))
+    solver_iso = SolverDiSMech(model, residual=RodResidual(rff_dim=R, w_rod=w_nz, iso_bending=True, seed=7))
     s_rest = model.state()
     eps0, edot0, sig0, p0, r0 = _eval_direct(solver_iso, s_rest, dt)
     assert np.allclose(sig0, 0.0, atol=1e-7)
@@ -399,7 +399,7 @@ def test_origin_orthogonality_and_symmetries(device, rng):
     assert_close(sig_r[0, 2:4], R_phi_neg @ sig_p[0, 2:4], 1e-5, name="so2_eqv_moment")
 
     # Verify non-isotropic mode activates full coupling when iso_bending=False.
-    solver_aniso = SolverDiSMech(model, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, iso_bending=False, seed=7))
+    solver_aniso = SolverDiSMech(model, residual=RodResidual(rff_dim=R, w_rod=w_nz, iso_bending=False, seed=7))
     _, _, sig_ap, _, _ = _eval_direct(solver_aniso, s_pos, dt)
     _, _, sig_ar, _, _ = _eval_direct(solver_aniso, s_roll, dt)
     assert np.linalg.norm(sig_ar[0, 2:4] - R_phi_neg @ sig_ap[0, 2:4]) > 1e-4
@@ -436,8 +436,8 @@ def test_se3_invariance(device, rng):
     w_scale = np.array([0.08, 0.08, 0.015, 0.015, 0.015], dtype=np.float64)
     w_nz = (rng.normal(0.0, 1.0, size=(16, 5)) * w_scale).astype(np.float32)
     d_rest = rng.normal(0.0, 0.01, size=(n_seg - 1, 5)).astype(np.float32)
-    spec0 = ResidualSpec(rod_rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
-    spec1 = ResidualSpec(rod_rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
+    spec0 = RodResidual(rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
+    spec1 = RodResidual(rff_dim=16, w_rod=w_nz, spatial_rest_delta=d_rest, seed=3)
 
     s_ramp = np.linspace(0.0, 1.0, n_seg + 1, dtype=np.float32)[:, None]
     v0 = s_ramp * np.array([0.0, 0.25, -0.15], dtype=np.float32)
@@ -482,7 +482,7 @@ def test_continuum_convergence(device, rng):
         m = b.finalize(device=device)
         m.gravity.assign((0.0, 0.0, -9.81))
         fin_z, _ = simulate(m, SolverDiSMech(m, residual=None), 150, 0.01)
-        sol_r = SolverDiSMech(m, residual=ResidualSpec(rod_rff_dim=16, w_rod=w_cont, seed=11))
+        sol_r = SolverDiSMech(m, residual=RodResidual(rff_dim=16, w_rod=w_cont, seed=11))
         fin_r, _ = simulate(m, sol_r, 150, 0.01)
         tips_zero[n] = float(fin_z.particle_q.numpy()[-1, 2])
         tips_res[n] = float(fin_r.particle_q.numpy()[-1, 2])
@@ -564,7 +564,6 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     if worlds == 2 and dahl:
         pytest.skip("single-world Dahl + multi-world elastic cover the full matrix")
     monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
-    monkeypatch.setattr(dn_solver, "ULP", 1.0e-8)
 
     n_seg = 4
     sub = _build_rod_builder(
@@ -590,7 +589,7 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     w0 = rng.normal(0.0, 0.025, size=(R, 5) if worlds == 1 else (worlds, R, 5)).astype(np.float32)
     w0_3d = w0[None] if w0.ndim == 2 else w0
     d0 = rng.normal(0.0, 0.03, size=(T, 5)).astype(np.float32)
-    spec = ResidualSpec(rod_rff_dim=R, w_rod=w0.copy(), spatial_rest_delta=d0.copy(), seed=13)
+    spec = RodResidual(rff_dim=R, w_rod=w0.copy(), spatial_rest_delta=d0.copy(), seed=13)
     solver = SolverDiSMech(model, iterations=30, exact=True, self_contact=False, residual=spec)
 
     def _base_state(grad: bool = True) -> newton.State:
@@ -620,8 +619,8 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
     L0, tape, loss_arr = _rollout_loss(model, solver, s_init, q_ref, w_q, w_qd, steps, dt, record_tape=True)
     tape.backward(loss_arr)
 
-    g_w = solver.residual.w_rod.grad.numpy().reshape(-1).copy()
-    g_d = solver.residual.d_rest.grad.numpy().reshape(-1).copy()
+    g_w = solver.residual.rod.w_rod.grad.numpy().reshape(-1).copy()
+    g_d = solver.residual.rod.d_rest.grad.numpy().reshape(-1).copy()
     g_q0 = s_init.dismech.q.grad.numpy().copy()
     g_qd0 = s_init.dismech.qd.grad.numpy().copy()
     tape.zero()
@@ -636,11 +635,11 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
         for row, a in enumerate(alphas):
             delta = (a[:, None] * dirs_w).sum(axis=0).reshape(w0_3d.shape).astype(np.float32)
-            solver.residual.w_rod.assign(w0_3d + delta)
+            solver.residual.rod.w_rod.assign(w0_3d + delta)
             s_cur = _base_state(grad=False)
             val, _, _ = _rollout_loss(model, solver, s_cur, q_ref, w_q, w_qd, steps, dt, record_tape=False)
             vals[row, 0] = val
-        solver.residual.w_rod.assign(w0_3d)
+        solver.residual.rod.w_rod.assign(w0_3d)
         return vals
 
     print(f"\n[{tag}] L0={L0:.6f}")
@@ -652,11 +651,11 @@ def test_rod_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int,
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
         for row, a in enumerate(alphas):
             delta = (a[:, None] * dirs_d).sum(axis=0).reshape(d0.shape).astype(np.float32)
-            solver.residual.d_rest.assign(d0 + delta)
+            solver.residual.rod.d_rest.assign(d0 + delta)
             s_cur = _base_state(grad=False)
             val, _, _ = _rollout_loss(model, solver, s_cur, q_ref, w_q, w_qd, steps, dt, record_tape=False)
             vals[row, 0] = val
-        solver.residual.d_rest.assign(d0)
+        solver.residual.rod.d_rest.assign(d0)
         return vals
 
     check_vjp_probe("d_rest", dirs_d, g_d, _eval_d, 2.0e-3, tag=tag)
@@ -749,12 +748,12 @@ def test_rod_residual_framegraph_capture(device, rng):
 
     for sc in (False, True):
         s_base = SolverDiSMech(model, self_contact=sc, residual=None)
-        s_res = SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, seed=5))
+        s_res = SolverDiSMech(model, self_contact=sc, residual=RodResidual(rff_dim=R, w_rod=w_nz, seed=5))
         q_base, _ = _capture_and_replay(s_base)
         q_res, s_init = _capture_and_replay(s_res)
         s_eager, _ = simulate(
             model,
-            SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(rod_rff_dim=R, w_rod=w_nz, seed=5)),
+            SolverDiSMech(model, self_contact=sc, residual=RodResidual(rff_dim=R, w_rod=w_nz, seed=5)),
             substeps,
             dt,
             state=s_init,

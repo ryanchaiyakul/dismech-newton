@@ -7,7 +7,7 @@ import warp as wp
 from newton import JointType, Model
 
 from .builder import _P
-from .constants import DAHL_DEADBAND, mat5x11f, vec5f, vec5i, vec8f, vec10f, vec11f, vec11i
+from .constants import mat5x11f, vec5f, vec5i, vec8f, vec11f, vec11i
 from .element import element_kernels, rest_strains
 from .state import node
 
@@ -52,49 +52,29 @@ class Rods:
             r = self.rest.numpy()
             r[:, :2] = 0.0
             self.rest.assign(r)
-        self.dahl = d.triplet_dahl
-        self._has_dahl = bool(self.count and (self.dahl.numpy() > 0.0).all(1).any())
         self._residual = None
-        self.effective = None  # (params, rest) per step: with Dahl hysteresis or constitutive residual
-        if self._has_dahl:
-            self.effective = self._effective
-            self.params_step, self.rest_step = wp.empty_like(self.params), wp.empty_like(self.rest)
+        self.effective = None  # (params, rest) per step: constitutive/memory residual
 
     def bind_residual(self, res) -> None:
-        """Bind a constitutive residual so :meth:`effective` evaluates it (fused with Dahl when active)."""
-        if self._has_dahl and getattr(res, "rod_mem_mode", 0):
-            raise ValueError("Cannot combine Dahl rod friction with another memory mode")
+        """Bind a constitutive or memory residual so :meth:`effective` evaluates it."""
         self._residual = res
         res._rods = self
         if self.count:
-            if res.params_step is not None:
-                self.params_step, self.rest_step = res.params_step, res.rest_step
-            elif self.effective is None:
-                self.params_step, self.rest_step = wp.empty_like(self.params), wp.empty_like(self.rest)
+            self.params_step = wp.empty_like(self.params)
+            self.rest_step = wp.empty_like(self.rest)
             self.effective = self._effective
 
     def _effective(self, s, dt: float, params=None, rest=None):
-        """The step's ``(params, rest)`` with Dahl and/or constitutive residual from ``s`` (into ``params``,
-        ``rest``)."""
+        """The step's ``(params, rest)`` with constitutive/memory residual from ``s`` (into ``params``, ``rest``)."""
         params = self.params_step if params is None else params
         rest = self.rest_step if rest is None else rest
-        if self._residual is not None:
-            self._residual.eval_rod(self, s, dt, self.params, self.rest, params, rest)
-        else:
-            wp.launch(dahl_step_kernel, dim=self.count, inputs=[self.params, self.rest, self.dahl, s.triplet_mem_q, dt],
-                      outputs=[params, rest], device=self.params.device)
+        self._residual.eval_rod(self, s, dt, self.params, self.rest, params, rest)
         return params, rest
 
     def carry(self, p, s, dt: float = 0.0) -> None:
-        """``s``'s carried memory / Dahl stresses as the step from ``p`` leaves them (both with their stored strains)."""
-        if not self.count:
-            return
-        if self._residual is not None and self._residual.rod_mem_mode:
+        """``s``'s carried memory as the step from ``p`` leaves it."""
+        if self.count and self._residual is not None and self._residual.has_rod_memory:
             self._residual.carry_rod(self, p, s, dt)
-        elif self._has_dahl:
-            wp.launch(dahl_update_kernel, dim=self.count, inputs=[p.triplet_strain_q, s.triplet_strain_q,
-                      self.params, self.dahl, p.triplet_mem_q], outputs=[s.triplet_mem_q],
-                      device=self.params.device)
 
     def bind(self, s) -> Rod:
         """The view with frames transported from ``s`` (a state's ``dismech``: ``q``, ``edge_d1_q``,
@@ -305,57 +285,6 @@ def _z_of_dof(i: int):
     if i == 7:
         return 7, 1.0, 7, 0.0
     return i - 4, 1.0, i - 4, 0.0
-
-
-# -- Dahl hysteresis ----------------------------------------------------------------------------
-# Newton's (SolverVBD): per bend and twist strain a stress sigma with d sigma / d kappa = (s sigma_max - sigma) / tau,
-# s = sign(d kappa), sigma_max = K eps_max, adding to K (kappa - rest). Over a step sigma is the start's plus the
-# tangent sigma_max / tau (the mean of the two branches' at sigma) times the strain's change: a rest shift and a
-# damping-like term of the element, implicit, so the stiff Dahl response cannot ring (a frozen sigma, Newton's force,
-# lags up to 2 sigma_max / tau = 40 K one step). After the step sigma follows the law exactly over the step's change.
-
-
-@wp.func
-def dahl_advance(d: float, sigma: float, sigma_max: float, tau: float) -> float:
-    """``sigma`` after a strain change ``d``: the exact flow along the branch of ``d``'s sign (in the deadband,
-    ``sigma``'s, where alternating noise returns ``sigma`` exactly)."""
-    s = wp.where(wp.abs(d) > DAHL_DEADBAND, wp.sign(d), wp.where(sigma < 0.0, -1.0, 1.0))
-    e = wp.exp(-s * d / tau)
-    return s * sigma_max * (1.0 - e) + sigma * e
-
-
-@wp.kernel
-def dahl_step_kernel(params: wp.array[vec10f], rest: wp.array[vec5f], dahl: wp.array[wp.vec2],
-                     mem: wp.array[vec5f], dt: float, params_out: wp.array[vec10f], rest_out: wp.array[vec5f]):
-    """``rest - sigma / K`` and the damping ``C + dt K eps_max / tau`` on the bend and twist strains."""
-    t = wp.tid()
-    p = params[t]
-    r = rest[t]
-    on = wp.where(dahl[t][0] > 0.0 and dahl[t][1] > 0.0, 1.0, 0.0)
-    rate = on * dt * dahl[t][0] / wp.max(dahl[t][1], 1.0e-30)
-    m = mem[t]
-    k1, k2, k3 = p[2], p[3], p[4]
-    rest_out[t] = vec5f(r[0], r[1], r[2] - on * m[2] / wp.max(k1, 1.0e-30), r[3] - on * m[3] / wp.max(k2, 1.0e-30),
-                        r[4] - on * m[4] / wp.max(k3, 1.0e-30))
-    params_out[t] = vec10f(p[0], p[1], k1, k2, k3, p[5], p[6], p[7] + rate * k1, p[8] + rate * k2, p[9] + rate * k3)
-
-
-@wp.kernel
-def dahl_update_kernel(prev: wp.array[vec5f], strain: wp.array[vec5f], params: wp.array[vec10f],
-                       dahl: wp.array[wp.vec2], mem: wp.array[vec5f], mem_out: wp.array[vec5f]):
-    """``sigma`` advanced over the step's strain change (none from a state no step has written)."""
-    t = wp.tid()
-    eps_max, tau = dahl[t][0], dahl[t][1]
-    a, b, p, m = prev[t], strain[t], params[t], mem[t]
-    out = vec5f(0.0)
-    if eps_max > 0.0 and tau > 0.0 and not wp.isnan(a[0]):
-        sg = wp.vec3(dahl_advance(b[2] - a[2], m[2], eps_max * p[2], tau),
-                     dahl_advance(b[3] - a[3], m[3], eps_max * p[3], tau),
-                     dahl_advance(b[4] - a[4], m[4], eps_max * p[4], tau))
-        out = vec5f(m[0], m[1], sg[0], sg[1], sg[2])
-    elif eps_max > 0.0 and tau > 0.0:
-        out = m
-    mem_out[t] = out
 
 
 # -- end-of-step kernels (one thread per edge or triplet) ---------------------------------

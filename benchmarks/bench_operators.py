@@ -8,10 +8,19 @@ from conftest import bench_framegraph
 from newton.solvers import SolverSemiImplicit
 from utils.common import FrameGraph, grid
 
-from dismech_newton import SolverDiSMech, add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
+from dismech_newton import (
+    ContactResidual,
+    JointResidual,
+    RodResidual,
+    ShellResidual,
+    SolverDiSMech,
+    add_cloth_mesh,
+    add_rod,
+    fix_segment,
+    register_custom_attributes,
+)
 from dismech_newton.contact import Slots
 from dismech_newton.coupling import SolverCoupledProxy
-from dismech_newton.residual import JointResidualSpec, ResidualSpec, SurfaceMaterialSpec
 
 RADIUS = 0.01
 
@@ -57,7 +66,7 @@ def test_bench_rod(benchmark, device, needs_cuda, worlds: int, variant: str):
     if variant == "rff":
         rng = np.random.default_rng(5)
         w = rng.normal(0.0, 0.05, size=(64, 5)).astype(np.float32)
-        res = ResidualSpec(rod_rff_dim=64, w_rod=w, seed=5)
+        res = RodResidual(rff_dim=64, w_rod=w, seed=5)
     sim = SolverDiSMech(m, self_contact=False, residual=res)
     s0, s1 = m.state(), m.state()
     dt = 0.01
@@ -97,7 +106,7 @@ def test_bench_shell(benchmark, device, needs_cuda, worlds: int, variant: str):
         rng = np.random.default_rng(5)
         scale = np.array([0.25, 0.25, 0.25, 0.002, 0.002, 0.002], dtype=np.float32)
         w = (rng.normal(0.0, 1.0, size=(64, 6)) * scale).astype(np.float32)
-        res = ResidualSpec(shell_rff_dim=64, w_shell=w, seed=5)
+        res = ShellResidual(rff_dim=64, w_shell=w, seed=6)
     sim = SolverDiSMech(m, self_contact=False, residual=res)
     s0, s1 = m.state(), m.state()
     dt = 0.01
@@ -148,8 +157,7 @@ def test_bench_contact(benchmark, device, needs_cuda, worlds: int, variant: str)
         emb = rng.normal(0.0, 0.5, (1, M, 8)).astype(np.float32)
         emb[:, :, 7] = np.array([[0.5, -0.3, 0.2, -0.4]], dtype=np.float32)
         wc = rng.normal(0.0, 0.4, (1, R, 2)).astype(np.float32)
-        res = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                           contact=SurfaceMaterialSpec(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=9))
+        res = ContactResidual(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=9)
     sim = SolverDiSMech(m, self_contact=False, residual=res)
     if variant == "aniso":
         orig_fill = sim.contact.source.fill
@@ -215,11 +223,11 @@ def test_bench_coupled(benchmark, device, needs_cuda, worlds: int, variant: str)
     D = m.joint_dof_count // worlds
     spec = None
     if variant == "joint_rff":
-        spec = ResidualSpec(
-            rod_rff_dim=0,
-            shell_rff_dim=0,
-            joint=JointResidualSpec(rff_dim=32, coulomb=0.2, stribeck=0.1,
-                                    w_joint=rng.normal(0.0, 0.2, (1, D, 32)).astype(np.float32)),
+        spec = JointResidual(
+            rff_dim=32,
+            coulomb=0.2,
+            stribeck=0.1,
+            w_joint=rng.normal(0.0, 0.2, (1, D, 32)).astype(np.float32),
         )
     entries = [
         SolverCoupledProxy.Entry(name="rigid", solver=lambda mv: SolverSemiImplicit(mv), bodies=rigid_b,

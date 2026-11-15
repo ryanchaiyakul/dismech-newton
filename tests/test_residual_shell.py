@@ -11,11 +11,13 @@ from rollouts import cloth, finalize_worlds, grid, simulate
 from scipy.spatial.transform import Rotation
 from utils.common import FrameGraph
 
-from dismech_newton import SolverDiSMech, flatten_state
+from dismech_newton import Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
 from dismech_newton import solver as dn_solver
 from dismech_newton.adjoint import StepAdjoint
 from dismech_newton.builder import Rod, add_rod, fix_segment, vec6f, vec12f
-from dismech_newton.residual import _ADJ_OPTS, ResidualSpec, _mem_ops, _shell_rff_loop
+from dismech_newton.constants import ADJ_MODULE_OPTS
+from dismech_newton.residuals.base import clamp_channel
+from dismech_newton.residuals.rff import shell_rff_sum
 
 
 def _cantilever_plate(
@@ -160,10 +162,10 @@ def test_shell_zero_weights_bit_identical(device, worlds: int):
         model,
         iterations=12,
         self_contact=False,
-        residual=ResidualSpec(shell_rff_dim=R, w_shell=np.zeros(w_shape, dtype=np.float32), seed=3),
+        residual=ShellResidual(rff_dim=R, w_shell=np.zeros(w_shape, dtype=np.float32), seed=4),
     )
     assert s_res.shells.effective is not None
-    assert s_res.residual.w_shell.shape == (1 if worlds == 1 else worlds, R)
+    assert s_res.residual.shell.w_shell.shape == (1 if worlds == 1 else worlds, R)
 
     dt = 0.01
     st0_b, _ = simulate(model, s_base, 10, dt)
@@ -199,7 +201,7 @@ def test_shell_origin_and_se3_invariance(device, rng):
         model,
         iterations=12,
         self_contact=False,
-        residual=ResidualSpec(shell_rff_dim=R, w_shell=w_nz, seed=11),
+        residual=ShellResidual(rff_dim=R, w_shell=w_nz, seed=12),
     )
 
     dt = 0.01
@@ -277,9 +279,7 @@ def test_shell_origin_and_se3_invariance(device, rng):
     assert np.abs(st_final.particle_qd.numpy()).max() < 1e-6
 
     # 2) Odd/even parity on (z_a, z_b) -> (-z_a, -z_b) AND physical small-deflection parity
-    res = solver.residual
-    m = res.mem_shell
-    mem_zero = wp.zeros(solver.shells.count, dtype=vec6f, device=device)
+    res = solver.residual.shell
     za_t = wp.empty(solver.shells.count, dtype=vec6f, device=device)
     zb_t = wp.empty(solver.shells.count, dtype=vec6f, device=device)
     za_np = rng.normal(0.0, 0.5, size=(solver.shells.count, 6)).astype(np.float32)
@@ -297,29 +297,18 @@ def test_shell_origin_and_se3_invariance(device, rng):
             inputs=[
                 solver.shells.params,
                 solver.shells.rest,
-                wp.full(solver.shells.count, float("nan"), dtype=vec6f, device=device),
-                res.d_rest_shell,
-                res.has_d_rest_shell,
+                res.d_rest,
+                int(res.has_d_rest),
                 solver.shells.area,
-                res.shell_rff_freq,
+                res.rff_freq,
                 res.w_shell,
-                res.shell_elem_world,
+                res.elem_world,
                 za_t,
                 zb_t,
-                mem_zero,
-                m.k_mem,
-                m.flow,
-                m.tau,
-                m.bw_sat,
-                m.yield_weight,
-                m.mk,
-                m.mode,
-                m.ye,
-                m.yd,
-                res.shell_scales,
+                res.data.scales,
                 stride,
-                res.spec.clamp_lo,
-                res.spec.clamp_hi,
+                res.clamp_lo,
+                res.clamp_hi,
                 dt,
             ],
             outputs=[p_t, r_t],
@@ -340,7 +329,7 @@ def test_shell_origin_and_se3_invariance(device, rng):
     # Physical pure-bending parity on a flat plate for infinitesimal transverse deflection + velocity
     sub_f, vf, ff, _ = _cantilever_plate(3, 3, gravity=(0.0, 0.0, 0.0))
     mod_f = sub_f.finalize(device=device)
-    sol_f = SolverDiSMech(mod_f, self_contact=False, residual=ResidualSpec(shell_rff_dim=R, w_shell=w_nz, seed=11))
+    sol_f = SolverDiSMech(mod_f, self_contact=False, residual=ShellResidual(rff_dim=R, w_shell=w_nz, seed=12))
     dz_bend = 1.0e-3 * (vf[:, 0] ** 2)
     vz_bend = 2.0e-3 * vf[:, 0]
     res_p, res_r = [], []
@@ -378,7 +367,7 @@ def test_shell_origin_and_se3_invariance(device, rng):
         * np.array([0.005, 0.005, 0.005, 0.02, 0.02, 0.02], dtype=np.float32)
     ).astype(np.float32)
 
-    spec = ResidualSpec(shell_rff_dim=R, w_shell=w_se3, shell_spatial_rest_delta=d_rest, seed=19)
+    spec = ShellResidual(rff_dim=R, w_shell=w_se3, spatial_rest_delta=d_rest, seed=20)
     sol_a = SolverDiSMech(mod_a, iterations=15, self_contact=False, residual=spec)
     sol_b = SolverDiSMech(mod_b, iterations=15, self_contact=False, residual=spec)
     assert np.any(~fixed_a)
@@ -392,13 +381,10 @@ def test_shell_origin_and_se3_invariance(device, rng):
 
 @cache
 def _get_shell_step_kernel():
-    mem_step6_0, _ = _mem_ops(6, 0)
-
-    @wp.kernel(module="unique", module_options=_ADJ_OPTS)
+    @wp.kernel(module="unique", module_options=ADJ_MODULE_OPTS)
     def _shell_constit_step_kernel(
         pb: wp.array[vec12f],
         rb: wp.array[vec6f],
-        sq: wp.array[vec6f],
         dr: wp.array[vec6f],
         has_dr: int,
         ar: wp.array[float],
@@ -407,16 +393,6 @@ def _get_shell_step_kernel():
         ew: wp.array[wp.int32],
         za: wp.array[vec6f],
         zb: wp.array[vec6f],
-        mem: wp.array[vec6f],
-        km: wp.array[vec6f],
-        fl: wp.array[vec6f],
-        ta: wp.array[vec6f],
-        bs: wp.array[vec6f],
-        yw: wp.array[vec6f],
-        mk: vec6f,
-        md: int,
-        ye: float,
-        yd: float,
         sc: vec12f,
         st: int,
         clo: float,
@@ -426,42 +402,37 @@ def _get_shell_step_kernel():
         rout: wp.array[vec6f],
     ):
         f, lane = wp.tid() // st, wp.tid() % st
-        R_, wi, z_a = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0), za[f]
-        sp, dk, dc = _shell_rff_loop(
-            z_a, zb[f], fr, ws, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)) if R_ > 0 else 0.0
+        rff_dim, wi, z_a = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0), za[f]
+        sp, dk, dc = shell_rff_sum(
+            z_a, zb[f], fr, ws, wi, rff_dim, lane, st, wp.sqrt(2.0 / float(rff_dim)) if rff_dim > 0 else 0.0
         )
         if lane == 0:
+            pb_i = pb[f]
+            r0 = rb[f] + dr[f] if has_dr != 0 else rb[f]
             sa = vec6f(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5])
             sb = vec6f(sc[6], sc[7], sc[8], sc[9], sc[10], sc[11])
-            po, ro = mem_step6_0(
-                pb[f],
-                rb[f],
-                dr[f],
-                has_dr,
-                z_a,
-                sq[f],
-                mem[f],
-                sp,
-                dk,
-                dc,
-                vec6f(ar[f]),
-                sa,
-                sb,
-                vec6f(0.0),
-                vec6f(0.0),
-                ew[f],
-                km,
-                fl,
-                ta,
-                bs,
-                yw,
-                mk,
-                ye,
-                yd,
-                clo,
-                chi,
-                dt,
-            )
+            er = wp.cw_mul(z_a, sa)
+            ls = vec6f(ar[f])
+            po, ro = vec12f(), vec6f()
+            for j in range(6):
+                r = clamp_channel(
+                    pb_i[j],
+                    pb_i[6 + j],
+                    ls[j] * sp[j],
+                    ls[j] * dk[j] / sa[j],
+                    ls[j] * dc[j] / sb[j],
+                    r0[j],
+                    er[j],
+                    0.0,
+                    0.0,
+                    0.0,
+                    clo,
+                    chi,
+                    dt,
+                )
+                po[j] = r[0]
+                po[6 + j] = r[1]
+                ro[j] = r[2]
             pout[f] = po
             rout[f] = ro
 
@@ -486,7 +457,7 @@ def test_shell_continuum_refinement(device, rng):
             model,
             iterations=15,
             self_contact=False,
-            residual=ResidualSpec(shell_rff_dim=R, w_shell=w, seed=0),
+            residual=ShellResidual(rff_dim=R, w_shell=w, seed=1),
         )
         qb, _ = simulate(model, s_b, steps, dt)
         qr, _ = simulate(model, s_r, steps, dt)
@@ -513,7 +484,6 @@ def test_shell_continuum_refinement(device, rng):
 @pytest.mark.parametrize("worlds", [1, pytest.param(2, marks=pytest.mark.slow)])
 def test_shell_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: int):
     monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
-    monkeypatch.setattr(dn_solver, "ULP", 1.0e-8)
 
     sub, v, _, fixed = _cantilever_plate(
         2,
@@ -539,7 +509,7 @@ def test_shell_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: in
     w0_3d = w0[None] if w0.ndim == 2 else w0
     d0 = (rng.normal(size=(F_tot, 6)) * d_scale).astype(np.float32)
 
-    spec = ResidualSpec(shell_rff_dim=R, w_shell=w0.copy(), shell_spatial_rest_delta=d0.copy(), seed=13)
+    spec = ShellResidual(rff_dim=R, w_shell=w0.copy(), spatial_rest_delta=d0.copy(), seed=14)
     solver = SolverDiSMech(model, iterations=30, exact=True, self_contact=False, residual=spec)
     assert isinstance(StepAdjoint(solver), StepAdjoint)
 
@@ -565,8 +535,8 @@ def test_shell_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: in
     L0, tape, loss_arr = _rollout_loss(model, solver, s_init, q_ref, w_q, w_qd, steps, dt, record_tape=True)
     tape.backward(loss_arr)
 
-    g_w = solver.residual.w_shell.grad.numpy().reshape(-1).copy()
-    g_d = solver.residual.d_rest_shell.grad.numpy().reshape(-1).copy()
+    g_w = solver.residual.shell.w_shell.grad.numpy().reshape(-1).copy()
+    g_d = solver.residual.shell.d_rest.grad.numpy().reshape(-1).copy()
     g_q0 = s_init.dismech.q.grad.numpy().copy()
     g_qd0 = s_init.dismech.qd.grad.numpy().copy()
     tape.zero()
@@ -583,12 +553,12 @@ def test_shell_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: in
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
         for row, a in enumerate(alphas):
             delta = (a[:, None] * dirs_w).sum(axis=0).reshape(w0_3d.shape).astype(np.float32)
-            solver.residual.w_shell.assign(w0_3d + delta)
+            solver.residual.shell.w_shell.assign(w0_3d + delta)
             val, _, _ = _rollout_loss(
                 model, solver, _base_state(grad=False), q_ref, w_q, w_qd, steps, dt, record_tape=False
             )
             vals[row, 0] = val
-        solver.residual.w_shell.assign(w0_3d)
+        solver.residual.shell.w_shell.assign(w0_3d)
         return vals
 
     check_vjp_probe("w_shell", dirs_w, g_w, _eval_w, 1.0e-2, rtol=5.0e-3, tag=tag)
@@ -599,12 +569,12 @@ def test_shell_step_adjoint_fd(device, rng, needs_cudss, monkeypatch, worlds: in
         vals = np.empty((alphas.shape[0], 1), dtype=np.float64)
         for row, a in enumerate(alphas):
             delta = (a[:, None] * dirs_d).sum(axis=0).reshape(d0.shape).astype(np.float32)
-            solver.residual.d_rest_shell.assign(d0 + delta)
+            solver.residual.shell.d_rest.assign(d0 + delta)
             val, _, _ = _rollout_loss(
                 model, solver, _base_state(grad=False), q_ref, w_q, w_qd, steps, dt, record_tape=False
             )
             vals[row, 0] = val
-        solver.residual.d_rest_shell.assign(d0)
+        solver.residual.shell.d_rest.assign(d0)
         return vals
 
     check_vjp_probe("d_rest_shell", dirs_d, g_d, _eval_d, 2.0e-3, rtol=5.0e-3, tag=tag)
@@ -678,7 +648,10 @@ def test_batched_multiworld_rod_shell_independence(device, rng):
     w_shell = rng.normal(0.0, 0.08, size=(W, R, 6)).astype(np.float32)
     dt, n_steps = 0.01, 8
 
-    spec_b = ResidualSpec(rod_rff_dim=R, shell_rff_dim=R, w_rod=w_rod, w_shell=w_shell, seed=23)
+    spec_b = Residual(
+        rod=RodResidual(rff_dim=R, w_rod=w_rod, seed=23),
+        shell=ShellResidual(rff_dim=R, w_shell=w_shell, seed=24),
+    )
     solver_b = SolverDiSMech(model_b, iterations=15, self_contact=False, residual=spec_b)
 
     def _init_state(m: newton.Model) -> tuple[newton.State, newton.State]:
@@ -715,7 +688,10 @@ def test_batched_multiworld_rod_shell_independence(device, rng):
     model_1.gravity.assign((0.0, 0.0, -9.81))
     ref_qs = []
     for w in range(W):
-        spec_1 = ResidualSpec(rod_rff_dim=R, shell_rff_dim=R, w_rod=w_rod[w], w_shell=w_shell[w], seed=23)
+        spec_1 = Residual(
+            rod=RodResidual(rff_dim=R, w_rod=w_rod[w], seed=23),
+            shell=ShellResidual(rff_dim=R, w_shell=w_shell[w], seed=24),
+        )
         sol_1 = SolverDiSMech(model_1, iterations=15, self_contact=False, residual=spec_1)
         s1_out, _ = simulate(model_1, sol_1, n_steps, dt)
         ref_q = s1_out.particle_q.numpy()
@@ -774,12 +750,12 @@ def test_shell_residual_framegraph_capture(device, rng):
 
     for sc in (False, True):
         s_base = SolverDiSMech(model, self_contact=sc, residual=None)
-        s_res = SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(shell_rff_dim=R, w_shell=w_nz, seed=5))
+        s_res = SolverDiSMech(model, self_contact=sc, residual=ShellResidual(rff_dim=R, w_shell=w_nz, seed=6))
         q_base, _ = _capture_and_replay(s_base)
         q_res, s_init = _capture_and_replay(s_res)
         s_eager, _ = simulate(
             model,
-            SolverDiSMech(model, self_contact=sc, residual=ResidualSpec(shell_rff_dim=R, w_shell=w_nz, seed=5)),
+            SolverDiSMech(model, self_contact=sc, residual=ShellResidual(rff_dim=R, w_shell=w_nz, seed=6)),
             3 * substeps,
             dt,
             state=s_init,

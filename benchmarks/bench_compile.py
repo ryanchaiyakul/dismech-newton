@@ -10,9 +10,8 @@ import pytest
 import warp as wp
 from conftest import count_dismech_modules
 
-from dismech_newton import SolverDiSMech, flatten_state
+from dismech_newton import ContactResidual, Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
 from dismech_newton.coupling import SolverCoupledProxy
-from dismech_newton.residual import ResidualSpec, SurfaceMaterialSpec
 
 
 def _build_rod(n_seg: int = 4) -> newton.ModelBuilder:
@@ -135,10 +134,10 @@ def test_compile_warm(benchmark, device, needs_cuda, kind: str):
             SolverDiSMech.add_cloth_mesh(b, vertices=v.tolist(), indices=f.ravel().tolist(), density=1.0,
                                          tri_ke=1.0e3, tri_ka=1.0e3, bend_stiffness=0.05)
             m = b.finalize(device=device)
-            res = ResidualSpec(
-                rod_rff_dim=16,
-                shell_rff_dim=16,
-                contact=SurfaceMaterialSpec(rff_dim=16, num_materials=2),
+            res = Residual(
+                rod=RodResidual(rff_dim=16),
+                shell=ShellResidual(rff_dim=16),
+                contact=ContactResidual(rff_dim=16, num_materials=2),
             )
             sc = True
         s0, s1 = m.state(), m.state()

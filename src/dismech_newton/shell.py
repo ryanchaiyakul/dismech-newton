@@ -13,7 +13,7 @@ import warp as wp
 from newton import Model
 
 from .builder import _P
-from .constants import FWD_MODULE_OPTS, mat6x21f, mat23f, mat63f, vec6f, vec9i, vec12f, vec21f, vec21i
+from .constants import FWD_MODULE_OPTS, mat6x21f, mat23f, mat63f, vec6f, vec9i, vec21f, vec21i
 from .element import element_kernels, rest_strains
 
 wp.set_module_options(FWD_MODULE_OPTS)
@@ -64,24 +64,16 @@ class Shells:
         self.effective = None
 
     def bind_residual(self, res) -> None:
-        """Bind a constitutive residual so :meth:`effective` evaluates it."""
+        """Bind a constitutive or memory residual so :meth:`effective` evaluates it."""
         self._residual = res
         res._shells = self
         if self.count:
-            self.params_step = (
-                res.shell_params_step
-                if res.shell_params_step is not None
-                else wp.empty(self.count, dtype=vec12f, device=self.params.device)
-            )
-            self.rest_step = (
-                res.shell_rest_step
-                if res.shell_rest_step is not None
-                else wp.empty(self.count, dtype=vec6f, device=self.rest.device)
-            )
+            self.params_step = wp.empty_like(self.params)
+            self.rest_step = wp.empty_like(self.rest)
             self.effective = self._effective
 
     def _effective(self, s, dt: float, params=None, rest=None):
-        """The step's ``(params, rest)`` with constitutive residual from ``s`` (into ``params``, ``rest``)."""
+        """The step's ``(params, rest)`` with constitutive/memory residual from ``s`` (into ``params``, ``rest``)."""
         params = self.params_step if params is None else params
         rest = self.rest_step if rest is None else rest
         self._residual.eval_shell(self, s, dt, self.params, self.rest, params, rest)
@@ -89,7 +81,7 @@ class Shells:
 
     def carry(self, p, s, dt: float = 0.0) -> None:
         """``s``'s carried face memory as the step from ``p`` leaves it."""
-        if self.count and self._residual is not None and self._residual.shell_mem_mode:
+        if self.count and self._residual is not None and self._residual.has_shell_memory:
             self._residual.carry_shell(self, p, s, dt)
 
     def bind(self, s) -> Shell:

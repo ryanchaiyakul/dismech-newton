@@ -10,9 +10,8 @@ import pytest
 import warp as wp
 from newton.solvers import SolverSemiImplicit
 
-from dismech_newton import SolverDiSMech
+from dismech_newton import JointResidual, SolverDiSMech
 from dismech_newton.coupling import SolverCoupledProxy
-from dismech_newton.residual import JointResidual, JointResidualSpec, ResidualSpec
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from utils.common import FrameGraph  # noqa: E402
@@ -103,7 +102,7 @@ def _build_coupled_worlds(device, n_worlds: int = 1, two_dof: bool = False, rod_
     return m, (rigid_b, rigid_j, rigid_sh, soft_p, soft_b, soft_sh, arm_b, prox_b)
 
 
-def _make_coupled(m, ids, spec: ResidualSpec | None):
+def _make_coupled(m, ids, spec: JointResidual | None):
     rigid_b, rigid_j, rigid_sh, soft_p, soft_b, soft_sh, arm_b, prox_b = ids
     entries = [
         SolverCoupledProxy.Entry(
@@ -128,10 +127,7 @@ def _set_joint_dof_values(n_dof: int, world_size: int, idx_values: dict[int, flo
 def test_zero_weight_bitwise_identity(device):
     m, ids = _build_coupled_worlds(device, n_worlds=1, two_dof=True, arm_z=0.15, collide_rod=True)
     D = m.joint_dof_count
-    spec = ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(rff_dim=16, w_joint=np.zeros((1, D, 16), "f4"), coulomb=0.0, stribeck=0.0),
-    )
+    spec = JointResidual(rff_dim=16, w_joint=np.zeros((1, D, 16), "f4"), coulomb=0.0, stribeck=0.0)
     c_base, c_res = _make_coupled(m, ids, None), _make_coupled(m, ids, spec)
     s0_b, s1_b = m.state(), m.state()
     s0_r, s1_r = m.state(), m.state()
@@ -165,12 +161,9 @@ def test_standstill_equilibrium_and_non_mutation(device, needs_cuda):
     rng = np.random.default_rng(3)
     m, ids = _build_coupled_worlds(device, n_worlds=1, two_dof=True, arm_z=0.25, collide_rod=True)
     D = m.joint_dof_count
-    spec = ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(
-            rff_dim=32, coulomb=1.2, stribeck=0.8,
-            w_joint=rng.normal(0.0, 2.0, (1, D, 32)).astype("f4"),
-        ),
+    spec = JointResidual(
+        rff_dim=32, coulomb=1.2, stribeck=0.8,
+        w_joint=rng.normal(0.0, 2.0, (1, D, 32)).astype("f4"),
     )
     c = _make_coupled(m, ids, spec)
     soft_solver = c._entries["soft"].solver
@@ -188,11 +181,11 @@ def test_standstill_equilibrium_and_non_mutation(device, needs_cuda):
 
     # Zero drift over 50 substeps under FrameGraph
     mh, idsh = _build_coupled_worlds(device, n_worlds=1, two_dof=False, arm_z=0.25, collide_rod=False)
-    ch = _make_coupled(mh, idsh, ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(
-            rff_dim=32, coulomb=1.2, stribeck=0.8, w_joint=rng.normal(0.0, 2.0, (1, 1, 32)).astype("f4")),
-    ))
+    ch = _make_coupled(
+        mh,
+        idsh,
+        JointResidual(rff_dim=32, coulomb=1.2, stribeck=0.8, w_joint=rng.normal(0.0, 2.0, (1, 1, 32)).astype("f4")),
+    )
     sh0, sh1, ch_ctrl = mh.state(), mh.state(), mh.control()
     ch_ctrl.joint_f = wp.zeros(1, dtype=float, device=device)
     sh0.joint_q.assign(np.array([0.35], "f4"))
@@ -239,9 +232,9 @@ def test_ortho_viscous_standstill_slope(device):
 
     slopes = {}
     for ortho in (True, False):
-        jres = JointResidual(m, JointResidualSpec(
+        jres = JointResidual(
             rff_dim=32, ortho_viscous=ortho, coulomb=0.0, stribeck=0.0, w_joint=wj,
-        ), device=device)
+        ).bind(m, device=device)
         slopes[ortho] = []
         h = 1.0e-4
         for kind in ("qd", "u"):
@@ -273,10 +266,7 @@ def test_actuator_object_seam_invariance(device):
             device, n_worlds=1, two_dof=False, rod_ei=ei, arm_z=0.0299, collide_rod=True, sphere=True, arm_x=0.1,
         )
         D = m.joint_dof_count
-        spec = ResidualSpec(
-            rod_rff_dim=0, shell_rff_dim=0,
-            joint=JointResidualSpec(rff_dim=16, coulomb=0.35, stribeck=0.25, w_joint=wj[:, :D, :]),
-        )
+        spec = JointResidual(rff_dim=16, coulomb=0.35, stribeck=0.25, w_joint=wj[:, :D, :])
         c = _make_coupled(m, ids, spec)
         s0, s1, ctrl = m.state(), m.state(), m.control()
         s0.joint_q.assign(_set_joint_dof_values(D, D, {0: 0.0}))
@@ -302,11 +292,11 @@ def test_tape_vjp_direct_and_coupled(device):
     # 1. Direct JointResidual.apply VJP wrt w_joint, coulomb, stribeck, joint_q, joint_qd, joint_f
     m_dir, _ = _build_coupled_worlds(device, n_worlds=1, two_dof=True, arm_z=0.2, collide_rod=False, requires_grad=True)
     D_dir = m_dir.joint_dof_count
-    jres_dir = JointResidual(m_dir, JointResidualSpec(
+    jres_dir = JointResidual(
         rff_dim=8, q_scale=0.5, qd_scale=0.2, u_scale=2.0, stribeck_v=0.5,
         coulomb=np.array([0.4, 0.3], "f4"), stribeck=np.array([0.3, 0.2], "f4"),
         w_joint=rng.normal(0.0, 0.6, (1, D_dir, 8)).astype("f4"),
-    ), device=device)
+    ).bind(m_dir, device=device)
     s_in, ctrl_dir = m_dir.state(), m_dir.control()
     s_in.joint_q.assign(np.array([0.45, -0.35], "f4"))
     s_in.joint_qd.assign(np.array([0.5, -0.4], "f4"))
@@ -346,12 +336,9 @@ def test_tape_vjp_direct_and_coupled(device):
     m_c, ids_c = _build_coupled_worlds(
         device, n_worlds=1, two_dof=False, arm_z=0.2, collide_rod=False, requires_grad=True)
     D_c = m_c.joint_dof_count
-    spec_c = ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(
-            rff_dim=8, qd_scale=0.2, u_scale=2.0, stribeck_v=0.1,
-            coulomb=0.35, stribeck=0.25, w_joint=rng.normal(0.0, 0.8, (1, D_c, 8)).astype("f4"),
-        ),
+    spec_c = JointResidual(
+        rff_dim=8, qd_scale=0.2, u_scale=2.0, stribeck_v=0.1,
+        coulomb=0.35, stribeck=0.25, w_joint=rng.normal(0.0, 0.8, (1, D_c, 8)).astype("f4"),
     )
     c = _make_coupled(m_c, ids_c, spec_c)
     jres_c = c._entries["soft"].solver.joint_residual
@@ -405,9 +392,8 @@ def test_multiworld_isolation_and_framegraph_capture(device, needs_cuda):
     rng = np.random.default_rng(31)
 
     # Validation checks
-    m0, _ = _build_coupled_worlds(device, n_worlds=1, two_dof=False, collide_rod=False)
     with pytest.raises(ValueError):
-        JointResidual(m0, JointResidualSpec(tau_cap=0.0), device=device)
+        JointResidual(tau_cap=0.0)
 
     # W=4 per-world weight isolation + enabled_dofs masking
     m4, ids4 = _build_coupled_worlds(device, n_worlds=4, two_dof=True, arm_z=0.2, collide_rod=True)
@@ -418,10 +404,7 @@ def test_multiworld_isolation_and_framegraph_capture(device, needs_cuda):
         wj4[w] = rng.normal(0.0, 0.5 * w, (D4, 16)).astype("f4")
         cl4[w] = 0.25 * w
         st4[w] = 0.15 * w
-    spec4 = ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(rff_dim=16, w_joint=wj4, coulomb=cl4, stribeck=st4),
-    )
+    spec4 = JointResidual(rff_dim=16, w_joint=wj4, coulomb=cl4, stribeck=st4)
     c4_base, c4_res = _make_coupled(m4, ids4, None), _make_coupled(m4, ids4, spec4)
     s0_b, s1_b = m4.state(), m4.state()
     s0_r, s1_r = m4.state(), m4.state()
@@ -446,9 +429,9 @@ def test_multiworld_isolation_and_framegraph_capture(device, needs_cuda):
     assert not np.allclose(jfe4[D4:2 * D4], jfe4[2 * D4:3 * D4])
 
     # enabled_dofs=(1,) leaves DOF 0 untouched
-    jres_masked = JointResidual(m4, JointResidualSpec(
+    jres_masked = JointResidual(
         rff_dim=16, w_joint=wj4, coulomb=cl4, stribeck=st4, enabled_dofs=(1,),
-    ), device=device)
+    ).bind(m4, device=device)
     out_masked = jres_masked.apply(s0_r, ctrl4)
     wp.synchronize()
     jfe_m = out_masked.joint_f.numpy()
@@ -458,12 +441,9 @@ def test_multiworld_isolation_and_framegraph_capture(device, needs_cuda):
 
     # W=4 FrameGraph capture & replay equivalence check
     D_fg = D4
-    spec_fg = ResidualSpec(
-        rod_rff_dim=0, shell_rff_dim=0,
-        joint=JointResidualSpec(
-            rff_dim=16, coulomb=0.2, stribeck=0.1,
-            w_joint=rng.normal(0.0, 0.2, (1, D_fg, 16)).astype("f4"),
-        ),
+    spec_fg = JointResidual(
+        rff_dim=16, coulomb=0.2, stribeck=0.1,
+        w_joint=rng.normal(0.0, 0.2, (1, D_fg, 16)).astype("f4"),
     )
     s_base = _make_coupled(m4, ids4, None)
     s_res = _make_coupled(m4, ids4, spec_fg)

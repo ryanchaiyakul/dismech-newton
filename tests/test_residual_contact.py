@@ -22,9 +22,8 @@ from rollouts import RADIUS, dismech_loss_kernel, simulate
 from scipy.spatial.transform import Rotation
 from utils.common import FrameGraph, pads
 
-from dismech_newton import SolverDiSMech, flatten_state, solver
+from dismech_newton import ContactResidual, SolverDiSMech, flatten_state, solver
 from dismech_newton.contact import Slots, _slots, emit
-from dismech_newton.residual import ResidualSpec, SurfaceMaterialSpec
 
 
 @wp.kernel
@@ -108,7 +107,7 @@ def _rod_ground_model(
 def test_no_torch_imported(device):
     assert "torch" not in sys.modules
     m = _rod_ground_model(device)
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0, contact=SurfaceMaterialSpec(rff_dim=8, num_materials=2))
+    spec = ContactResidual(rff_dim=8, num_materials=2)
     sim = SolverDiSMech(m, self_contact=False, residual=spec)
     s0, s1 = m.state(), m.state()
     sim.step(s0, s1, None, None, 5.0e-3)
@@ -127,8 +126,7 @@ def test_zero_weight_bitwise_identity(device, rng, kh):
     wc = np.zeros((16, 2), dtype=np.float32)
 
     s_base = SolverDiSMech(m, exact=True, iterations=200, self_contact=False, residual=None)
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                        contact=SurfaceMaterialSpec(rff_dim=16, num_materials=3, embeddings=emb, w_contact=wc))
+    spec = ContactResidual(rff_dim=16, num_materials=3, embeddings=emb, w_contact=wc)
     s_res = SolverDiSMech(m, exact=True, iterations=200, self_contact=False, residual=spec)
 
     def _run(sim):
@@ -196,9 +194,7 @@ def test_swap_permutation_symmetry(device, rng):
         su[0] = u_a if swap else u_b
         m.dismech.shape_surface_id.assign(ss)
         m.dismech.shape_surface_u.assign(su)
-        spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                            contact=SurfaceMaterialSpec(rff_dim=32, num_materials=2, embeddings=emb, w_contact=wc,
-                                                        seed=11))
+        spec = ContactResidual(rff_dim=32, num_materials=2, embeddings=emb, w_contact=wc, seed=11)
         sim = SolverDiSMech(m, exact=True, iterations=400, self_contact=False, residual=spec)
         s0, s1 = m.state(), m.state()
         s0.particle_qd.assign(np.tile([0.3, 0.15, 0.0], (m.particle_count, 1)).astype(np.float32))
@@ -229,9 +225,7 @@ def test_swap_permutation_symmetry(device, rng):
         m = b.finalize(device=device)
         sids = np.array([1, 1, 1, 0, 0, 0] if swap else [0, 0, 0, 1, 1, 1], dtype=np.int32)
         m.dismech.surface_id.assign(sids)
-        spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                            contact=SurfaceMaterialSpec(rff_dim=32, num_materials=2, embeddings=emb, w_contact=wc,
-                                                        seed=17))
+        spec = ContactResidual(rff_dim=32, num_materials=2, embeddings=emb, w_contact=wc, seed=17)
         sim = SolverDiSMech(m, exact=True, iterations=200, residual=spec)
         s0, s1 = m.state(), m.state()
         qd = np.tile([0.2, 0.1, 0.0], (m.particle_count, 1)).astype(np.float32)
@@ -255,17 +249,23 @@ def test_reference_anchor_and_bounds(device, rng):
     """At ``u_ref = [log 2, 1, 0, 0]`` (``rho = rho_ref``, ``|v_t| = v_ref``, ``s_an = 0``, ``dt_n = 0``),
     ``mu_eff == mu_0`` regardless of large ``w_contact``; extreme weights respect all bounds."""
     m = _rod_ground_model(device, segments=1, z=RADIUS, mu_rod=0.4, mu_shape=0.4)
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                        contact=SurfaceMaterialSpec(rff_dim=32, rho_ref=2.5, v_ref=0.2, mu_min_mult=0.15,
-                                                    pad_min_mult=0.2, pad_max_mult=4.0, gamma_max=1.2,
-                                                    num_materials=2,
-                                                    embeddings=rng.normal(0.0, 0.7, (2, 8)).astype(np.float32),
-                                                    w_contact=rng.normal(0.0, 25.0, (32, 2)).astype(np.float32),
-                                                    seed=31))
+    spec = ContactResidual(
+        rff_dim=32,
+        rho_ref=2.5,
+        v_ref=0.2,
+        mu_min_mult=0.15,
+        pad_min_mult=0.2,
+        pad_max_mult=4.0,
+        gamma_max=1.2,
+        num_materials=2,
+        embeddings=rng.normal(0.0, 0.7, (2, 8)).astype(np.float32),
+        w_contact=rng.normal(0.0, 25.0, (32, 2)).astype(np.float32),
+        seed=31,
+    )
     # Zero alpha for s_an == 0 at reference anchor
-    emb_np = spec.contact.embeddings.copy()
+    emb_np = spec.embeddings.copy()
     emb_np[:, 7] = 0.0
-    spec.contact.embeddings = emb_np
+    spec.embeddings = emb_np
     sim = SolverDiSMech(m, exact=True, iterations=50, self_contact=False, residual=spec)
     res, src = sim.residual.contact, sim.contact.source
 
@@ -273,7 +273,7 @@ def test_reference_anchor_and_bounds(device, rng):
     st = m.state()
     flatten_state(st)
     # Set |v_t| = v_ref along +x, normal = +z, d = th -> dt_n = 0, rho = rho_ref
-    cspec = spec.contact
+    cspec = spec
     st.dismech.qd.assign(np.array([cspec.v_ref, 0.0, 0.0, 0.0], dtype=np.float32))
     mu0, th = 0.4, 0.02
     wp.launch(_emit_slot_kernel, 1, inputs=[
@@ -312,10 +312,15 @@ def test_shallow_depth_pad_zero_and_slope(device, rng):
     m = _rod_ground_model(device, segments=1, z=RADIUS, kh=5.0e5, surf_rod=0, surf_shape=1, u_shape=(1.0, 0.0, 0.0))
     wc = np.zeros((16, 2), dtype=np.float32)
     wc[:, 1] = rng.normal(0.0, 3.0, 16).astype(np.float32)
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                        contact=SurfaceMaterialSpec(rff_dim=16, num_materials=2, pad_min_mult=0.1, pad_max_mult=8.0,
-                                                    embeddings=rng.normal(0.0, 0.8, (2, 8)).astype(np.float32),
-                                                    w_contact=wc, seed=7))
+    spec = ContactResidual(
+        rff_dim=16,
+        num_materials=2,
+        pad_min_mult=0.1,
+        pad_max_mult=8.0,
+        embeddings=rng.normal(0.0, 0.8, (2, 8)).astype(np.float32),
+        w_contact=wc,
+        seed=7,
+    )
     sim = SolverDiSMech(m, exact=True, iterations=50, self_contact=False, residual=spec)
     res, src = sim.residual.contact, sim.contact.source
     slots = _slots(1, device)
@@ -344,7 +349,7 @@ def test_shallow_depth_pad_zero_and_slope(device, rng):
     # Deep penetration shows substantial modulation and consistent pad_c in [min, max]
     kh_deep = _eval_kh(0.5)
     assert abs(kh_deep - kh0) > 1.0e4
-    assert spec.contact.pad_min_mult * kh0 <= kh_deep <= spec.contact.pad_max_mult * kh0
+    assert spec.pad_min_mult * kh0 <= kh_deep <= spec.pad_max_mult * kh0
 
 
 # -- 3. SE(3) covariance on rod and shell ----------------------------------------------------------------------------
@@ -403,9 +408,9 @@ def test_se3_covariance(device, rng, monkeypatch, kind):
         su[0] = u_sh0  # shape_surface_u is in shape-local frame and co-rotates via _shape_pose
         m.dismech.shape_surface_id.assign(ss)
         m.dismech.shape_surface_u.assign(su)
-        spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                            contact=SurfaceMaterialSpec(rff_dim=24, v_ref=0.5, num_materials=2, embeddings=emb,
-                                                        w_contact=wc if use_res else None, seed=23))
+        spec = ContactResidual(
+            rff_dim=24, v_ref=0.5, num_materials=2, embeddings=emb, w_contact=wc if use_res else None, seed=23
+        )
         sim = SolverDiSMech(m, exact=True, iterations=80, self_contact=False, residual=spec)
         st = m.state()
         st.particle_qd.assign(np.tile((R @ v0).astype(np.float32), (m.particle_count, 1)))
@@ -444,9 +449,9 @@ def test_contact_residual_vjp_matches_fd(device, rng, monkeypatch, kh):
     emb0 = rng.normal(0.0, 0.55, (1, M, 8)).astype(np.float32)
     emb0[:, :, 7] = np.array([[0.7, -0.4, 0.6]], dtype=np.float32)
 
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                        contact=SurfaceMaterialSpec(rff_dim=R, rho_ref=1.0, v_ref=0.1, num_materials=M,
-                                                    embeddings=emb0.copy(), w_contact=wc0.copy(), seed=19))
+    spec = ContactResidual(
+        rff_dim=R, rho_ref=1.0, v_ref=0.1, num_materials=M, embeddings=emb0.copy(), w_contact=wc0.copy(), seed=19
+    )
     sim = SolverDiSMech(m, exact=True, iterations=1500, self_contact=False, residual=spec)
     dt = 5.0e-3
     v0 = np.tile([0.35, 0.15, -0.05 if kh > 0.0 else 0.0], (m.particle_count, 1)).astype(np.float32)
@@ -592,9 +597,7 @@ def test_multiworld_isolation(device, rng):
     emb_b[1] = 0.0
 
     def _run(wc, emb):
-        spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                            contact=SurfaceMaterialSpec(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc,
-                                                        seed=5))
+        spec = ContactResidual(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=5)
         sim = SolverDiSMech(m, exact=True, iterations=400, self_contact=False, residual=spec)
         s0, s1 = m.state(), m.state()
         s0.particle_qd.assign(np.tile([0.35, 0.15, 0.0], (m.particle_count, 1)).astype(np.float32))
@@ -642,8 +645,7 @@ def test_contact_residual_framegraph_capture(device, rng):
     emb = rng.normal(0.0, 0.5, (1, M, 8)).astype(np.float32)
     emb[:, :, 7] = np.array([[0.5, -0.3]], dtype=np.float32)
     wc = rng.normal(0.0, 0.4, (1, R, 2)).astype(np.float32)
-    spec = ResidualSpec(rod_rff_dim=0, shell_rff_dim=0,
-                        contact=SurfaceMaterialSpec(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=9))
+    spec = ContactResidual(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=9)
     s_base = SolverDiSMech(m, self_contact=False, residual=None)
     s_res = SolverDiSMech(m, self_contact=False, residual=spec)
 

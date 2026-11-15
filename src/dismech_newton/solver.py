@@ -19,7 +19,7 @@ from .contact import BarrierBlock, make_arm
 from .coupling import ProxyArm, ProxyPins, _turn
 from .element import ElementBlock
 from .linear import SymmetricCSR, sparse_solver
-from .residual import ConstitutiveResidual, ResidualSpec
+from .residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
 from .rod import Rods, advance_frames_kernel, advance_ref_twist_kernel, pose_proxies_kernel, proxy_joints
 from .shell import Shells
 from .state import (
@@ -125,7 +125,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
-        residual: ResidualSpec | None = None,
+        residual: Residual | RodResidual | ShellResidual | JointResidual | ContactResidual | Memory | None = None,
         tolerance: float | None = None,
         ulp: float | None = None,
     ):
@@ -181,7 +181,23 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                 rows[name] = of[t.dofs()[:, 0]] if t.count else []
         self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
-        self.residual = ConstitutiveResidual(model, residual, device=dev) if residual is not None else None
+        residual = Residual.coerce(residual, rod_count=self.triplets.count, shell_count=self.shells.count)
+        model_dahl = Dahl.from_model(model) if self.triplets.count else None
+        if model_dahl is not None:
+            if residual is not None and residual.rod_memory is not None:
+                raise ValueError("Cannot combine model Dahl hysteresis with another rod_memory residual")
+            if residual is None:
+                residual = Residual(rod_memory=model_dahl)
+            else:
+                residual = Residual(
+                    rod=residual.rod,
+                    shell=residual.shell,
+                    rod_memory=model_dahl,
+                    shell_memory=residual.shell_memory,
+                    joint=residual.joint,
+                    contact=residual.contact,
+                )
+        self.residual = residual.bind(model, self.triplets, self.shells, device=dev) if residual is not None else None
         self.joint_residual = self.residual.joint if self.residual is not None else None
         if self.residual is not None:
             if self.residual.has_rod:

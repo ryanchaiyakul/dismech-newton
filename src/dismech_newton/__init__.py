@@ -2,10 +2,17 @@
 contact, friction and an adjoint (:class:`SolverDiSMech`)."""
 
 from .builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
+from .residuals import ContactResidual, Dahl, JointResidual, Residual, RodResidual, ShellResidual
 from .solver import SolverDiSMech
 from .state import flatten_state, suspended_tape
 
 __all__ = [
+    "ContactResidual",
+    "Dahl",
+    "JointResidual",
+    "Residual",
+    "RodResidual",
+    "ShellResidual",
     "SolverDiSMech",
     "add_cloth_mesh",
     "add_rod",

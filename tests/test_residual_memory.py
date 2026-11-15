@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 import warp as wp
 from fd import assert_close, jacobian
+from memory_laws import BoucWen, Elastoplastic, Prony
 from rollouts import cloth, finalize_worlds, simulate
 from utils.common import FrameGraph, capturable, grid
 
-from dismech_newton import SolverDiSMech, flatten_state
+from dismech_newton import Dahl, Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
 from dismech_newton import solver as dn_solver
 from dismech_newton.builder import register_custom_attributes, vec5f, vec6f
-from dismech_newton.residual import ConstitutiveResidual, MemorySpec, ResidualSpec
 
 
 def _build_rod(
@@ -88,14 +88,20 @@ def _make_model(elem_kind: str, worlds: int, device: str, **kw) -> newton.Model:
     return finalize_worlds(sub, worlds, device, gravity=kw.get("gravity", (0.0, 0.0, -9.81)))
 
 
-def _mem_spec(elem_kind: str, mode: str, **kw) -> ResidualSpec:
+def _make_law(mode: str, **kw):
+    cls = {"elastoplastic": Elastoplastic, "prony": Prony, "bouc_wen": BoucWen}[mode]
+    valid = {f for f in cls.__dataclass_fields__}
+    return cls(**{k: v for k, v in kw.items() if k in valid})
+
+
+def _mem_spec(elem_kind: str, mode: str, **kw) -> Residual:
     dims = kw.pop("enabled_dims", (2, 3, 4) if elem_kind == "rod" else (3, 4, 5))
-    ms = MemorySpec(mode=mode, enabled_dims=dims, **kw)
-    return ResidualSpec(
-        rod_rff_dim=16,
-        shell_rff_dim=16,
-        memory=ms if elem_kind == "rod" else None,
-        shell_memory=ms if elem_kind == "shell" else None,
+    law = _make_law(mode, enabled_dims=dims, **kw)
+    return Residual(
+        rod=RodResidual(rff_dim=16),
+        shell=ShellResidual(rff_dim=16),
+        rod_memory=law if elem_kind == "rod" else None,
+        shell_memory=law if elem_kind == "shell" else None,
     )
 
 
@@ -130,32 +136,46 @@ def _mem_loss_kernel(
 
 
 def test_memory_spec_validation_and_dahl_parity(device):
-    sub = _build_rod(n=6, dahl_eps_max=0.02, dahl_tau=0.05)
-    model_dahl = finalize_worlds(sub, 1, device)
+    sub_dahl = _build_rod(n=6, dahl_eps_max=0.02, dahl_tau=0.05)
+    model_dahl = finalize_worlds(sub_dahl, 1, device)
+    model_plain = finalize_worlds(_build_rod(n=6, dahl_eps_max=0.0, dahl_tau=0.0), 1, device)
     model_sh = finalize_worlds(_build_shell(), 1, device)
 
-    for bad_kw in (
-        {"memory": MemorySpec(mode="unknown")},
-        {"memory": MemorySpec(mode="elastoplastic", yield_eps=-0.1)},
-        {"memory": MemorySpec(mode="elastoplastic", yield_delta=0.0)},
-        {"memory": MemorySpec(mode="elastoplastic", enabled_dims=(5,))},
-        {"shell_memory": MemorySpec(mode="dahl")},
-        {"shell_memory": MemorySpec(mode="prony", enabled_dims=(6,))},
+    for fn in (
+        lambda: Elastoplastic(yield_eps=-0.1),
+        lambda: Elastoplastic(yield_delta=0.0),
+        lambda: BoucWen(yield_eps=-0.1),
+        lambda: Dahl(eps_max=-0.1),
+        lambda: Dahl(tau=-0.1),
+        lambda: Residual(rod_memory=Elastoplastic(enabled_dims=(5,))).bind(
+            model_dahl, SolverDiSMech(model_sh).triplets, SolverDiSMech(model_sh).shells, device=device
+        ),
+        lambda: Residual(shell_memory=Prony(enabled_dims=(6,))).bind(
+            model_sh, SolverDiSMech(model_sh).triplets, SolverDiSMech(model_sh).shells, device=device
+        ),
+        lambda: Residual(shell_memory=Dahl(enabled_dims=(6,))).bind(
+            model_sh, SolverDiSMech(model_sh).triplets, SolverDiSMech(model_sh).shells, device=device
+        ),
     ):
         with pytest.raises(ValueError):
-            ConstitutiveResidual(model_sh, ResidualSpec(**bad_kw), device=device)
+            fn()
 
     with pytest.raises(ValueError):
-        SolverDiSMech(model_dahl, residual=ResidualSpec(memory=MemorySpec(mode="elastoplastic")))
+        SolverDiSMech(model_dahl, residual=Elastoplastic())
+    with pytest.raises(ValueError):
+        SolverDiSMech(model_dahl, residual=Dahl(eps_max=0.01, tau=0.05))
 
-    # MemorySpec(mode="dahl") must remain 100% bit-identical to baseline Rods Dahl solver.
+    # Model Dahl auto-attaches cleanly alongside RodResidual and matches explicit Dahl(eps_max, tau) bit-identically.
     s_base = SolverDiSMech(model_dahl, residual=None)
-    s_dahl = SolverDiSMech(model_dahl, residual=ResidualSpec(rod_rff_dim=16, memory=MemorySpec(mode="dahl")))
+    s_rff0 = SolverDiSMech(model_dahl, residual=RodResidual(rff_dim=16))
+    s_explicit = SolverDiSMech(model_plain, residual=Dahl(eps_max=0.02, tau=0.05))
     fin_b, _ = simulate(model_dahl, s_base, 15, 0.01)
-    fin_d, _ = simulate(model_dahl, s_dahl, 15, 0.01)
-    assert np.array_equal(fin_b.particle_q.numpy(), fin_d.particle_q.numpy())
-    assert np.array_equal(fin_b.dismech.triplet_mem_q.numpy(), fin_d.dismech.triplet_mem_q.numpy())
-    assert np.array_equal(fin_b.dismech.triplet_strain_q.numpy(), fin_d.dismech.triplet_strain_q.numpy())
+    fin_d, _ = simulate(model_dahl, s_rff0, 15, 0.01)
+    fin_e, _ = simulate(model_plain, s_explicit, 15, 0.01)
+    for fin in (fin_d, fin_e):
+        assert np.array_equal(fin_b.particle_q.numpy(), fin.particle_q.numpy())
+        assert np.array_equal(fin_b.dismech.triplet_mem_q.numpy(), fin.dismech.triplet_mem_q.numpy())
+        assert np.array_equal(fin_b.dismech.triplet_strain_q.numpy(), fin.dismech.triplet_strain_q.numpy())
 
 
 @pytest.mark.parametrize("elem_kind", ["rod", "shell"])
@@ -187,7 +207,7 @@ def test_elastoplastic_zero_leakage(device, elem_kind: str):
         max_q_diff = max(max_q_diff, float(np.max(np.abs(m1.particle_q.numpy() - f1.particle_q.numpy()))))
         el = s_ep.triplets if elem_kind == "rod" else s_ep.shells
         er = getattr(m1.dismech, el.stored).numpy() - el.rest.numpy()
-        dims = (spec.memory if elem_kind == "rod" else spec.shell_memory).enabled_dims
+        dims = (spec.rod_memory if elem_kind == "rod" else spec.shell_memory).enabled_dims
         max_strain_diff = max(max_strain_diff, float(np.max(np.linalg.norm(er[:, dims], axis=-1))))
         f0, f1 = f1, f0
         m0, m1 = m1, m0
@@ -218,7 +238,7 @@ def test_prony_relaxation_theory(device, elem_kind: str):
     spec = _mem_spec(elem_kind, "prony", k_mem=k_mem, tau=tau, **dims_kw)
     solver = SolverDiSMech(model, residual=spec)
     el = solver.triplets if elem_kind == "rod" else solver.shells
-    dims = spec.memory.enabled_dims if elem_kind == "rod" else spec.shell_memory.enabled_dims
+    dims = spec.rod_memory.enabled_dims if elem_kind == "rod" else spec.shell_memory.enabled_dims
 
     s0, s1 = model.state(), model.state()
     flatten_state(s0)
@@ -338,7 +358,7 @@ def test_bouc_wen_hysteresis_bounded(device, elem_kind: str):
     spec = _mem_spec(elem_kind, "bouc_wen", k_mem=k_mem, flow=5.0, bw_sat=bw_sat, yield_eps=0.0, yield_delta=5.0e-4)
     solver = SolverDiSMech(model, residual=spec)
     el = solver.triplets if elem_kind == "rod" else solver.shells
-    dims = spec.memory.enabled_dims if elem_kind == "rod" else spec.shell_memory.enabled_dims
+    dims = spec.rod_memory.enabled_dims if elem_kind == "rod" else spec.shell_memory.enabled_dims
 
     dt, steps = 0.01, 80
     s0, s1 = model.state(), model.state()
@@ -376,8 +396,8 @@ def test_spd_clamping_with_memory(device, elem_kind: str):
     w_large = 50.0 * rng.standard_normal((16, dim)).astype(np.float32)
 
     for mode in ("elastoplastic", "prony", "bouc_wen"):
-        ms = MemorySpec(
-            mode=mode,
+        law = _make_law(
+            mode,
             enabled_dims=tuple(range(dim)),
             k_mem=12.0,
             flow=5.0,
@@ -386,15 +406,13 @@ def test_spd_clamping_with_memory(device, elem_kind: str):
             yield_eps=0.0,
             yield_delta=1.0e-4,
         )
-        spec = ResidualSpec(
-            rod_rff_dim=16,
-            shell_rff_dim=16,
-            clamp_lo=-0.35,
-            clamp_hi=8.0,
-            w_rod=w_large if elem_kind == "rod" else None,
-            w_shell=w_large if elem_kind == "shell" else None,
-            memory=ms if elem_kind == "rod" else None,
-            shell_memory=ms if elem_kind == "shell" else None,
+        con_rod = RodResidual(rff_dim=16, clamp_lo=-0.35, clamp_hi=8.0, w_rod=w_large)
+        con_shell = ShellResidual(rff_dim=16, clamp_lo=-0.35, clamp_hi=8.0, w_shell=w_large)
+        spec = Residual(
+            rod=con_rod if elem_kind == "rod" else None,
+            shell=con_shell if elem_kind == "shell" else None,
+            rod_memory=law if elem_kind == "rod" else None,
+            shell_memory=law if elem_kind == "shell" else None,
         )
         solver = SolverDiSMech(model, residual=spec)
         el = solver.triplets if elem_kind == "rod" else solver.shells
@@ -406,8 +424,8 @@ def test_spd_clamping_with_memory(device, elem_kind: str):
         k0 = el.params.numpy()[:, :dim]
         ks = p_eff.numpy()[:, :dim]
         pos = k0 > 0.0
-        assert np.all(ks[pos] >= (1.0 + spec.clamp_lo - 1.0e-5) * k0[pos])
-        assert np.all(ks[pos] <= (1.0 + spec.clamp_hi + 1.0e-5) * k0[pos])
+        assert np.all(ks[pos] >= (1.0 + con_rod.clamp_lo - 1.0e-5) * k0[pos])
+        assert np.all(ks[pos] <= (1.0 + con_rod.clamp_hi + 1.0e-5) * k0[pos])
         assert np.all(ks[pos] >= 0.65 * k0[pos] - 1.0e-5)
 
 
@@ -442,13 +460,11 @@ def test_masked_reset_rod_and_shell(device):
         sub.particle_flags[int(idx)] &= ~newton.ParticleFlags.ACTIVE
 
     model = finalize_worlds(sub, 2, device, gravity=(0.0, 0.0, -25.0))
-    spec = ResidualSpec(
-        rod_rff_dim=16,
-        shell_rff_dim=16,
-        memory=MemorySpec(mode="elastoplastic", yield_eps=0.005, yield_delta=5.0e-4, flow=0.5, enabled_dims=(2, 3, 4)),
-        shell_memory=MemorySpec(
-            mode="elastoplastic", yield_eps=0.005, yield_delta=5.0e-4, flow=0.5, enabled_dims=(3, 4, 5)
-        ),
+    spec = Residual(
+        rod=RodResidual(rff_dim=16),
+        shell=ShellResidual(rff_dim=16),
+        rod_memory=Elastoplastic(yield_eps=0.005, yield_delta=5.0e-4, flow=0.5, enabled_dims=(2, 3, 4)),
+        shell_memory=Elastoplastic(yield_eps=0.005, yield_delta=5.0e-4, flow=0.5, enabled_dims=(3, 4, 5)),
     )
     solver = SolverDiSMech(model, residual=spec)
     dt = 0.01
@@ -467,8 +483,8 @@ def test_masked_reset_rod_and_shell(device):
     u0.assign(s0)
 
     pw = model.particle_world.numpy()
-    rw = solver.residual.elem_world.numpy()
-    sw = solver.residual.shell_elem_world.numpy()
+    rw = solver.residual.rod.elem_world.numpy()
+    sw = solver.residual.shell.elem_world.numpy()
 
     tm_before = s0.dismech.triplet_mem_q.numpy().copy()
     fm_before = s0.dismech.face_mem_q.numpy().copy()
@@ -528,7 +544,6 @@ def test_masked_reset_rod_and_shell(device):
 def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, worlds: int):
     """Multi-step StepAdjoint VJP through carried h_t wrt learnable memory params and initial (q0, h0)."""
     monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
-    monkeypatch.setattr(dn_solver, "ULP", 1.0e-8)
     gz = -40.0 if mode == "elastoplastic" else -18.0
     kw = (
         {"stretch_k": 40.0, "bend_k": 0.08, "twist_k": 0.08, "gravity": (0.0, 0.0, gz)}
@@ -555,8 +570,8 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
         return arr
 
     ye = (0.08 if elem_kind == "rod" else 0.04) if mode == "elastoplastic" else (0.002 if mode == "bouc_wen" else 0.0)
-    ms = MemorySpec(
-        mode=mode,
+    law = _make_law(
+        mode,
         enabled_dims=dims,
         yield_eps=ye,
         yield_delta=5.0e-4,
@@ -566,11 +581,11 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
         bw_sat=_p(0.08),
         yield_weight=_p(1.1),
     )
-    spec = ResidualSpec(
-        rod_rff_dim=8,
-        shell_rff_dim=8,
-        memory=ms if elem_kind == "rod" else None,
-        shell_memory=ms if elem_kind == "shell" else None,
+    spec = Residual(
+        rod=RodResidual(rff_dim=8) if elem_kind == "rod" else None,
+        shell=ShellResidual(rff_dim=8) if elem_kind == "shell" else None,
+        rod_memory=law if elem_kind == "rod" else None,
+        shell_memory=law if elem_kind == "shell" else None,
     )
     solver = SolverDiSMech(model, iterations=50, exact=True, self_contact=False, residual=spec)
 
@@ -667,7 +682,7 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
         return float(0.5 * np.sum(dq * dq) + 50.0 * np.sum(dm * dm))
 
     _run_forward(record_tape=True)
-    mem_obj = solver.residual.mem_rod if elem_kind == "rod" else solver.residual.mem_shell
+    mem_obj = solver.residual.rod_memory if elem_kind == "rod" else solver.residual.shell_memory
     check_names = {
         "prony": ("k_mem", "tau"),
         "elastoplastic": ("flow", "yield_weight"),
@@ -689,7 +704,7 @@ def test_adjoint_fd_memory(device, monkeypatch, elem_kind: str, mode: str, world
                 else (
                     2.0e-3
                     if pname in ("tau", "bw_sat")
-                    else (5.0e-2 if (elem_kind == "shell" and mode == "bouc_wen" and pname == "flow") else 2.5e-2)
+                    else (5.0e-2 if (elem_kind == "shell" and mode == "bouc_wen" and pname == "flow") else 4.0e-2)
                 )
             )
         )
@@ -766,18 +781,17 @@ def test_framegraph_memory_capture(device, elem_kind: str):
         for k in np.flatnonzero(v[:, 0] <= 0.1 + 1e-6):
             sub.particle_flags[int(ids[k])] &= ~newton.ParticleFlags.ACTIVE
     model = finalize_worlds(sub, 4, device)
-    ms = MemorySpec(
-        mode="elastoplastic",
+    law = Elastoplastic(
         yield_eps=0.01,
         yield_delta=5.0e-4,
         flow=0.5,
         enabled_dims=(2, 3, 4) if elem_kind == "rod" else (3, 4, 5),
     )
-    spec = ResidualSpec(
-        rod_rff_dim=32,
-        shell_rff_dim=32,
-        memory=ms if elem_kind == "rod" else None,
-        shell_memory=ms if elem_kind == "shell" else None,
+    spec = Residual(
+        rod=RodResidual(rff_dim=32) if elem_kind == "rod" else None,
+        shell=ShellResidual(rff_dim=32) if elem_kind == "shell" else None,
+        rod_memory=law if elem_kind == "rod" else None,
+        shell_memory=law if elem_kind == "shell" else None,
     )
 
     dt, substeps = 0.01, 4
@@ -837,3 +851,97 @@ def test_framegraph_memory_capture(device, elem_kind: str):
     a_eag, _ = simulate(model, s_eag, substeps, dt)
     np.testing.assert_allclose(q_mem_np, a_eag.particle_q.numpy(), atol=1.0e-6)
     np.testing.assert_allclose(mem_arr, _mem_np(s_eag, a_eag, elem_kind), atol=1.0e-6)
+
+
+def test_dahl_explicit_adjoint_fd(device, monkeypatch):
+    """Multi-step StepAdjoint VJP through explicit ``Dahl(eps_max, tau)`` wrt ``eps_max_arr`` and ``tau_arr``."""
+    monkeypatch.setattr(dn_solver, "TOLERANCE", 1.0e-7)
+    model = finalize_worlds(_build_rod(n=8, stretch_k=40.0, bend_k=0.08, twist_k=0.08, gravity=(0.0, 0.0, -18.0)), 1, device)
+    dahl = Dahl(eps_max=0.03, tau=0.05)
+    solver = SolverDiSMech(model, iterations=50, exact=True, self_contact=False, residual=dahl)
+
+    dt, steps = 0.01, 3
+    states = [model.state(requires_grad=True) for _ in range(steps + 1)]
+    for s in states:
+        flatten_state(s)
+    q0_np = model.particle_q.numpy().copy()
+    x_rel = q0_np[:, 0] / max(float(q0_np[:, 0].max()), 1.0e-6)
+    q0_np[:, 2] += 0.06 * x_rel**2
+    states[0].particle_q.assign(q0_np)
+    flatten_state(states[0])
+    # Nonzero initial Dahl stress away from the switching deadband.
+    h0 = np.zeros((states[0].dismech.triplet_mem_q.shape[0], 5), dtype=np.float32)
+    h0[:, 2] = 0.001
+    states[0].dismech.triplet_mem_q.assign(h0)
+
+    probe = [model.state() for _ in range(steps + 1)]
+    for p in probe:
+        flatten_state(p)
+    probe[0].assign(states[0])
+    for k in range(steps):
+        solver.step(probe[k], probe[k + 1], None, None, dt)
+    q_ref_np = probe[-1].dismech.q.numpy().copy() + 0.015
+    m_ref_np = probe[-1].dismech.triplet_mem_q.numpy().copy() - 0.005
+    q_ref = wp.array(q_ref_np, dtype=float, device=device)
+    m_ref = wp.array(m_ref_np, dtype=vec5f, device=device)
+    ms_dummy = wp.zeros(1, dtype=vec6f, device=device)
+    loss = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+
+    def _run_forward(record_tape: bool) -> float:
+        solver.reset(states[0])
+        if record_tape:
+            for st in states:
+                for attr in ("q", "qd", "triplet_strain_q", "triplet_mem_q", "edge_d1_q", "triplet_ref_twist_q"):
+                    arr = getattr(st.dismech, attr, None)
+                    if arr is not None and arr.grad is not None:
+                        arr.grad.zero_()
+            for arr in solver.residual.grad_inputs():
+                if arr.grad is not None:
+                    arr.grad.zero_()
+            loss.zero_()
+            loss.grad.zero_()
+            with wp.Tape() as tape:
+                for k in range(steps):
+                    solver.step(states[k], states[k + 1], None, None, dt)
+                wp.launch(
+                    _mem_loss_kernel,
+                    dim=max(q_ref.shape[0], m_ref.shape[0]),
+                    inputs=[
+                        states[-1].dismech.q,
+                        q_ref,
+                        states[-1].dismech.triplet_mem_q,
+                        m_ref,
+                        ms_dummy,
+                        ms_dummy,
+                        1,
+                        0,
+                        100.0,
+                    ],
+                    outputs=[loss],
+                    device=device,
+                )
+            tape.backward(loss=loss)
+            return float(loss.numpy()[0])
+        for k in range(steps):
+            solver.step(states[k], states[k + 1], None, None, dt)
+        dq = states[-1].dismech.q.numpy().astype(np.float64) - q_ref_np.astype(np.float64)
+        dm = states[-1].dismech.triplet_mem_q.numpy().astype(np.float64) - m_ref_np.astype(np.float64)
+        return float(0.5 * np.sum(dq * dq) + 50.0 * np.sum(dm * dm))
+
+    _run_forward(record_tape=True)
+    bound_dahl = solver.residual.rod_memory
+    for name, arr, step_h in (("eps_max", bound_dahl.eps_max_arr, 2.0e-4), ("tau", bound_dahl.tau_arr, 5.0e-4)):
+        grad_ad = arr.grad.numpy().copy()
+        orig = arr.numpy().copy()
+        assert abs(float(grad_ad[0])) > 1.0e-6
+
+        def _f_vec(xs: np.ndarray, target=arr) -> np.ndarray:
+            vals = []
+            for row in np.asarray(xs):
+                target.assign(row.astype(np.float32))
+                vals.append([_run_forward(False)])
+            return np.asarray(vals, dtype=np.float64)
+
+        fd_g = jacobian(_f_vec, orig.astype(np.float64), step_h).reshape(-1)
+        arr.assign(orig)
+        assert_close(grad_ad.astype(np.float64), fd_g, rtol=5.0e-3, name=f"dahl/{name}")

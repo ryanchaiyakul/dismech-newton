@@ -17,6 +17,11 @@ _lagged_step_coupled = SolverCoupledProxy._step_coupled
 
 def _rsr_step_coupled(self: SolverCoupledProxy, state_in: State, state_out: State, control, contacts, dt: float) -> None:
     """Follow the 1-pass proxy solve with a rigid corrector step on the harvested ``F^n`` (``R-S-R``)."""
+    for entry in self._entries.values():
+        jres = getattr(entry.solver, "joint_residual", None)
+        if jres is not None:
+            control = jres.apply(state_in, control)
+            break
     _lagged_step_coupled(self, state_in, state_out, control, contacts, dt)
     if int(self._coupling.iterations) != 1:
         return

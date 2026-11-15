@@ -188,6 +188,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
         self.residual = ConstitutiveResidual(model, residual, device=dev) if residual is not None else None
+        self.joint_residual = self.residual.joint if self.residual is not None else None
         if self.residual is not None:
             if self.residual.has_rod:
                 self.triplets.bind_residual(self.residual)

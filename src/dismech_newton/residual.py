@@ -7,10 +7,10 @@ from typing import Literal
 
 import numpy as np
 import warp as wp
-from newton import Model
+from newton import Control, JointType, Model
 
 from .builder import _P, vec5f, vec6f, vec10f, vec12f
-from .rod import Rod, _dkappa, _dphi, _geometry, _oriented, rod_dofs, vec11f
+from .rod import Rod, _dkappa, _dphi, _geometry, _oriented, rod_dofs, vec11f, vec11i
 from .shell import Shell, _angles, _forms, _points, _row, _whiten, shell_dofs, vec21f, vec21i
 
 _ADJ_OPTS = {"enable_backward": True, "max_unroll": 32, "optimization_level": 2}
@@ -29,7 +29,23 @@ class MemorySpec:
     tau: float | np.ndarray | wp.array = 0.1
     bw_sat: float | np.ndarray | wp.array = 0.1
     yield_weight: float | np.ndarray | wp.array = 1.0
-
+@dataclass
+class JointResidualSpec:
+    """Configuration for robot-owned joint Stribeck + RFF residuals."""
+    rff_dim: int = 32
+    rff_bandwidth: float = 1.5
+    q_scale: float = 1.0
+    qd_scale: float = 1.0
+    u_scale: float = 10.0
+    stribeck_v: float = 0.05
+    eps_vel: float = 1.0e-3
+    ortho_viscous: bool = True
+    tau_cap: float = 50.0
+    coulomb: float | np.ndarray | wp.array = 0.0
+    stribeck: float | np.ndarray | wp.array = 0.0
+    w_joint: np.ndarray | wp.array | None = None
+    enabled_dofs: tuple[int, ...] | None = None
+    seed: int = 17
 @dataclass
 class ResidualSpec:
     """Configuration and optional initial weights for pure-Warp constitutive residuals."""
@@ -48,27 +64,30 @@ class ResidualSpec:
     shell_spatial_rest_delta: np.ndarray | wp.array | None = None
     memory: MemorySpec | None = None
     shell_memory: MemorySpec | None = None
+    joint: JointResidualSpec | None = None
 
 def _as_vec_grad(val, dt, nv: int, n0: int, n1: int | None, dev, name: str) -> wp.array:
     """Validate/convert scalar, NumPy, or Warp array to a differentiable vector ``wp.array`` on ``dev``."""
-    mem, r0, rg = (n0 < 0), max(n0, 0), (n1 is not None)
+    mem, r0, rg, fl = (n0 < 0), max(n0, 0), (n1 is not None), (dt is float)
     if val is None:
-        return wp.zeros((1, r0) if (not mem and rg) else 1, dtype=dt, device=dev, requires_grad=rg)
-    w = isinstance(val, wp.array)
-    a = val if w else np.asarray(val, np.float32)
+        return wp.zeros((1, r0, nv) if fl and not mem else ((1, nv) if fl else ((1, r0) if not mem and rg else 1)),
+                        dtype=dt, device=dev, requires_grad=rg)
+    w, a = isinstance(val, wp.array), (val if isinstance(val, wp.array) else np.asarray(val, np.float32))
     if not w and mem:
         a = np.full((1, nv), a.item(), "f4") if a.size == 1 else (a[None] if a.shape == (nv,) else a)
-    elif not mem and rg and a.shape in ((r0,), (r0, nv)):
+    elif not mem and rg and (a.shape == (r0, nv) if fl else a.shape in ((r0,), (r0, nv))):
         a = a.reshape((1,) + a.shape) if w else a[None]
-    a = ((a.reshape(-1) if mem and a.ndim == 2 else a).view(dt) if a.dtype == wp.float32 and a.shape[-1] == nv
-         else (a if a.dtype == dt else None)) if w else a
+    if w:
+        a = (a.reshape((1, nv)) if fl and mem and a.shape == (nv,) else a) if fl else (
+            (a.reshape(-1) if mem and a.ndim == 2 else a).view(dt) if a.dtype == wp.float32 and a.shape[-1] == nv
+            else (a if a.dtype == dt else None))
     sh = ((1,), (n1,)) if mem else (((r0,),) if not rg else ((1, r0), (n1, r0)))
-    if a is None or a.shape not in (sh if w else tuple(s + (nv,) for s in sh)):
+    ok = sh if (w and not fl) else tuple(s + (nv,) for s in sh)
+    if a is None or (fl and w and a.dtype != wp.float32) or a.shape not in ok:
         raise ValueError(f"{name} shape/dtype mismatch: shape={getattr(val, 'shape', np.shape(val))}")
     out = a if (w and a.device == dev) else wp.array(a.numpy() if w else a, dtype=dt, device=dev)
     out.requires_grad = True
     return out
-
 @wp.func
 def _iso_qh2(u2: float) -> wp.vec2:
     """Singularity-free radial RFF quotient ``q(u^2) = sin(u)/u - exp(-u^2/2)`` and ``2 q'(u^2)``."""
@@ -77,20 +96,17 @@ def _iso_qh2(u2: float) -> wp.vec2:
     u, e = wp.sqrt(u2), wp.exp(-0.5 * u2)
     q = wp.sin(u) / u - e
     return wp.vec2(q, (wp.cos(u) - (1.0 - u2) * e - q) / u2)
-
 @wp.func
 def _psi_dpsi(u: float, cn: float) -> wp.vec2:
     """Origin-orthogonal odd RFF basis ``psi(u)`` and derivative ``psi'(u)``."""
     eu = wp.exp(-0.5 * u * u)
     return wp.vec2(cn * (wp.sin(u) - u * eu), cn * (wp.cos(u) - (1.0 - u * u) * eu))
-
 @wp.func_native(snippet=(
     "#if defined(__CUDA_ARCH__)\nunsigned m = 0xffu << (threadIdx.x & 24);\nx += __shfl_down_sync(m, x, 4, 8); "
     "x += __shfl_down_sync(m, x, 2, 8); x += __shfl_down_sync(m, x, 1, 8);\n#endif\nreturn x;\n"),
     adj_snippet=("#if defined(__CUDA_ARCH__)\nadj_x += __shfl_sync(0xffu << (threadIdx.x & 24), adj_ret, 0, 8);\n"
                  "#else\nadj_x += adj_ret;\n#endif\n"))
 def _ts(x: float) -> float: ...
-
 @wp.func_native(snippet=(
     "#if defined(__CUDA_ARCH__)\nreturn __shfl_sync(0xffu << (threadIdx.x & 24), x, 0, 8);\n"
     "#else\nreturn x;\n#endif\n"),
@@ -99,7 +115,6 @@ def _ts(x: float) -> float: ...
                  "s += __shfl_down_sync(m, s, 1, 8);\nif ((threadIdx.x & 7) == 0) adj_x += s;\n"
                  "#else\nadj_x += adj_ret;\n#endif\n"))
 def _bcast8(x: float) -> float: ...
-
 @wp.func
 def _clamp_ch(k0: float, c0: float, sig: float, dkr: float, dcr: float, r0: float, er: float, ed: float,
               mem_i: float, d_c: float, clo: float, chi: float, dt: float) -> wp.vec3:
@@ -109,7 +124,6 @@ def _clamp_ch(k0: float, c0: float, sig: float, dkr: float, dcr: float, r0: floa
     dc = wp.where(c0 > 0.0, wp.clamp(dcr, clo * c0, chi * c0),
                   wp.where(k0 > 0.0, wp.clamp(dcr, 0.0, chi * k0 * dt), 0.0))
     return wp.vec3(ks, c0 + dc + d_c, wp.where(ks > 0.0, r0 - mem_i / den - (sig - dk * er - dc * ed) / den, r0))
-
 @cache
 def _mem_ops(N: int, md: int):
     """Mode-specialized ``module='unique'`` memory step helper and carry kernel for 5D rods and 6D shells."""
@@ -130,9 +144,7 @@ def _mem_ops(N: int, md: int):
     def mem_step(pb: pt, rb_i: vt, dr_i: vt, hdr: int, za: vt, ep: vt, h: vt, sp: vt, dk: vt, dc: vt, ls: vt, sa: vt,
                  sb: vt, dm0: vt, dc0: vt, w: int, km: wp.array[vt], fl: wp.array[vt], ta: wp.array[vt],
                  bs: wp.array[vt], yw: wp.array[vt], mk: vt, ye: float, yd: float, clo: float, chi: float, dt: float):
-        po, ro = pt(), vt()
-        r0 = rb_i + dr_i if hdr != 0 else rb_i
-        er, ef = wp.cw_mul(za, sa), vt(0.0)
+        po, ro, r0, er, ef = pt(), vt(), (rb_i + dr_i if hdr != 0 else rb_i), wp.cw_mul(za, sa), vt(0.0)
         if not wp.isnan(ep[0]):
             ef = (er + r0 - ep) / dt
         if wp.static(md == 1):
@@ -165,8 +177,7 @@ def _mem_ops(N: int, md: int):
     def mem_carry(prev: wp.array[vt], strain: wp.array[vt], rb: wp.array[vt], dr: wp.array[vt], hdr: int,
                   mem: wp.array[vt], ew: wp.array[wp.int32], fl: wp.array[vt], ta: wp.array[vt], bs: wp.array[vt],
                   yw: wp.array[vt], mk: vt, ye: float, yd: float, dt: float, mem_out: wp.array[vt]):
-        t = wp.tid()
-        h, out = mem[t], vt(0.0)
+        t, h, out = wp.tid(), mem[wp.tid()], vt(0.0)
         if dt > 0.0:
             ep, w, r0 = strain[t], ew[t], (rb[t] + dr[t] if hdr != 0 else rb[t])
             if wp.static(md == 1):
@@ -193,7 +204,6 @@ def _mem_ops(N: int, md: int):
                 out[j] = v
         mem_out[t] = out if dt > 0.0 else h
     return mem_step, mem_carry
-
 @wp.func
 def _rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
     """Triplet strain and directional strain rate ``J * xd`` without forming the full ``5x11`` matrix."""
@@ -206,7 +216,6 @@ def _rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
     return g.strain, vec5f(wp.dot(g.te, ze) / g.l0e, wp.dot(g.tf, zf) / g.l0f,
         wp.dot(De1, ze) + wp.dot(Df1, zf) + a1 * pe + b1 * pf, wp.dot(De2, ze) + wp.dot(Df2, zf) + a2 * pe + b2 * pf,
         0.5 * wp.dot(g.kb / g.ne, ze) + 0.5 * wp.dot(g.kb / g.nf, zf) - pe + pf)
-
 @wp.func
 def _rff_loop(z_a: vec5f, z_b: vec5f, fr: wp.array[vec10f], wr: wp.array2d[vec5f],
               w_idx: int, R_: int, lane: int, stride: int, cn: float, iso: int):
@@ -232,7 +241,6 @@ def _rff_loop(z_a: vec5f, z_b: vec5f, fr: wp.array[vec10f], wr: wp.array2d[vec5f
     return (vec5f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4])),
             vec5f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4])),
             vec5f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4])))
-
 @wp.func
 def _shell_rff_loop(z_a: vec6f, z_b: vec6f, fr: wp.array[vec12f], wr: wp.array2d[vec6f],
                     w_idx: int, R_: int, lane: int, stride: int, cn: float):
@@ -246,7 +254,6 @@ def _shell_rff_loop(z_a: vec6f, z_b: vec6f, fr: wp.array[vec12f], wr: wp.array2d
     return (vec6f(_ts(sp[0]), _ts(sp[1]), _ts(sp[2]), _ts(sp[3]), _ts(sp[4]), _ts(sp[5])),
             vec6f(_ts(dk[0]), _ts(dk[1]), _ts(dk[2]), _ts(dk[3]), _ts(dk[4]), _ts(dk[5])),
             vec6f(_ts(dc[0]), _ts(dc[1]), _ts(dc[2]), _ts(dc[3]), _ts(dc[4]), _ts(dc[5])))
-
 @cache
 def _rod_step_fn(md: int):
     """Fused 5D DER rod strain/rate, RFF reduction, SPD clamping, Dahl, and memory kernel."""
@@ -258,15 +265,10 @@ def _rod_step_fn(md: int):
              km: wp.array[vec5f], fl: wp.array[vec5f], ta: wp.array[vec5f], bs: wp.array[vec5f], yw: wp.array[vec5f],
              mk: vec5f, ye: float, yd: float, sc: vec10f, iso: int, st: int, clo: float, chi: float, dt: float,
              pout: wp.array[vec10f], rout: wp.array[vec5f]):
-        t, lane, za, zb = wp.tid() // st, wp.tid() % st, vec5f(0.0), vec5f(0.0)
-        le, lf, dl = float(0.0), float(0.0), float(0.0)
+        t, lane, za, zb, le, lf, dl = wp.tid() // st, wp.tid() % st, vec5f(0.0), vec5f(0.0), 0.0, 0.0, 0.0
         if lane == 0:
             c, d = v.conn[t], rod_dofs(v, t)
-            x = vec11f(q[d[0]], q[d[1]], q[d[2]], q[d[3]], q[d[4]], q[d[5]],
-                       q[d[6]], q[d[7]], q[d[8]], q[d[9]], q[d[10]])
-            xd = vec11f(u[d[0]], u[d[1]], u[d[2]], u[d[3]], u[d[4]], u[d[5]],
-                        u[d[6]], u[d[7]], u[d[8]], u[d[9]], u[d[10]])
-            eps, ed = _rod_strain_rate(x, xd, v, t)
+            eps, ed = _rod_strain_rate(_v11(q, d), _v11(u, d), v, t)
             er = eps - (rb[t] + dr[t] if has_dr != 0 else rb[t])
             le, lf = float(v.edge_length[c[0]]), float(v.edge_length[c[1]])
             dl = 0.5 * (le + lf)
@@ -276,30 +278,27 @@ def _rod_step_fn(md: int):
         if st > 1:
             z_a = vec5f(_bcast8(za[0]), _bcast8(za[1]), _bcast8(za[2]), _bcast8(za[3]), _bcast8(za[4]))
             z_b = vec5f(_bcast8(zb[0]), _bcast8(zb[1]), _bcast8(zb[2]), _bcast8(zb[3]), _bcast8(zb[4]))
-        R_, wi = fr.shape[0], (ew[t] if wr.shape[0] > 1 else 0)
-        sp, dk, dc = vec5f(0.0), vec5f(0.0), vec5f(0.0)
+        R_, wi, sp, dk, dc = fr.shape[0], (ew[t] if wr.shape[0] > 1 else 0), vec5f(0.0), vec5f(0.0), vec5f(0.0)
         if R_ > 0:
             sp, dk, dc = _rff_loop(z_a, z_b, fr, wr, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)), iso)
         if lane == 0:
             sv, dv, p0, mv = share[t], dahl[t], pb[t], mem[t]
-            ls = vec5f(sv[0] * le, sv[1] * lf, 1.0, 1.0, 1.0)
-            on = wp.where(dv[0] > 0.0 and dv[1] > 0.0, 1.0, 0.0)
-            rt = on * dt * dv[0] / wp.max(dv[1], 1.0e-30)
-            dm0 = vec5f(0.0, 0.0, on * mv[2], on * mv[3], on * mv[4])
+            ls, on = vec5f(sv[0] * le, sv[1] * lf, 1.0, 1.0, 1.0), wp.where(dv[0] > 0.0 and dv[1] > 0.0, 1.0, 0.0)
+            rt, dm0 = on * dt * dv[0] / wp.max(dv[1], 1.0e-30), vec5f(0.0, 0.0, on * mv[2], on * mv[3], on * mv[4])
             dc0 = vec5f(0.0, 0.0, rt * p0[2], rt * p0[3], rt * p0[4])
-            sa = vec5f(sc[0], sc[1], dl * sc[2], dl * sc[3], dl * sc[4])
-            sb = vec5f(sc[5], sc[6], dl * sc[7], dl * sc[8], dl * sc[9])
-            po, ro = mem_step(p0, rb[t], dr[t], has_dr, z_a, sq[t], mv, sp, dk, dc, ls, sa, sb, dm0, dc0,
-                              ew[t], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
-            pout[t] = po
-            rout[t] = ro
+            ps, rs = mem_step(p0, rb[t], dr[t], has_dr, z_a, sq[t], mv, sp, dk, dc, ls, vec5f(sc[0], sc[1],
+                dl * sc[2], dl * sc[3], dl * sc[4]), vec5f(sc[5], sc[6], dl * sc[7], dl * sc[8], dl * sc[9]),
+                dm0, dc0, ew[t], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
+            pout[t] = ps
+            rout[t] = rs
     return step
-
+@wp.func
+def _v11(a: wp.array[float], d: vec11i) -> vec11f:
+    return vec11f(a[d[0]], a[d[1]], a[d[2]], a[d[3]], a[d[4]], a[d[5]], a[d[6]], a[d[7]], a[d[8]], a[d[9]], a[d[10]])
 @wp.func
 def _v21(a: wp.array[float], d: vec21i) -> vec21f:
     return vec21f(a[d[0]], a[d[1]], a[d[2]], a[d[3]], a[d[4]], a[d[5]], a[d[6]], a[d[7]], a[d[8]], a[d[9]], a[d[10]],
                   a[d[11]], a[d[12]], a[d[13]], a[d[14]], a[d[15]], a[d[16]], a[d[17]], a[d[18]], a[d[19]], a[d[20]])
-
 @wp.func
 def _shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
     """Face strain and directional strain rate ``J * xd`` without forming the full ``6x21`` matrix."""
@@ -324,7 +323,6 @@ def _shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
                            + wp.dot(u2, L * dfl + wp.dot(fl - pk, tn) * dpj - wp.dot(fl - pj, tn) * dpk))
         dg[i] = c * (dnn - h * wp.dot(tn, dpk - dpj)) / L + h * (1.0 + c * c) * (dpsi + float(v.sign[f][i]) * dth[i])
     return _whiten(v, f, m, g), _whiten(v, f, dm, dg)
-
 @cache
 def _shell_step_fn(md: int):
     """Fused 6D BAC shell strain/rate, RFF reduction, SPD clamping, and memory kernel."""
@@ -347,38 +345,95 @@ def _shell_step_fn(md: int):
         if st > 1:
             z_a = vec6f(_bcast8(za[0]), _bcast8(za[1]), _bcast8(za[2]), _bcast8(za[3]), _bcast8(za[4]), _bcast8(za[5]))
             z_b = vec6f(_bcast8(zb[0]), _bcast8(zb[1]), _bcast8(zb[2]), _bcast8(zb[3]), _bcast8(zb[4]), _bcast8(zb[5]))
-        R_, wi = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0)
-        sp, dk, dc = vec6f(0.0), vec6f(0.0), vec6f(0.0)
+        R_, wi, sp, dk, dc = fr.shape[0], (ew[f] if ws.shape[0] > 1 else 0), vec6f(0.0), vec6f(0.0), vec6f(0.0)
         if R_ > 0:
             sp, dk, dc = _shell_rff_loop(z_a, z_b, fr, ws, wi, R_, lane, st, wp.sqrt(2.0 / float(R_)))
         if lane == 0:
             sa, sb = vec6f(sc[0], sc[1], sc[2], sc[3], sc[4], sc[5]), vec6f(sc[6], sc[7], sc[8], sc[9], sc[10], sc[11])
-            po, ro = mem_step(pb[f], rb[f], dr[f], has_dr, z_a, sq[f], mem[f], sp, dk, dc, vec6f(ar[f]), sa, sb,
-                              vec6f(0.0), vec6f(0.0), ew[f], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
-            pout[f] = po
-            rout[f] = ro
+            ps, rs = mem_step(pb[f], rb[f], dr[f], has_dr, z_a, sq[f], mem[f], sp, dk, dc, vec6f(ar[f]), sa, sb,
+                vec6f(0.0), vec6f(0.0), ew[f], km, fl, ta, bs, yw, mk, ye, yd, clo, chi, dt)
+            pout[f] = ps
+            rout[f] = rs
     return step
-
+@wp.kernel(module="unique", module_options=_ADJ_OPTS)
+def _joint_residual_kernel(q: wp.array[float], qd: wp.array[float], u_in: wp.array[float], dm: wp.array[wp.vec4i],
+    fr: wp.array3d[float], wj: wp.array3d[float], cl: wp.array2d[float], st: wp.array2d[float], R: int, qs: float,
+    vsc: float, usc: float, vs: float, eps: float, ov: int, cap: float, sc: float, out: wp.array[float]):
+    d, m, uc = wp.tid(), dm[wp.tid()], u_in[wp.tid()]
+    if m[3] == 0:
+        out[d] = uc
+        return
+    w, l, qa, v = m[0], m[1], q[m[2]], qd[d]
+    fc, fs, vr = cl[w if cl.shape[0] > 1 else 0, l], st[w if st.shape[0] > 1 else 0, l], v / vs
+    t_st = -(fc + fs * wp.exp(-(vr * vr))) * (v / wp.sqrt(v * v + eps * eps))
+    wi, qn, vn, un, tr = (w if wj.shape[0] > 1 else 0), qa / qs, v / vsc, uc / usc, float(0.0)
+    for k in range(R):
+        a0, f1, f2 = fr[l, k, 0] * qn + fr[l, k, 3], fr[l, k, 1] * vn, fr[l, k, 2] * un
+        dv, ev = f1 + f2, (wp.exp(-0.5 * (f1 * f1 + f2 * f2)) if ov != 0 else 0.0)
+        s2 = wp.sin(0.5 * dv)
+        tr += wj[wi, l, k] * ((wp.sin(dv) - dv * ev) * wp.cos(a0) - 2.0 * s2 * s2 * wp.sin(a0))
+    out[d] = uc + cap * wp.tanh((t_st + sc * tr) / cap)
+class JointResidual:
+    """Pre-allocated pure-Warp robot-owned joint Stribeck + RFF residual."""
+    def __init__(self, model: Model, spec: JointResidualSpec, device=None):
+        f, s = getattr(model, "_parent", model), spec
+        if s.rff_dim < 0 or min(s.q_scale, s.qd_scale, s.u_scale, s.stribeck_v, s.eps_vel, s.tau_cap) <= 0.0:
+            raise ValueError("Invalid JointResidualSpec parameters")
+        dev = self.device = wp.get_device(f.device if device is None else device)
+        self.spec, self.n_dof, nq, nj = s, int(f.joint_dof_count), int(f.joint_coord_count), int(f.joint_count)
+        jw, dm = (f.joint_world.numpy() if nj else np.zeros(0, np.int32)), np.zeros((max(self.n_dof, 1), 4), np.int32)
+        gm = f.world_count > 1 and (jw < 0).any()
+        if self.n_dof and nj:
+            qds, d = f.joint_qd_start.numpy(), np.arange(self.n_dof, dtype=np.int32)
+            ji = np.repeat(np.arange(nj, dtype=np.int32), np.diff(qds))
+            w, jt = jw[ji], np.isin(f.joint_type.numpy()[ji], (int(JointType.PRISMATIC), int(JointType.REVOLUTE)))
+            dl = d - np.where(w >= 0, f.joint_dof_world_start.numpy()[np.maximum(w, 0)], 0)
+            dm[:, 0], dm[:, 1] = (0 if gm else np.maximum(w, 0)), dl
+            dm[:, 2] = np.minimum(f.joint_q_start.numpy()[ji] + d - qds[ji], max(nq, 1) - 1)
+            dm[:, 3] = jt if s.enabled_dofs is None else (jt & np.isin(dl, s.enabled_dofs))
+        W, R, rng = (1 if gm else max(1, int(f.world_count))), max(s.rff_dim, 1), np.random.default_rng(s.seed)
+        D, self.dof_map = max(1, int(dm[:, 1].max()) + 1 if self.n_dof else 1), wp.array(dm, dtype=wp.vec4i, device=dev)
+        self.rff_freq = wp.array(np.concatenate([rng.normal(0.0, s.rff_bandwidth, (D, R, 3)),
+            rng.uniform(0.0, 2.0 * np.pi, (D, R, 1))], -1).astype(np.float32), dtype=float, device=dev)
+        self.w_joint, self.coulomb, self.stribeck = (_as_vec_grad(v, float, n, m, W, dev, k) for v, n, m, k in (
+            (s.w_joint, R, D, "w_joint"), (s.coulomb, D, -1, "coulomb"), (s.stribeck, D, -1, "stribeck")))
+        self._args = (int(s.rff_dim), float(s.q_scale), float(s.qd_scale), float(s.u_scale), float(s.stribeck_v),
+            float(s.eps_vel), int(s.ortho_viscous), float(s.tau_cap), (2.0 / s.rff_dim) ** 0.5 if s.rff_dim else 0.0)
+        self.joint_f_eff, self._ctrl = wp.zeros(self.n_dof, dtype=float, device=dev, requires_grad=True), Control()
+        self._zero_u, self._none_ctrl = wp.zeros(self.n_dof, float, device=dev), dict.fromkeys(self._ctrl.__dict__)
+    def apply(self, state_in, control: Control | None) -> Control | None:
+        """Evaluate joint residual into ``self.joint_f_eff`` and wrap in reusable ``Control``."""
+        if not self.n_dof:
+            return control
+        u = control.joint_f if (control is not None and control.joint_f is not None) else self._zero_u
+        wp.launch(_joint_residual_kernel, self.n_dof, device=self.device, outputs=[self.joint_f_eff], inputs=[
+            state_in.joint_q, state_in.joint_qd, u, self.dof_map, self.rff_freq, *self.grad_inputs(), *self._args])
+        self._ctrl.__dict__.clear()
+        self._ctrl.__dict__.update(control.__dict__ if control is not None else self._none_ctrl)
+        self._ctrl.joint_f = self.joint_f_eff
+        return self._ctrl
+    def grad_inputs(self) -> list[wp.array]:
+        """Differentiable joint residual parameter arrays."""
+        return [self.w_joint, self.coulomb, self.stribeck]
 class ConstitutiveResidual:
     """Pre-allocated pure-Warp 5D DER rod and 6D BAC shell constitutive residual and memory evaluator."""
     def __init__(self, model: Model, spec: ResidualSpec, device=None):
-        if (min(spec.rod_rff_dim, spec.shell_rff_dim) < 0 or min(*spec.rod_scales, *spec.shell_scales) <= 0.0
-                or len(spec.rod_scales) != 10 or len(spec.shell_scales) != 12
-                or not (-1.0 < spec.clamp_lo <= spec.clamp_hi)):
+        sp, dev = spec, wp.get_device(model.device if device is None else device)
+        if (min(sp.rod_rff_dim, sp.shell_rff_dim) < 0 or min(*sp.rod_scales, *sp.shell_scales) <= 0.0
+                or len(sp.rod_scales) != 10 or len(sp.shell_scales) != 12 or not (-1.0 < sp.clamp_lo <= sp.clamp_hi)):
             raise ValueError("Invalid ResidualSpec parameters")
-        self.spec, self.device = spec, wp.get_device(model.device if device is None else device)
-        self.clamp_lo, self.clamp_hi = float(spec.clamp_lo), float(spec.clamp_hi)
-        self.scales, self.shell_scales = vec10f(*map(float, spec.rod_scales)), vec12f(*map(float, spec.shell_scales))
-        self.iso_bending = int(bool(spec.iso_bending))
-        d, pw = model.dismech, (model.particle_world.numpy() if model.particle_count else np.zeros(0, np.int32))
-        gm = model.world_count > 1 and (pw < 0).any()
+        self.spec, self.device, self.iso_bending = sp, dev, int(bool(sp.iso_bending))
+        self.clamp_lo, self.clamp_hi = float(sp.clamp_lo), float(sp.clamp_hi)
+        self.scales, self.shell_scales = vec10f(*map(float, sp.rod_scales)), vec12f(*map(float, sp.shell_scales))
+        pw = model.particle_world.numpy() if model.particle_count else np.zeros(0, np.int32)
+        gm, cc = (model.world_count > 1 and (pw < 0).any()), model.custom_frequency_counts
         self._nw = 1 if (gm or not pw.size) else int(np.maximum(pw, 0).max(initial=0)) + 1
-        self.rod_count = nt = int(model.custom_frequency_counts.get(_P + "triplet", 0))
-        self.shell_count = nf = int(model.custom_frequency_counts.get(_P + "face", 0))
+        self.rod_count, self.shell_count = (nt := int(cc.get(_P + "triplet", 0))), (nf := int(cc.get(_P + "face", 0)))
+        d = model.dismech if (nt or nf) else None
         e, f = (d.triplet_edge0.numpy(), d.triplet_edge1.numpy()) if nt else ((), ())
         cnt = np.bincount(np.concatenate([e, f]), minlength=d.edge_length.shape[0]) if nt else None
-        es = np.column_stack([1.0 / cnt[e], 1.0 / cnt[f]]).astype(np.float32) if nt else np.zeros((0, 2), np.float32)
-        self.edge_share = wp.array(es, dtype=wp.vec2, device=self.device)
+        self.edge_share = wp.array(np.column_stack([1.0 / cnt[e], 1.0 / cnt[f]]).astype(np.float32),
+            dtype=wp.vec2, device=dev) if nt else wp.zeros(0, dtype=wp.vec2, device=dev)
         rc = self._elem(nt, d.edge_node0.numpy()[e] if nt else None, pw, gm, False)
         sc = self._elem(nf, d.face_node0.numpy() if nf else None, pw, gm, True)
         (self.elem_world, self.params_step, self.rest_step, self.rff_freq, self.w_rod, self.has_d_rest,
@@ -386,9 +441,9 @@ class ConstitutiveResidual:
         (self.shell_elem_world, self.shell_params_step, self.shell_rest_step, self.shell_rff_freq,
          self.w_shell, self.has_d_rest_shell, self.d_rest_shell, self.mem_shell) = sc
         self.rod_mem_mode, self.shell_mem_mode, self._ctx = self.mem_rod.mode, self.mem_shell.mode, (rc, sc)
-        self.has_rod = bool(nt and (spec.rod_rff_dim > 0 or self.has_d_rest or self.rod_mem_mode != 0))
-        self.has_shell = bool(nf and (spec.shell_rff_dim > 0 or self.has_d_rest_shell or self.shell_mem_mode != 0))
-
+        self.has_rod = bool(nt and (sp.rod_rff_dim > 0 or self.has_d_rest or self.rod_mem_mode != 0))
+        self.has_shell = bool(nf and (sp.shell_rff_dim > 0 or self.has_d_rest_shell or self.shell_mem_mode != 0))
+        self.joint = JointResidual(model, sp.joint, device=dev) if sp.joint is not None else None
     def _elem(self, n: int, nodes, pw, gm, shell: bool):
         dev, sp, (nv, p_dt, v_dt) = self.device, self.spec, (6, vec12f, vec6f) if shell else (5, vec10f, vec5f)
         dim, seed, w_v, dr_v, ms = ((sp.shell_rff_dim, sp.seed + 1, sp.w_shell, sp.shell_spatial_rest_delta,
@@ -399,8 +454,8 @@ class ConstitutiveResidual:
             raise ValueError(f"Invalid MemorySpec: {ms}")
         md, pfx, hdr = _MEM_MODES[ms.mode], ("shell_" if shell else ""), int(dr_v is not None and n > 0)
         mem = SimpleNamespace(mode=md, mk=v_dt(*(float(i in ms.enabled_dims) for i in range(nv))),
-            ye=float(ms.yield_eps), yd=float(ms.yield_delta), pr=wp.empty(n if md == 3 else 0, dtype=v_dt,
-            device=dev, requires_grad=True), **{k: _as_vec_grad(getattr(ms, k), v_dt, nv, -1, self._nw, dev, k)
+            ye=float(ms.yield_eps), yd=float(ms.yield_delta), pr=wp.empty(n * (md == 3), dtype=v_dt, device=dev,
+            requires_grad=True), **{k: _as_vec_grad(getattr(ms, k), v_dt, nv, -1, self._nw, dev, k)
             for k in ("k_mem", "flow", "tau", "bw_sat", "yield_weight")})
         rff = np.random.default_rng(seed).normal(0.0, sp.rff_bandwidth, (dim, 2 * nv)).astype(np.float32)
         ew = np.zeros(n, np.int32) if (gm or not n) else np.maximum(pw[nodes], 0).astype(np.int32)
@@ -408,15 +463,13 @@ class ConstitutiveResidual:
                 wp.empty(n, dtype=v_dt, device=dev), wp.array(rff, dtype=p_dt, device=dev),
                 _as_vec_grad(w_v, v_dt, nv, dim, self._nw, dev, "w_shell" if shell else "w_rod"), hdr,
                 _as_vec_grad(dr_v if hdr else None, v_dt, nv, n, None, dev, f"{pfx}spatial_rest_delta"), mem)
-
     def grad_inputs(self) -> list[wp.array]:
         """Differentiable parameter arrays tracked by ``SolverDiSMech._record``."""
-        c = ((self.spec.rod_rff_dim and (self.rod_count or self.spec.w_rod is not None), self.w_rod),
-             (self.has_d_rest, self.d_rest), (self.has_d_rest_shell, self.d_rest_shell),
-             (self.spec.shell_rff_dim and (self.shell_count or self.spec.w_shell is not None), self.w_shell))
-        return [a for k, a in c if k] + [getattr(m, k) for n, m in ((self.rod_count, self.mem_rod),
-                (self.shell_count, self.mem_shell)) if n for k in _MEM_ATTRS.get(m.mode, ())]
-
+        return ([a for k, a in ((self.spec.rod_rff_dim and (self.rod_count or self.spec.w_rod is not None),
+                 self.w_rod), (self.has_d_rest, self.d_rest), (self.has_d_rest_shell, self.d_rest_shell),
+                 (self.spec.shell_rff_dim and (self.shell_count or self.spec.w_shell is not None), self.w_shell)) if k]
+                + [getattr(m, k) for n, m in ((self.rod_count, self.mem_rod), (self.shell_count, self.mem_shell))
+                   if n for k in _MEM_ATTRS.get(m.mode, ())] + (self.joint.grad_inputs() if self.joint else []))
     def _eval(self, shell: bool, el, s, dt: float, pb, rb, po, ro) -> None:
         if not el.count:
             return
@@ -428,7 +481,6 @@ class ConstitutiveResidual:
         wp.launch(sk, el.count * st, block_dim=bd, device=self.device, outputs=[dp if po is None else po,
                   dr if ro is None else ro], inputs=[s.q, s.qd, el.bind(s), pb, rb, getattr(s, el.stored),
                   d_rest, hdr, *xs, st, self.clamp_lo, self.clamp_hi, dt])
-
     def _carry(self, shell: bool, el, p, s, dt: float) -> None:
         ew, _, _, _, _, hdr, d_rest, m = self._ctx[shell]
         if not el.count or not m.mode:
@@ -442,7 +494,6 @@ class ConstitutiveResidual:
         wp.launch(_mem_ops(6 if shell else 5, m.mode)[1], el.count, block_dim=1 if self.device.is_cpu else 128,
                   device=self.device, outputs=[out], inputs=[prev, getattr(s, el.stored), el.rest, d_rest, hdr,
                   getattr(p, el.memory), ew, m.flow, m.tau, m.bw_sat, m.yield_weight, m.mk, m.ye, m.yd, dt])
-
     def eval_rod(self, rods, s, dt: float, params_base, rest_base, params_out=None, rest_out=None) -> None:
         self._eval(False, rods, s, dt, params_base, rest_base, params_out, rest_out)
     def eval_shell(self, shells, s, dt: float, params_base, rest_base, params_out=None, rest_out=None) -> None:

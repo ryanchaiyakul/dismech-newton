@@ -171,7 +171,7 @@ def _taxel_kernel(q: wp.array[float], s: Slots, arm: Arm, eps: float, key0: int,
     if k < 0:
         return
     g, h, fr = contact_force(pair_point(q, s, i, arm, s.anchor[i]), s.normal[i], s.c0[i], s.thickness[i],
-                             s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps, s.pad[i], s.damp[i])
+                             s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps, s.pad[i], s.damp[i], s.aniso[i])
     if wp.length(g) == 0.0:
         return
     inv = wp.transform_inverse(_shape_pose(b, shape, b.body_q))  # the sensor's frame at the step's start

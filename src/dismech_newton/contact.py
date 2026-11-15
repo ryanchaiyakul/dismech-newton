@@ -62,6 +62,8 @@ class Slots:
     pad: wp.array[wp.vec4]  # a pad's point: (c, p, h, d), its energy c (th + h - d)^p, Hunt-Crossley's d [s/m]
     damp: wp.array[float]  # and its damping d f0 / dt (f0 its pressure's force at the step's start)
     rewound: wp.array[wp.int32]  # sliding pair tried to rewind in this step: use isotropic majorizer
+    aniso: wp.array[wp.vec4]  # (e1.x, e1.y, e1.z, gamma), D_t = e^(g/2) e1 e1^T + e^(-g/2) e2 e2^T
+    base: wp.array[wp.vec2]  # baseline (mu0, pad_c0) saved at emit (for Phase 4C idempotency)
 
 
 @wp.struct
@@ -311,6 +313,8 @@ def emit(
     s.pad[i] = pad
     s.mu[i] = mu
     s.rewound[i] = 0
+    s.aniso[i] = wp.vec4(0.0)
+    s.base[i] = wp.vec2(mu, pad[0])
 
 
 @wp.func
@@ -319,6 +323,8 @@ def clear(s: Slots, i: int):
     s.rho[i] = 0.0
     s.key[i] = -1
     s.rewound[i] = 0
+    s.aniso[i] = wp.vec4(0.0)
+    s.base[i] = wp.vec2(0.0)
 
 
 # -- contact as an energy: a barrier and lagged friction ------------------------------------------------------------
@@ -647,21 +653,45 @@ def _slip(c: wp.vec3, c0: wp.vec3, n: wp.vec3) -> wp.vec3:
 
 
 @wp.func
+def _aniso_axes(n: wp.vec3, aniso: wp.vec4):
+    """Tangent frame ``(e1, e2, d1, d2)`` for anisotropic friction ``(e1.x, e1.y, e1.z, gamma)``."""
+    u = wp.vec3(aniso[0], aniso[1], aniso[2])
+    up = u - wp.dot(n, u) * n
+    ul2 = wp.dot(up, up)
+    e1 = wp.vec3(0.0)
+    if ul2 > wp.max(1.0e-24, 1.0e-10 * wp.dot(u, u)):
+        e1 = up / wp.sqrt(ul2)
+    else:
+        ref = wp.where(wp.abs(n[0]) < 0.9, wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0))
+        e1 = wp.normalize(wp.cross(n, ref))
+    e2 = wp.cross(n, e1)
+    return e1, e2, wp.exp(0.5 * aniso[3]), wp.exp(-0.5 * aniso[3])
+
+
+@wp.func
 def contact_force(c: wp.vec3, n: wp.vec3, c0: wp.vec3, th: float, k: float, lam: float, mu_rho: float, eps: float,
-                  pad: wp.vec4, damp: float):
+                  pad: wp.vec4, damp: float, aniso: wp.vec4):
     """A pair's gradient with respect to ``C q = c`` (normal ``n``, start ``c0``, multiplier ``lam``, friction
-    ``mu rho = mu_rho``), and its barrier's and friction's curvatures."""
+    ``mu rho = mu_rho``, anisotropic friction ``aniso``), and its barrier's and friction's curvatures."""
     e = barrier(wp.dot(n, c), th, k, lam) + pad_energy(wp.dot(n, c), th, pad) + pad_damping(
         wp.dot(n, c), wp.dot(n, c0), th, pad, damp)
     slip = _slip(c, c0, n)
-    friction = mu_rho * slip_energy(wp.length(slip), eps)[1]
-    return e[1] * n + friction * slip, e[2], friction
+    if aniso[3] == 0.0:
+        friction = mu_rho * slip_energy(wp.length(slip), eps)[1]
+        return e[1] * n + friction * slip, e[2], friction
+    e1, e2, d1, d2 = _aniso_axes(n, aniso)
+    s1 = wp.dot(e1, slip)
+    s2 = wp.dot(e2, slip)
+    yt = wp.sqrt(d1 * d1 * s1 * s1 + d2 * d2 * s2 * s2)
+    friction = mu_rho * slip_energy(yt, eps)[1]
+    ft = friction * (d1 * d1 * s1 * e1 + d2 * d2 * s2 * e2)
+    return e[1] * n + ft, e[2], friction
 
 
 @wp.func
 def _barrier_force(c: wp.vec3, s: Slots, i: int, eps: float):
     return contact_force(c, s.normal[i], s.c0[i], s.thickness[i], s.stiffness[i], s.lam[i], s.mu[i] * s.rho[i], eps,
-                         s.pad[i], s.damp[i])
+                         s.pad[i], s.damp[i], s.aniso[i])
 
 
 @wp.func
@@ -671,13 +701,28 @@ def contact_hessian(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     n = s.normal[i]
     nn = wp.outer(n, n)
     g, h, fr = _barrier_force(c, s, i, eps)
+    an = s.aniso[i]
+    if an[3] != 0.0:
+        e1, e2, d1, d2 = _aniso_axes(n, an)
+        return h * nn + fr * (d1 * d1 * wp.outer(e1, e1) + d2 * d2 * wp.outer(e2, e2)) + _along_slip(c, s, i, eps)
     return h * nn + fr * (wp.identity(3, float) - nn) + _along_slip(c, s, i, eps)
 
 
 @wp.func
 def _along_slip(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     """Friction's exact curvature along the slip less its majorizer's: ``mu rho (f1' - f1 / y) t t^T``."""
-    slip = _slip(c, s.c0[i], s.normal[i])
+    n = s.normal[i]
+    slip = _slip(c, s.c0[i], n)
+    an = s.aniso[i]
+    if an[3] != 0.0:
+        e1, e2, d1, d2 = _aniso_axes(n, an)
+        s1 = wp.dot(e1, slip)
+        s2 = wp.dot(e2, slip)
+        yt = wp.sqrt(d1 * d1 * s1 * s1 + d2 * d2 * s2 * s2)
+        if yt == 0.0:
+            return wp.mat33()
+        dt_t = (d1 * d1 * s1 * e1 + d2 * d2 * s2 * e2) / yt
+        return -s.mu[i] * s.rho[i] * wp.where(yt < eps, yt / (eps * eps), 1.0 / yt) * wp.outer(dt_t, dt_t)
     y = wp.length(slip)
     if y == 0.0:
         return wp.mat33()
@@ -731,8 +776,26 @@ def _majorizer(c: wp.vec3, s: Slots, i: int, eps: float) -> wp.mat33:
     x = s.thickness[i] + pad[2] - wp.dot(n, c)  # in its pad: a rod's curvature (delta^1/2) is 0 at the surface,
     if pad[0] > 0.0 and x >= 0.0:  # so A holds at least the pad's at PAD_FLOOR of it deep
         h = wp.max(h, pad_energy(s.thickness[i] + pad[2] - wp.max(x, PAD_FLOOR * pad[2]), s.thickness[i], pad)[2])
-    h = wp.min(h, CURVATURE * s.stiffness[i])  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
+    cap = CURVATURE * s.stiffness[i]
+    h = wp.min(h, cap)  # the log's 1/d^2 bounded (float32 cuDSS); the energy stays exact
     slip = _slip(c, s.c0[i], n)
+    an = s.aniso[i]
+    if an[3] != 0.0:
+        e1, e2, d1, d2 = _aniso_axes(n, an)
+        s1 = wp.dot(e1, slip)
+        s2 = wp.dot(e2, slip)
+        st = d1 * s1 * e1 + d2 * s2 * e2
+        yt = wp.length(st)
+        if yt >= eps and s.rewound[i] == 0:
+            bt = wp.cross(n, st / yt)
+            wb = d1 * wp.dot(e1, bt) * e1 + d2 * wp.dot(e2, bt) * e2
+            fr_c = wp.min(fr, cap / wp.max(d1 * d1, d2 * d2))
+            return h * wp.outer(n, n) + fr_c * wp.outer(wb, wb)
+        return (
+            h * wp.outer(n, n)
+            + wp.min(fr * d1 * d1, cap) * wp.outer(e1, e1)
+            + wp.min(fr * d2 * d2, cap) * wp.outer(e2, e2)
+        )
     y = wp.length(slip)
     if y >= eps and s.rewound[i] == 0:
         b = wp.cross(n, slip / y)
@@ -850,13 +913,26 @@ def _impact_kernel(q: wp.array[float], dq: wp.array[float], s: Slots, arm: Arm, 
             wp.atomic_min(t, s.world[i], IMPACT * d / approach)
     if s.mu[i] * s.rho[i] > 0.0:
         slip = _slip(c, s.c0[i], n)
-        y = wp.length(slip)
-        if y >= eps:  # sliding: Newton did not see the sticking ramp, so a step back holds only to its middle
-            rewind = wp.dot(slip / y, _slip(dq_c, wp.vec3(0.0), n))
-            if rewind > 0.0:
-                if rewind > y - 0.5 * eps:
-                    s.rewound[i] = 1
-                wp.atomic_min(t, s.world[i], (y - 0.5 * eps) / rewind)
+        if s.aniso[i][3] != 0.0:
+            e1, e2, d1, d2 = _aniso_axes(n, s.aniso[i])
+            st = d1 * wp.dot(e1, slip) * e1 + d2 * wp.dot(e2, slip) * e2
+            yt = wp.length(st)
+            if yt >= eps:
+                dqs = _slip(dq_c, wp.vec3(0.0), n)
+                dq_st = d1 * wp.dot(e1, dqs) * e1 + d2 * wp.dot(e2, dqs) * e2
+                rewind = wp.dot(st / yt, dq_st)
+                if rewind > 0.0:
+                    if rewind > yt - 0.5 * eps:
+                        s.rewound[i] = 1
+                    wp.atomic_min(t, s.world[i], (yt - 0.5 * eps) / rewind)
+        else:
+            y = wp.length(slip)
+            if y >= eps:  # sliding: Newton did not see the sticking ramp, so a step back holds only to its middle
+                rewind = wp.dot(slip / y, _slip(dq_c, wp.vec3(0.0), n))
+                if rewind > 0.0:
+                    if rewind > y - 0.5 * eps:
+                        s.rewound[i] = 1
+                    wp.atomic_min(t, s.world[i], (y - 0.5 * eps) / rewind)
 
 
 @wp.kernel
@@ -890,7 +966,15 @@ def _barrier_energy_kernel(q_cand: wp.array2d[float], s: Slots, arm: Arm, stride
         c = pair_point(q_cand[j], s, i, arm, s.anchor[i])
         n = s.normal[i]
         e = wp.float64(pair_energy(wp.dot(n, c), s, i)[0])
-        e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(wp.length(_slip(c, s.c0[i], n)), eps)[0])
+        if s.aniso[i][3] != 0.0:
+            sl = _slip(c, s.c0[i], n)
+            e1, e2, d1, d2 = _aniso_axes(n, s.aniso[i])
+            s1 = wp.dot(e1, sl)
+            s2 = wp.dot(e2, sl)
+            yt = wp.sqrt(d1 * d1 * s1 * s1 + d2 * d2 * s2 * s2)
+            e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(yt, eps)[0])
+        else:
+            e += wp.float64(s.mu[i] * s.rho[i] * slip_energy(wp.length(_slip(c, s.c0[i], n)), eps)[0])
     world_sum(energy, w, j, stride, e)
 
 

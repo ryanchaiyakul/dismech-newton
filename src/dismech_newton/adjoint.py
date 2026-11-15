@@ -332,19 +332,22 @@ class StepAdjoint:
                           outputs=[e.g], device=dev)
                 wp.launch(k.scatter, dim=blk.count, inputs=[e.g, v, s.fixed], outputs=[self.residual], device=dev)
             if contacts is not None:
+                c = Slots()
+                for name in Slots.vars:
+                    setattr(c, name, getattr(contacts, name))
                 src, q_in = s.contact.source, state_in.dismech.q
                 poses = src.bodies.body_q if self.arm is None else self._snap.poses
-                n_c = contacts.active.shape[0]
+                n_c = c.active.shape[0]
                 t0 = wp.empty(n_c, dtype=float, device=dev)
-                wp.launch(_scan_kernel, dim=n_c, inputs=[contacts, src.bodies, _detached(poses), src.shape_key0,
+                wp.launch(_scan_kernel, dim=n_c, inputs=[c, src.bodies, _detached(poses), src.shape_key0,
                                                          _detached(q_in)], outputs=[t0], device=dev, record_tape=False)
                 weights = wp.zeros(n_c, dtype=wp.vec4, device=dev, requires_grad=True)
-                wp.launch(_weights_kernel, dim=n_c, inputs=[contacts, src.bodies, poses, _detached(poses),
+                wp.launch(_weights_kernel, dim=n_c, inputs=[c, src.bodies, poses, _detached(poses),
                                                            src.shape_key0, q_in, _detached(q_in), t0],
                           outputs=[weights], device=dev)
                 # the lever arms from the step's anchors (a body's point, which its surface point at q_in can miss
                 # along the surface): their values, the surface point's derivative
-                inputs = [contacts, src.bodies, poses, weights, arm, src.shape_key0, s.fixed,
+                inputs = [c, src.bodies, poses, weights, arm, src.shape_key0, s.fixed,
                           s.contact.slip_speed * dt, dt, self.q_star, q_in, _detached(q_in), self.mass,
                           _detached(self.mass), self._com if self.arm is not None else self._no_com,
                           self.Minv if self.arm is not None else arm.Minv]
@@ -352,7 +355,7 @@ class StepAdjoint:
                 if self.arm is not None:
                     wp.launch(_contact_residual_kernel, dim=n_c, inputs=[*inputs, off],
                               outputs=[wp.zeros_like(self.residual), anchors], device=dev, record_tape=False)
-                    wp.launch(_lever_off_kernel, dim=n_c, inputs=[contacts.anchor, anchors], outputs=[off], device=dev,
+                    wp.launch(_lever_off_kernel, dim=n_c, inputs=[c.anchor, anchors], outputs=[off], device=dev,
                               record_tape=False)
                 wp.launch(_contact_residual_kernel, dim=n_c, inputs=[*inputs, off], outputs=[self.residual, anchors],
                           device=dev)
@@ -573,7 +576,8 @@ def _contact_residual_kernel(
     if body >= 0:
         cq -= arm_move(q, arm, body, lever)
     anchors[i] = anchor
-    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.pad[i][3] * pf / dt)
+    g, h, fr = contact_force(cq, n, c0, th, k, c.lam[i], c.mu[i] * rho, eps, c.pad[i], c.pad[i][3] * pf / dt,
+                             c.aniso[i])
     for j in range(4):
         if pair[j] >= 0:
             scatter_node(r, fixed, pair[j], wp.transpose(node_map(w, roll, n, ta, tb, j)) * g)

@@ -88,7 +88,7 @@ class ProxyArm:
         self.last_wrench = wp.zeros(nb, dtype=wp.spatial_vector, device=self.device)
         self._last_grad = None  # the last recorded step's adjoint of its end poses (snapshot)
         self.restart = False  # the next step repeats the last (a coupler's iteration restart): from its start
-        self._arm: Arm | None = None
+        self._arm: "Arm | None" = None
 
     def bind(self, arm: Arm) -> None:
         self._arm = arm

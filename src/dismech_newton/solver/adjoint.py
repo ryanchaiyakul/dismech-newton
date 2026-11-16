@@ -120,7 +120,7 @@ class StepAdjoint:
             self._intermediates += [self.pred, self.M, self.Minv, self.end, self._end_qd, self._offset, self._com,
                                     self.pin_point]
 
-    def vjp(self, state_in: State, state_out: State, dt: float, contacts: Slots | None = None, arm=None) -> None:
+    def vjp(self, state_in: State, state_out: State, dt: float, contacts: "Slots | None" = None, arm=None) -> None:
         """Accumulate the adjoints from ``state_out``'s ``.grad``; both states must still hold the step (``arm``: its
         proxies', :meth:`~.coupling.ProxyArm.snapshot`)."""
         s = self.solver
@@ -214,7 +214,7 @@ class StepAdjoint:
             p.node, p.body, p.local, p.point, p.k = live.node, live.body, live.local, self.pin_point, snap.pin_k
             self.pins = p
 
-    def _solve(self, state_in: State, dt: float, contacts: Slots | None) -> None:
+    def _solve(self, state_in: State, dt: float, contacts: "Slots | None") -> None:
         """``H lam = -adj_q``, then ``lam^T dr`` into the inputs."""
         s = self.solver
         bind_dofs(self.dofs, s.model, self.mass, s.fixed, s._no_force, state_in, dt)
@@ -302,7 +302,7 @@ class StepAdjoint:
             return e.blk.params, e.blk.rest
         return e.blk.effective(state_in.dismech, dt, e.params, e.rest)
 
-    def _residual(self, state_in: State, dt: float, contacts: Slots | None) -> wp.Tape:
+    def _residual(self, state_in: State, dt: float, contacts: "Slots | None") -> wp.Tape:
         """``r(q_star)`` on a tape, every input with its adjoint."""
         s, dev = self.solver, self.solver.device
         self.residual.zero_()

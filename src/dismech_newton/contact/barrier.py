@@ -135,7 +135,7 @@ class BarrierBlock:
         if self.residual is not None:
             self.residual.apply_contact(self.s, state_in, self.source, self.arm, self.dt)
 
-    def snapshot(self) -> Slots | None:
+    def snapshot(self) -> "Slots | None":
         """This step's active pairs, gathered for its adjoint if any carries force at its end (one host read; two if
         so)."""
         if not self.count or not int(self.touching.numpy()[0]):

@@ -7,7 +7,7 @@ import warp as wp
 from newton import JointType, Model
 
 from ..builder import _P
-from ..constants import mat5x11f, vec5f, vec5i, vec8f, vec11f, vec11i
+from ..constants import mat5x11f, mat63f, vec5f, vec5i, vec8f, vec11f, vec11i
 from ..dofs import node
 from .block import element_kernels, rest_strains
 
@@ -34,7 +34,7 @@ class Rods:
     stored = "triplet_strain_q"
     memory = "triplet_mem_q"
 
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, *, geometric: bool = True, material=None):
         d, dev = model.dismech, wp.get_device(model.device)
         self.count = model.custom_frequency_counts.get(_P + "triplet", 0)
         self.params, self.edge_length, self.num_node_dofs = d.triplet_params, d.edge_length, 3 * model.particle_count
@@ -46,34 +46,61 @@ class Rods:
                                 np.where(sf > 0, node1[f], node0[f])))
         self.conn = wp.array(conn.astype(np.int32).reshape(-1, 5), dtype=vec5i, device=dev)
         self.sign = wp.array(np.column_stack((se, sf)).reshape(-1, 2), dtype=wp.vec2, device=dev)
-        self.kernels = element_kernels(Rod, rod_strain, rod_jacobian, rod_dofs, 5, 11)
+        geom = (rod_geometric, rod_geometric_entry) if geometric else None
+        self.kernels = element_kernels(Rod, rod_strain, rod_jacobian, rod_dofs, 5, 11, geom, material)
         self.rest = rest_strains(self, model, vec5f)
         if self.count:
             r = self.rest.numpy()
             r[:, :2] = 0.0
             self.rest.assign(r)
+        self._dahl = None
         self._residual = None
-        self.effective = None  # (params, rest) per step: constitutive/memory residual
+        self.effective = None  # (params, rest, stress) per step: Dahl hysteresis and/or residual hook
+
+    def bind_dahl(self, dahl) -> None:
+        """Bind classical Dahl hysteresis so :meth:`effective` evaluates it."""
+        self._dahl = dahl
+        if self.count:
+            if not hasattr(self, "params_step"):
+                self.params_step = wp.empty_like(self.params)
+            if not hasattr(self, "stress_step"):
+                self.stress_step = wp.zeros(self.count, dtype=vec5f, device=self.params.device)
+            self._params_dahl = wp.empty_like(self.params)
+            self.effective = self._effective
 
     def bind_residual(self, res) -> None:
-        """Bind a constitutive or memory residual so :meth:`effective` evaluates it."""
+        """Bind an external constitutive or memory residual hook so :meth:`effective` evaluates it."""
         self._residual = res
         res._rods = self
         if self.count:
-            self.params_step = wp.empty_like(self.params)
+            if not hasattr(self, "params_step"):
+                self.params_step = wp.empty_like(self.params)
             self.rest_step = wp.empty_like(self.rest)
+            if not hasattr(self, "stress_step"):
+                self.stress_step = wp.zeros(self.count, dtype=vec5f, device=self.params.device)
             self.effective = self._effective
 
-    def _effective(self, s, dt: float, params=None, rest=None):
-        """The step's ``(params, rest)`` with constitutive/memory residual from ``s`` (into ``params``, ``rest``)."""
+    def _effective(self, s, dt: float, params=None, rest=None, stress=None):
+        """The step's ``(params, rest, stress)`` from Dahl hysteresis and/or external residual hook."""
         params = self.params_step if params is None else params
+        stress = self.stress_step if stress is None else stress
+        if self._residual is None:
+            self._dahl.step(self, s, dt, params, stress)
+            return params, self.rest, stress
         rest = self.rest_step if rest is None else rest
-        self._residual.eval_rod(self, s, dt, self.params, self.rest, params, rest)
-        return params, rest
+        if self._dahl is None:
+            self._residual.eval_rod(self, s, dt, self.params, self.rest, params, rest)
+            return params, rest, self.stress_step
+        mid = wp.empty_like(params, requires_grad=True) if params.requires_grad else self._params_dahl
+        self._dahl.step(self, s, dt, mid, stress)
+        self._residual.eval_rod(self, s, dt, mid, self.rest, params, rest)
+        return params, rest, stress
 
     def carry(self, p, s, dt: float = 0.0) -> None:
         """``s``'s carried memory as the step from ``p`` leaves it."""
-        if self.count and self._residual is not None and self._residual.has_rod_memory:
+        if self.count and self._dahl is not None:
+            self._dahl.carry(self, p, s)
+        if self.count and self._residual is not None and getattr(self._residual, "has_rod_memory", False):
             self._residual.carry_rod(self, p, s, dt)
 
     def bind(self, s) -> Rod:
@@ -163,6 +190,49 @@ def rod_strain_rate(x: vec11f, xd: vec11f, v: Rod, t: int):
         wp.dot(De2, ze) + wp.dot(Df2, zf) + a2 * pe + b2 * pf,
         0.5 * wp.dot(g.kb / g.ne, ze) + 0.5 * wp.dot(g.kb / g.nf, zf) - pe + pf,
     )
+
+
+@wp.func
+def _edge_geometric(d: wp.vec3, l0: float, sig: float) -> wp.mat33:
+    n = wp.length(d)
+    if sig <= 0.0 or n <= 0.0 or l0 <= 0.0:
+        return wp.mat33()
+    t = d / n
+    return (sig / (l0 * n)) * (wp.identity(3, float) - wp.outer(t, t))
+
+
+@wp.func
+def rod_geometric(x: vec11f, v: Rod, i: int, sigma: vec5f) -> mat63f:
+    """PSD-projected tensile stretch geometric stiffness: ``Ke`` (rows 0..2) and ``Kf`` (rows 3..5)."""
+    c = v.conn[i]
+    Ke = _edge_geometric(wp.vec3(x[4] - x[0], x[5] - x[1], x[6] - x[2]), v.edge_length[c[0]], sigma[0])
+    Kf = _edge_geometric(wp.vec3(x[8] - x[4], x[9] - x[5], x[10] - x[6]), v.edge_length[c[1]], sigma[1])
+    G = mat63f()
+    for r in range(3):
+        for k in range(3):
+            G[r, k] = Ke[r, k]
+            G[3 + r, k] = Kf[r, k]
+    return G
+
+
+@wp.func
+def rod_geometric_entry(G: mat63f, a: int, c: int) -> float:
+    """Entry ``(a, c)`` (``a <= c``) of the triplet's 11x11 tensile stretch geometric stiffness."""
+    if a == 3 or a == 7 or c == 3 or c == 7:
+        return 0.0
+    na, ka = a // 4, a % 4
+    nc, kc = c // 4, c % 4
+    if na == 0 and nc == 0:
+        return G[ka, kc]
+    if na == 0 and nc == 1:
+        return -G[ka, kc]
+    if na == 1 and nc == 1:
+        return G[ka, kc] + G[3 + ka, kc]
+    if na == 1 and nc == 2:
+        return -G[3 + ka, kc]
+    if na == 2 and nc == 2:
+        return G[3 + ka, kc]
+    return 0.0
 
 
 # -- frames and geometry ----------------------------------------------------------------------

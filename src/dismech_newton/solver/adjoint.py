@@ -90,12 +90,14 @@ class StepAdjoint:
             SimpleNamespace(blk=b, eps_prev=grad(b.count, b.k.vec), strain=grad(b.count, b.k.vec),
                             xs=grad(b.count, b.k.xvec), g=grad(b.count, b.k.xvec), params=grad(b.count, b.params.dtype),
                             xs_rows=grad((b.count, b.k.D), b.k.xvec), g_rows=grad((b.count, b.k.D), b.k.xvec),
-                            rest=grad(b.count, b.k.vec), mem=grad(b.count, b.k.vec) if b.memory else None)
+                            rest=grad(b.count, b.k.vec),
+                            stress=grad(b.count, b.k.vec), stress_zero=wp.zeros(b.count, dtype=b.k.vec, device=dev),
+                            mem=grad(b.count, b.k.vec) if b.memory else None)
             for b in s.elements if b.count
         ]
         self._intermediates = [self.q_star, self.q_pred, self.q, self.qd, self.edge_d1, self.ref_twist,
-                               *(a for e in self.elements for a in (e.eps_prev, e.strain, e.params, e.rest, e.mem)
-                                 if a is not None)]
+                               *(a for e in self.elements for a in (e.eps_prev, e.strain, e.params, e.rest, e.stress,
+                                 e.mem) if a is not None)]
         nd = s.num_node_dofs
         self._q_nodes = self.q[:nd].reshape((nd // 3, 3)).view(wp.vec3)
         self._rhs, self._lam = (wp.zeros(n, dtype=float, device=dev) for _ in range(2))
@@ -274,12 +276,13 @@ class StepAdjoint:
             blk, k = e.blk, e.blk.k
             v = _detached(blk.bind(state_in.dismech))
             wp.launch(k.gather, dim=blk.count, inputs=[_detached(self.q_star), v], outputs=[e.xs], device=dev)
-            params, rest = self._params(e, state_in, dt)
+            params, rest, stress = self._params(e, state_in, dt)
             wp.launch(_rows_kernel, dim=(blk.count, k.D), inputs=[e.xs], outputs=[e.xs_rows], device=dev)
             tape = wp.Tape()
             with tape:
                 wp.launch(k.forces_rows, dim=(blk.count, k.D),
-                          inputs=[e.xs_rows, v, _detached(params), _detached(rest), _detached(e.eps_prev), dt],
+                          inputs=[e.xs_rows, v, _detached(params), _detached(rest), _detached(e.eps_prev),
+                                  _detached(stress), 1.0 / dt],
                           outputs=[e.g_rows], device=dev)
             e.xs_rows.grad.zero_()
             wp.launch(_unit_kernel, dim=(blk.count * k.D, k.D), inputs=[k.D], outputs=[_flat(e.g_rows.grad)], device=dev)
@@ -297,10 +300,10 @@ class StepAdjoint:
 
     @staticmethod
     def _params(e, state_in: State, dt: float):
-        """The element's ``(params, rest)`` in the step (with Dahl: from ``state_in``'s stresses, on any tape)."""
+        """The element's ``(params, rest, stress)`` in the step (with Dahl/residual hooks, on any tape)."""
         if e.blk.effective is None:
-            return e.blk.params, e.blk.rest
-        return e.blk.effective(state_in.dismech, dt, e.params, e.rest)
+            return e.blk.params, e.blk.rest, e.stress_zero
+        return e.blk.effective(state_in.dismech, dt, e.params, e.rest, e.stress)
 
     def _residual(self, state_in: State, dt: float, contacts: "Slots | None") -> wp.Tape:
         """``r(q_star)`` on a tape, every input with its adjoint."""
@@ -325,8 +328,8 @@ class StepAdjoint:
                 e.xs.grad.zero_()
                 e.g.grad.zero_()
                 wp.launch(k.gather, dim=blk.count, inputs=[self.q_star, v], outputs=[e.xs], device=dev)
-                params, rest = self._params(e, state_in, dt)
-                wp.launch(k.forces, dim=blk.count, inputs=[e.xs, v, params, rest, e.eps_prev, dt],
+                params, rest, stress = self._params(e, state_in, dt)
+                wp.launch(k.forces, dim=blk.count, inputs=[e.xs, v, params, rest, e.eps_prev, stress, 1.0 / dt],
                           outputs=[e.g], device=dev)
                 wp.launch(k.scatter, dim=blk.count, inputs=[e.g, v, s.fixed], outputs=[self.residual], device=dev)
             if contacts is not None:
@@ -355,7 +358,7 @@ class StepAdjoint:
                               outputs=[wp.zeros_like(self.residual), anchors], device=dev, record_tape=False)
                     wp.launch(_lever_off_kernel, dim=n_c, inputs=[c.anchor, anchors], outputs=[off], device=dev,
                               record_tape=False)
-                if s.residual is not None and s.residual.contact is not None:
+                if s.residual is not None and getattr(s.residual, "contact", None) is not None:
                     bqd = (state_in.body_qd if state_in.body_qd is not None and state_in.body_qd.shape[0] > 0
                            else src.bodies.body_qd)
                     c_res = Slots()

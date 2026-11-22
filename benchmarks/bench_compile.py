@@ -10,7 +10,7 @@ import pytest
 import warp as wp
 from conftest import count_dismech_modules
 
-from dismech_newton import ContactResidual, Residual, RodResidual, ShellResidual, SolverDiSMech, flatten_state
+from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton.coupling import SolverCoupledProxy
 
 
@@ -100,7 +100,7 @@ print(f"COLD_MODULES={mods}")
     benchmark.extra_info["compiled_modules"] = captured["modules"]
 
 
-@pytest.mark.parametrize("kind", ["rod", "shell", "contact", "coupled", "residual"])
+@pytest.mark.parametrize("kind", ["rod", "shell", "contact", "coupled", "dahl"])
 def test_compile_warm(benchmark, device, needs_cuda, kind: str):
     """Warm solver construction, sparse analysis, and first step timing plus active ``wp.Module`` count."""
     if kind == "coupled":
@@ -115,37 +115,26 @@ def test_compile_warm(benchmark, device, needs_cuda, kind: str):
     else:
         if kind == "shell":
             m = _build_shell().finalize(device=device)
-            res = None
             sc = False
         elif kind == "rod":
             m = _build_rod().finalize(device=device)
-            res = None
             sc = False
         elif kind == "contact":
             m = _build_rod().finalize(device=device)
-            res = None
             sc = True
         else:
-            b = _build_rod()
-            from utils.common import grid  # noqa: PLC0415
-
-            v, f = grid(3, 3, 0.2, 0.2)
-            v[:, 2] = 0.04
-            SolverDiSMech.add_cloth_mesh(b, vertices=v.tolist(), indices=f.ravel().tolist(), density=1.0,
-                                         tri_ke=1.0e3, tri_ka=1.0e3, bend_stiffness=0.05)
+            b = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+            b.add_ground_plane()
+            rod = newton.Rod.create_straight((0.0, 0.0, 0.02), (1.0, 0.0, 0.0), 0.2, segment_count=4, radius=0.01)
+            SolverDiSMech.add_rod(b, rod=rod, dahl_eps_max=0.02, dahl_tau=0.05)
             m = b.finalize(device=device)
-            res = Residual(
-                rod=RodResidual(rff_dim=16),
-                shell=ShellResidual(rff_dim=16),
-                contact=ContactResidual(rff_dim=16, num_materials=2),
-            )
             sc = True
         s0, s1 = m.state(), m.state()
         flatten_state(s0)
         flatten_state(s1)
 
         def _instantiate_and_step():
-            s = SolverDiSMech(m, self_contact=sc, residual=res)
+            s = SolverDiSMech(m, self_contact=sc)
             s.step(s0, s1, None, None, 5.0e-3)
             wp.synchronize()
 

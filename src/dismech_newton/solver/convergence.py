@@ -7,7 +7,7 @@ from ..dofs import Dofs, _external
 from ..worlds import Worlds
 from .linesearch import SOLVER_MODULE
 
-_NET, _LOAD, _FLOOR, _ANCHOR2, _N = 0, 3, 4, 5, 6  # a world's net force (3), load, floor, anchor floor²
+_NET, _LOAD, _FLOOR, _ANCHOR2, _B2, _N = 0, 3, 4, 5, 6, 7  # a world's net force (3), load, floor, anchor floor², |b|²
 
 
 @wp.kernel(module=SOLVER_MODULE)
@@ -36,18 +36,63 @@ def _unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: 
     if f.fixed[i] != 0 and f.fixed[i + 1] != 0 and f.fixed[i + 2] != 0:
         return
     w = wd.of[i]
+    if wd.active[w] == 0:
+        return
     r = wp.vec3(q[i] - q_pred[i], q[i + 1] - q_pred[i + 1], q[i + 2] - q_pred[i + 2])
     ext = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
     k = f.mass[i] * f.inv_dt2
     o = _N * w
     for c in range(3):
         wp.atomic_add(net, o + _NET + c, b[i + c])
+        wp.atomic_add(net, o + _B2, b[i + c] * b[i + c])
     x = wp.vec3(q[i], q[i + 1], q[i + 2])
     wp.atomic_add(net, o + _LOAD, wp.float64(load[i] + k * wp.length(r) + wp.length(ext)))
     a = wp.vec3(anchor[i], anchor[i + 1], anchor[i + 2])
     s = EPS32 * wp.length(a) * wp.length(x)
     wp.atomic_add(net, o + _ANCHOR2, wp.float64(s * s))
     wp.atomic_add(net, o + _FLOOR, wp.float64(k * ulp * (wp.length(x) + wp.length(r))))
+
+
+@wp.kernel(module=SOLVER_MODULE)
+def _dof_unbalanced_kernel(q: wp.array[float], q_pred: wp.array[float], f: Dofs, b: wp.array[wp.float64],
+                           indptr: wp.array[wp.int32], vals: wp.array[wp.float64], wd: Worlds, num_state_dofs: int,
+                           tolerance: float, ulp: float, net: wp.array[wp.float64], unbalanced: wp.array[float]):
+    """Contact-free per-node and scalar-DOF force balance against inertia/external load and float32 floor."""
+    tid = wp.tid()
+    num_nodes = f.num_node_dofs // 3
+    if tid < num_nodes:
+        i = 3 * tid
+        if f.fixed[i] != 0 and f.fixed[i + 1] != 0 and f.fixed[i + 2] != 0:
+            return
+        w = wd.of[i]
+        if wd.active[w] == 0:
+            return
+        b_n = wp.vec3(float(b[i]), float(b[i + 1]), float(b[i + 2]))
+        r_n = wp.vec3(q[i] - q_pred[i], q[i + 1] - q_pred[i + 1], q[i + 2] - q_pred[i + 2])
+        x_n = wp.vec3(q[i], q[i + 1], q[i + 2])
+        ext_n = wp.vec3(_external(f, i), _external(f, i + 1), _external(f, i + 2))
+        a_tr = float(0.0)
+        for c in range(3):
+            if f.fixed[i + c] == 0:
+                a_tr = a_tr + float(vals[indptr[i + c]])
+        k_m = f.mass[i] * f.inv_dt2
+        load_n = k_m * wp.length(r_n) + wp.length(ext_n)
+        fl_n = a_tr * EPS32 * wp.max(wp.length(x_n), 1.0e-3) + k_m * ulp * (wp.length(x_n) + wp.length(r_n))
+        wp.atomic_max(unbalanced, w, wp.length(b_n) / (tolerance * load_n + fl_n + 1.0e-30))
+        return
+    i = f.num_node_dofs + (tid - num_nodes)
+    if i >= num_state_dofs or f.fixed[i] != 0:
+        return
+    w = wd.of[i]
+    if wd.active[w] == 0:
+        return
+    wp.atomic_add(net, _N * w + _B2, b[i] * b[i])
+    k_m = f.mass[i] * f.inv_dt2
+    a_i = float(vals[indptr[i]])
+    r_i = wp.abs(q[i] - q_pred[i])
+    x_i = wp.abs(q[i])
+    fl_i = a_i * EPS32 * wp.max(x_i, 1.0) + k_m * ulp * (x_i + r_i)
+    wp.atomic_max(unbalanced, w, wp.abs(float(b[i])) / (tolerance * k_m * r_i + fl_i + 1.0e-30))
 
 
 @wp.kernel(module=SOLVER_MODULE)
@@ -63,12 +108,17 @@ def _arm_unbalanced_kernel(b: wp.array[wp.float64], load: wp.array[float], floor
 
 
 @wp.kernel(module=SOLVER_MODULE)
-def _net_kernel(net: wp.array[wp.float64], tolerance: float, unbalanced: wp.array[float]):
+def _net_kernel(net: wp.array[wp.float64], tolerance: float, wd: Worlds, unbalanced: wp.array[float],
+                residual_norm: wp.array[float]):
     """Per world, the nodes' net force against ``tolerance`` of their loads (plus float32's floor)."""
-    o = _N * wp.tid()
+    w = wp.tid()
+    if wd.active[w] == 0:
+        return
+    o = _N * w
     u = wp.sqrt(net[o] * net[o] + net[o + 1] * net[o + 1] + net[o + 2] * net[o + 2])
     tol = wp.float64(tolerance) * net[o + _LOAD] + net[o + _FLOOR] + wp.sqrt(net[o + _ANCHOR2]) + wp.float64(1.0e-30)
-    unbalanced[wp.tid()] = wp.max(unbalanced[wp.tid()], float(u / tol))
+    unbalanced[w] = wp.max(unbalanced[w], float(u / tol))
+    residual_norm[w] = float(wp.sqrt(net[o + _B2]))
 
 
 @wp.kernel(module=SOLVER_MODULE)

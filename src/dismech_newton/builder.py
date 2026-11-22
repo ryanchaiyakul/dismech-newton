@@ -140,7 +140,7 @@ def add_rod(
     kinematic capsule per segment, posed every step (rendering). ``collide``: the
     rod takes part in the solver's contacts (:mod:`.collide`), its friction ``cfg.mu`` (without ``cfg``, 0.3); its
     capsules are in :data:`ROD_GROUP`, so no Newton pipeline pairs them. ``dahl_eps_max``, ``dahl_tau``
-    (both > 0): Newton's Dahl hysteresis on bending and twist (:func:`.residuals.newton.dahl.dahl_advance`).
+    (both > 0): Newton's Dahl hysteresis on bending and twist (:func:`.elements.dahl.dahl_advance`).
     """
     points, edges, frames = rod._normalize_and_validate_geometry()
     if collide and not proxies:

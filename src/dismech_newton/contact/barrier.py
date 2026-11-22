@@ -148,15 +148,16 @@ class BarrierBlock:
                       outputs=[getattr(out, name)], device=self.device)
         return out
 
-    def update(self, q: wp.array, tol: float, dq_max: wp.array, pick: wp.array, go: wp.array, mask: wp.array) -> None:
+    def update(self, q: wp.array, tol: float, dq_max: wp.array, stalled: wp.array, go: wp.array,
+               mask: wp.array) -> None:
         """At a converged ``q``: each pair's multiplier, the force its barrier holds there beyond what it holds at
         its thickness (kept by key for the next detection and step); if one moves its pair's rest by more than
-        ``tol``, the solve converged (its last Newton step ``dq_max`` within ``tol`` and taken: not stalled) and the
+        ``tol``, the solve converged (its last Newton step ``dq_max`` within ``tol`` and not stalled) and the
         step has updates left, the pairs take them and ``go`` is set: the solve goes on. Per world, in the worlds of
         ``mask``; ``go[num_worlds]``: any world goes on."""
         self.moved.zero_()
         self._launch(_uzawa_kernel, [q, self.s, self.arm, mask, tol, self.lam, self.moved])
-        wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, pick, tol, self.num_worlds,
+        wp.launch(_again_kernel, dim=self.num_worlds, inputs=[dq_max, stalled, tol, self.num_worlds,
                   mask, self.left, self.moved, go], device=self.device)
         self._launch(_apply_kernel, [self.moved, self.lam, self.s])
 
@@ -785,13 +786,13 @@ def _keep_kernel(s: Slots, lam: wp.array[float]):
 
 
 @wp.kernel
-def _again_kernel(dq_max: wp.array[float], pick: wp.array[wp.int32], tol: float, count: int,
+def _again_kernel(dq_max: wp.array[float], stalled: wp.array[wp.int32], tol: float, count: int,
                   mask: wp.array[wp.int32], left: wp.array[wp.int32], moved: wp.array[wp.int32],
                   go: wp.array[wp.int32]):
     """Per world of ``mask``: ``moved`` kept only if its solve converged and its step has updates left (one spent);
     its solve goes on if so. ``moved[count]`` (zero before), ``go[count]``: in any world."""
     w = wp.tid()
-    if mask[w] != 0 and moved[w] != 0 and dq_max[w] <= tol and pick[w] != 0 and left[w] > 0:
+    if mask[w] != 0 and moved[w] != 0 and dq_max[w] <= tol and stalled[w] == 0 and left[w] > 0:
         left[w] = left[w] - 1
         go[w] = 1
         moved[count] = 1

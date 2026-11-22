@@ -1,6 +1,7 @@
 """Generic element block, 5D DER rods, and 6D midedge BAC shells."""
 
 from .block import ElementBlock, element_kernels, rest_strains
+from .dahl import Dahl, dahl_advance
 from .rod import (
     Rod,
     Rods,
@@ -10,13 +11,25 @@ from .rod import (
     pose_proxies_kernel,
     proxy_joints,
     rod_dofs,
+    rod_geometric,
+    rod_geometric_entry,
     rod_jacobian,
     rod_strain,
     rod_strain_rate,
 )
-from .shell import Shell, Shells, shell_dofs, shell_jacobian, shell_strain, shell_strain_rate
+from .shell import (
+    Shell,
+    Shells,
+    shell_dofs,
+    shell_geometric,
+    shell_geometric_entry,
+    shell_jacobian,
+    shell_strain,
+    shell_strain_rate,
+)
 
 __all__ = [
+    "Dahl",
     "ElementBlock",
     "Rod",
     "Rods",
@@ -24,16 +37,21 @@ __all__ = [
     "Shells",
     "advance_frames_kernel",
     "advance_ref_twist_kernel",
+    "dahl_advance",
     "element_kernels",
     "material_frame",
     "pose_proxies_kernel",
     "proxy_joints",
     "rest_strains",
     "rod_dofs",
+    "rod_geometric",
+    "rod_geometric_entry",
     "rod_jacobian",
     "rod_strain",
     "rod_strain_rate",
     "shell_dofs",
+    "shell_geometric",
+    "shell_geometric_entry",
     "shell_jacobian",
     "shell_strain",
     "shell_strain_rate",

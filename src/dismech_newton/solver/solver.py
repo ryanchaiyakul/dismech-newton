@@ -2,6 +2,7 @@ import logging
 import re
 import sys
 from functools import partial
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -10,7 +11,7 @@ from newton.solvers import SolverBase
 from newton.solvers.experimental.coupled import CouplingInterface
 
 from ..builder import add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
-from ..constants import CARRIED, LINESEARCH, NEST, TOLERANCE, ULP
+from ..constants import CARRIED, LINESEARCH, NEST, OBJECTIVE_NOISE, TOLERANCE, ULP
 from ..constants import PCG_SWEEPS as CG
 from ..contact import BarrierBlock, Offset, make_arm
 from ..coupling import ProxyArm, ProxyPins
@@ -27,6 +28,7 @@ from ..dofs import (
     suspended_tape,
 )
 from ..elements import (
+    Dahl,
     ElementBlock,
     Rods,
     Shells,
@@ -35,13 +37,13 @@ from ..elements import (
     pose_proxies_kernel,
     proxy_joints,
 )
-from ..residuals import ContactResidual, Dahl, JointResidual, Memory, Residual, RodResidual, ShellResidual
 from ..worlds import Worlds, dof_worlds, masked_copy_kernel
 from .convergence import (
     _N,
     _activate_kernel,
     _arm_unbalanced_kernel,
     _count_kernel,
+    _dof_unbalanced_kernel,
     _go_kernel,
     _hinge_size_kernel,
     _net_kernel,
@@ -156,9 +158,14 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self_contact: bool = True,
         theta: float = 1.0,
         refactor: bool = True,
-        residual: Residual | RodResidual | ShellResidual | JointResidual | ContactResidual | Memory | None = None,
+        residual=None,
+        dahl: Dahl | None = None,
         tolerance: float | None = None,
         ulp: float | None = None,
+        objective_noise: float | None = None,
+        rod_geometric: bool = True,
+        rod_material=None,
+        shell_material=None,
     ):
         super().__init__(model)
         if not 0.5 <= theta <= 1.0:
@@ -171,6 +178,10 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         default_ulp = getattr(pkg, "ULP", ULP)
         self.tolerance = float(default_tol if tolerance is None else tolerance)  # (tests may monkeypatch solver.TOLERANCE)
         self.ulp = float(default_ulp if ulp is None else ulp)
+        noise = OBJECTIVE_NOISE if objective_noise is None else float(objective_noise)
+        if noise < 0.0:
+            raise ValueError(f"objective_noise must be non-negative, got {noise}")
+        self.objective_noise = float(noise)
         self.num_candidates = nc = LINESEARCH + 1  # candidate 0: the current iterate
         dev = self.device
         self.der = d = model.dismech
@@ -194,7 +205,9 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._has_proxies = bool((d.edge_body.numpy() >= 0).any())
         self._edge_joint = wp.array(proxy_joints(model), dtype=wp.vec2i, device=dev)
 
-        types = self.triplets, self.shells = Rods(model), Shells(model, self.num_node_dofs + d.edge_length.shape[0])
+        self.triplets = Rods(model, geometric=rod_geometric, material=rod_material)
+        self.shells = Shells(model, self.num_node_dofs + d.edge_length.shape[0], material=shell_material)
+        types = self.triplets, self.shells
         node0, node1 = d.edge_node0.numpy().astype(np.int64), d.edge_node1.numpy().astype(np.int64)
         edge_dofs = np.column_stack([3 * node0 + k for k in range(3)] + [3 * node1 + k for k in range(3)])
         stencils = [edge_dofs, *(t.dofs() for t in types)]  # an edge's nodes: its contacts
@@ -215,28 +228,42 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                 rows[name] = of[t.dofs()[:, 0]] if t.count else []
         self._rows = {k: wp.array(v, dtype=wp.int32, device=dev) for k, v in rows.items() if len(v)}
         self._rest = self._scratch = None  # a masked reset's: the model's state, and the reset worlds' carried
-        residual = Residual.coerce(residual, rod_count=self.triplets.count, shell_count=self.shells.count)
         model_dahl = Dahl.from_model(model) if self.triplets.count else None
-        if model_dahl is not None:
-            if residual is not None and residual.rod_memory is not None:
-                raise ValueError("Cannot combine model Dahl hysteresis with another rod_memory residual")
-            if residual is None:
-                residual = Residual(rod_memory=model_dahl)
-            else:
-                residual = Residual(
-                    rod=residual.rod,
-                    shell=residual.shell,
-                    rod_memory=model_dahl,
-                    shell_memory=residual.shell_memory,
-                    joint=residual.joint,
-                    contact=residual.contact,
+        if model_dahl is not None and dahl is not None:
+            raise ValueError("Cannot combine model Dahl hysteresis with an explicit dahl instance")
+        self.dahl = model_dahl if dahl is None else dahl
+        if residual is not None and hasattr(residual, "bind"):
+            if any(hasattr(residual, a) for a in ("eval_rod", "eval_shell", "has_rod", "has_shell")):
+                residual = residual.bind(model, self.triplets, self.shells, device=dev)
+            elif hasattr(residual, "apply_contact"):
+                c_res = residual.bind(model, device=dev)
+                residual = SimpleNamespace(
+                    has_rod=False, has_shell=False, has_rod_memory=False, has_shell_memory=False,
+                    contact=c_res, joint=None, grad_inputs=lambda: list(getattr(c_res, "params", ())),
                 )
-        self.residual = residual.bind(model, self.triplets, self.shells, device=dev) if residual is not None else None
-        self.joint_residual = self.residual.joint if self.residual is not None else None
+            elif hasattr(residual, "apply"):
+                j_res = residual.bind(model, device=dev)
+                residual = SimpleNamespace(
+                    has_rod=False, has_shell=False, has_rod_memory=False, has_shell_memory=False,
+                    contact=None, joint=j_res, grad_inputs=lambda: list(getattr(j_res, "params", ())),
+                )
+            else:
+                residual = residual.bind(model, self.triplets, self.shells, device=dev)
+        if self.dahl is not None and residual is not None and getattr(residual, "has_rod_memory", False):
+            raise ValueError("Cannot combine Dahl hysteresis with another rod_memory residual")
+        self.residual = residual
+        self.joint_residual = getattr(residual, "joint", None) if residual is not None else None
+        if self.dahl is not None:
+            if self.triplets.count:
+                self.dahl = self.dahl.bind(model, self.triplets, device=dev)
+                self.triplets.bind_dahl(self.dahl)
+            elif self.shells.count:
+                self.dahl = self.dahl.bind(model, self.shells, device=dev)
+                self.shells.bind_dahl(self.dahl)
         if self.residual is not None:
-            if self.residual.has_rod:
+            if getattr(self.residual, "has_rod", False):
                 self.triplets.bind_residual(self.residual)
-            if self.residual.has_shell:
+            if getattr(self.residual, "has_shell", False):
                 self.shells.bind_residual(self.residual)
         self.elements = tuple(
             ElementBlock(t, slots=self.A.slots(t.dofs()), fixed=self.fixed, num_candidates=nc) for t in types
@@ -248,7 +275,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         source = Offset(model, self.fixed, self_contact=self_contact, world=of)
         self.contact = BarrierBlock(model, self.fixed, source, of, nc)
         if self.residual is not None:
-            self.contact.residual = self.residual.contact
+            self.contact.residual = getattr(self.residual, "contact", None)
         if k:
             self.contact.arm = make_arm(model, source.shape_key0, n0, k)
             arm.bind(self.contact.arm)
@@ -290,6 +317,7 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._cgs = wp.zeros(W * _S, dtype=wp.float64, device=dev)
         self._cg_go = wp.zeros(1, dtype=wp.int32, device=dev)
         self.counts = wp.zeros(3, dtype=wp.int32, device=dev)  # steps ended unconverged (budget spent), stalled, failed
+        self.residual_norm = wp.zeros(W, dtype=float, device=dev)  # per-world Euclidean force-balance residual norm
         # the last step's contact forces on Newton's bodies (body_f layout): what a rigid solver couples back
         self.body_reaction = wp.zeros(max(model.body_count, 1), dtype=wp.spatial_vector, device=dev)
         # a coupler's next input carries on from these (see below): the last step's output, once there is one
@@ -356,9 +384,10 @@ class SolverDiSMech(SolverBase, CouplingInterface):
             self.model.particle_mass,
             self.der.edge_inertia,
             *(a for e in self.elements for a in (e.params, e.rest)),
-            *(self.residual.grad_inputs() if self.residual is not None else ()),
+            *(self.dahl.params if self.dahl is not None else ()),
+            *(self.residual.grad_inputs() if self.residual is not None and hasattr(self.residual, "grad_inputs") else ()),
         ]
-        if self.residual is not None and self.residual.contact is not None and self._proxy_arm is None:
+        if self.residual is not None and getattr(self.residual, "contact", None) is not None and self._proxy_arm is None:
             inputs += [state_in.body_q, state_in.body_qd]
         arm = None
         if self._proxy_arm is not None:  # the proxies' step, held for its adjoint
@@ -525,9 +554,11 @@ class SolverDiSMech(SolverBase, CouplingInterface):
         self._go.fill_(1)
         def iteration(it):
             self._room = it < self.iterations - 2  # a multiplier update leaves the solve an iteration
-            if it == 0 or (self.exact and self.cap == 0.0):  # the chord matrix at the prediction (every iterate:
-                self._assemble(q, f)  # Gauss-Newton)
+            if it == 0:  # the chord matrix at the prediction
+                self._assemble(q, f)
                 self._linear.invalidate()
+            elif self.exact and self.cap == 0.0:  # Gauss-Newton (inside wp.capture_if)
+                self._refactor(q, f)
             elif self.cap > 0.0 and self.refactor:  # the barrier's: at the iterate while a contact touches
                 wp.launch(_refresh_kernel, dim=1, inputs=[self._go[W:], self.contact.touching, int(self.exact)],
                           outputs=[self._refresh], device=dev)
@@ -546,34 +577,37 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                 else:
                     wp.capture_if(self._go[W:], on_true=partial(chain, a, min(a + NEST, stop)))
 
-        if self.cap == 0.0:
-            for it in range(self.iterations):
-                iteration(it)
-        else:
-            chains(0, self.iterations, True)
+        chains(0, self.iterations, True)
         self.contact.end_step()
-        if self.cap > 0.0:
-            wp.launch(_count_kernel, dim=W, inputs=[self._go, self._stalled, self._failed, self.counts], device=dev)
+        wp.launch(_count_kernel, dim=W, inputs=[self._go, self._stalled, self._failed, self.counts], device=dev)
 
     def _iterate(self, state_in: State, q: wp.array, f, fresh_a: bool = True) -> None:
         wp.launch(_activate_kernel, dim=self.num_worlds, inputs=[self._go], outputs=[self.worlds.active],
                   device=self.device)
         self._dof(q, f)
-        if self.cap > 0.0:  # the force balance at q: |b| within tolerance of the loads, or below float32's reach
-            self._load.zero_()
-            self._net.zero_()
-            self._unbalanced.zero_()
+        self._load.zero_()
+        self._net.zero_()
+        self._unbalanced.zero_()
+        if self.cap > 0.0:
             self.contact.load(q, self._load, self._floor, self.ulp)
-            wp.launch(_unbalanced_kernel, dim=self.model.particle_count, inputs=[q, self.q_pred, f, self._b,
-                      self._load, self._anchor, self.worlds, self.ulp], outputs=[self._net], device=self.device)
+        wp.launch(_unbalanced_kernel, dim=self.model.particle_count, inputs=[q, self.q_pred, f, self._b,
+                  self._load, self._anchor, self.worlds, self.ulp], outputs=[self._net], device=self.device)
+        if self.cap == 0.0:
+            dim = self.model.particle_count + (self.num_state_dofs - self.num_node_dofs)
+            if dim > 0:
+                wp.launch(_dof_unbalanced_kernel, dim=dim,
+                          inputs=[q, self.q_pred, f, self._b, self.A.indptr, self.A.vals, self.worlds,
+                                  self.num_state_dofs, self.tolerance, self.ulp],
+                          outputs=[self._net, self._unbalanced], device=self.device)
+        else:
             a = self.contact.arm
             if a.k:
                 wp.launch(_arm_unbalanced_kernel, dim=(a.M.shape[0], a.k // 6),
                           inputs=[self._b, self._load, self._floor, a.start, a.k, self.tolerance],
                           outputs=[self._unbalanced],
                           device=self.device)
-            wp.launch(_net_kernel, dim=self.num_worlds, inputs=[self._net, self.tolerance], outputs=[self._unbalanced],
-                      device=self.device)
+        wp.launch(_net_kernel, dim=self.num_worlds, inputs=[self._net, self.tolerance, self.worlds],
+                  outputs=[self._unbalanced, self.residual_norm], device=self.device)
         self._linear.solve(self._b, self._dq)
         if self.contact.count and CG and fresh_a:
             wp.capture_if(self.contact.two_sided, on_true=partial(self._pcg, q))
@@ -639,7 +673,8 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                   outputs=[self._q_cand, b, self._energy, self._slope], device=dev)
         for blk in self.blocks:
             blk.energy(self._q_cand, self._energy)
-        wp.launch(_pick_kernel, dim=n, inputs=[self._energy, self._slope, wd, self._q_cand],
+        self._pick.zero_()
+        wp.launch(_pick_kernel, dim=n, inputs=[self._energy, self._slope, wd, self._q_cand, self.objective_noise],
                   outputs=[q, self._pick], device=dev)
         wp.launch(_nonfinite_kernel, dim=n, inputs=[self._dq, wd], outputs=[q, self._failed], device=dev)
         if self.cap > 0.0:
@@ -658,14 +693,14 @@ class SolverDiSMech(SolverBase, CouplingInterface):
                           inputs=[self._dq, self.shells.view.hinge_offset, h, wd], outputs=[self._dq_max], device=dev)
             self.contact.newton_size(q, self._dq, self.cap, self._dq_max)
             wp.capture_if(self._moved[W:], on_true=partial(self._detect, state_in, q))
-            self._go[W:].zero_()
-            self._settle[W:].zero_()
-            wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._unbalanced, self._pick, self._moved, self._failed,
-                                                 self._tol, wd],
-                      outputs=[self._go, self._stalled, self._settle], device=dev)
-            if self._room:  # converged: the multipliers updated, and on if one moved
-                wp.capture_if(self._settle[W:], on_true=partial(self.contact.update, q, self._tol, self._dq_max,
-                                                                self._pick, self._go, self._settle))
+        self._go[W:].zero_()
+        self._settle[W:].zero_()
+        wp.launch(_go_kernel, dim=W, inputs=[self._dq_max, self._unbalanced, self._pick, self._moved, self._failed,
+                                             self._tol, wd],
+                  outputs=[self._go, self._stalled, self._settle], device=dev)
+        if self.cap > 0.0 and self._room:  # converged: the multipliers updated, and on if one moved
+            wp.capture_if(self._settle[W:], on_true=partial(self.contact.update, q, self._tol, self._dq_max,
+                                                            self._stalled, self._go, self._settle))
         for blk in self.blocks:
             blk.commit(q, self._pick, b)
 

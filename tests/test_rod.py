@@ -6,11 +6,13 @@ import newton
 import numpy as np
 import pytest
 import warp as wp
-from fd import assert_close
+from fd import assert_close, assert_derivative, jacobian
 from rollouts import energies, simulate
+from scipy.sparse import csr_matrix
 
-from dismech_newton import SolverDiSMech, flatten_state
+from dismech_newton import Dahl, SolverDiSMech, flatten_state
 from dismech_newton.builder import vec5f
+from dismech_newton.dofs import bind_dofs
 from dismech_newton.elements.rod import Rod, mat5x11f, rod_jacobian, rod_strain, vec5i, vec11f
 
 
@@ -342,3 +344,215 @@ def test_nonlinear_elastica_cantilever(alpha):
     sag, shorten = -float(tip[2]), float(L - tip[0])
     assert abs(sag / z_exact - 1.0) < 0.02, (sag, z_exact)
     assert abs(shorten / (L_eff - x_exact) - 1.0) < 0.02, (shorten, L_eff - x_exact)
+
+
+@wp.kernel
+def _dahl_loss_kernel(q: wp.array[float], w: wp.array[float], out: wp.array[float]):
+    i = wp.tid()
+    wp.atomic_add(out, 0, q[i] * w[i])
+
+
+def test_dahl_zero_stiffness_and_explicit_api(rng):
+    """Explicit ``SolverDiSMech(..., dahl=Dahl(...))``: 1) matches model-attribute Dahl bit-for-bit and rejects
+    combining both; 2) injects ``sigma_dahl`` directly on ``k_bend == 0`` channels instead of dividing by ``k == 0``;
+    3) differentiates explicit ``dahl.eps_max`` / ``dahl.tau`` accurately against finite differences."""
+    eps_max, tau, dt = 0.1, 0.05, 5.0e-4
+    force = 2.5 * np.sin(np.linspace(0.0, 2.0 * np.pi, 40))
+
+    b_attr = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.2, segment_count=2, radius=0.01)
+    SolverDiSMech.add_rod(b_attr, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), bend_stiffness=1.0,
+                          collide=False, proxies=False, dahl_eps_max=eps_max, dahl_tau=tau)
+    SolverDiSMech.fix_segment(b_attr, edge=0)
+    m_attr = b_attr.finalize()
+    with pytest.raises(ValueError, match="Cannot combine"):
+        SolverDiSMech(m_attr, dahl=Dahl(eps_max=eps_max, tau=tau), self_contact=False)
+
+    b_exp = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    SolverDiSMech.add_rod(b_exp, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), bend_stiffness=1.0,
+                          collide=False, proxies=False)
+    SolverDiSMech.fix_segment(b_exp, edge=0)
+    m_exp = b_exp.finalize()
+    sol_exp = SolverDiSMech(m_exp, dahl=Dahl(eps_max=eps_max, tau=tau), self_contact=False)
+    s0, s1 = m_exp.state(), m_exp.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    f_arr, out_exp = wp.array(force, dtype=float), wp.zeros(len(force), dtype=float)
+    for i in range(len(force)):
+        wp.launch(_tip_force, dim=1, inputs=[f_arr, i], outputs=[s0.particle_f])
+        sol_exp.step(s0, s1, None, None, dt)
+        s0, s1 = s1, s0
+        wp.launch(_record_kappa, dim=1, inputs=[s0.dismech.triplet_strain_q, i], outputs=[out_exp])
+    np.testing.assert_allclose(out_exp.numpy(), _dahl_cycle(eps_max, tau, force, dt), rtol=0.0, atol=1.0e-6)
+
+    # Zero elastic stiffness on bend channel + nonzero carried Dahl stress: direct injection must NOT vanish
+    b_zero = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    SolverDiSMech.add_rod(b_zero, rod=rod, cfg=newton.ModelBuilder.ShapeConfig(density=1.0), stretch_stiffness=1.0e3,
+                          bend_stiffness=0.0, twist_stiffness=1.0, collide=False, proxies=False)
+    SolverDiSMech.fix_segment(b_zero, edge=0)
+    m_zero = b_zero.finalize()
+    sol_zero = SolverDiSMech(m_zero, dahl=Dahl(eps_max=eps_max, tau=tau), self_contact=False)
+    sz = m_zero.state()
+    flatten_state(sz)
+    q_z = sz.dismech.q.numpy()
+    q_z[8] += 0.01  # deflect tip slightly
+    sz.dismech.q.assign(q_z)
+    mem = np.zeros((1, 5), dtype=np.float32)
+    mem[0, 2] = 0.25
+    sz.dismech.triplet_mem_q.assign(mem)
+    blk = sol_zero.elements[0]
+    blk.begin_step(sz, 0.01, exact=True)
+    b_vec = wp.zeros(sol_zero.num_dofs, dtype=wp.float64)
+    blk.grad(sz.dismech.q, b_vec)
+    g_zero = b_vec.numpy()
+    assert abs(g_zero[8]) > 0.5, g_zero
+    dir_z = np.zeros_like(q_z)
+    dir_z[sol_zero.fixed.numpy() == 0] = rng.normal(size=int((sol_zero.fixed.numpy() == 0).sum()))
+    qc = wp.array(np.stack([(q_z + 1.0e-4 * dir_z).astype(np.float32),
+                            (q_z - 1.0e-4 * dir_z).astype(np.float32)]), dtype=float)
+    en = wp.zeros(sol_zero.num_candidates, dtype=wp.float64)
+    blk.energy(qc, en)
+    fd_z = float(en.numpy()[0] - en.numpy()[1]) / 2.0e-4
+    assert abs(float(g_zero @ dir_z) - fd_z) < 2.0e-3 * abs(fd_z)
+
+    # Explicit Dahl parameter gradients wrt (eps_max, tau) vs Richardson FD over a 2-step rollout
+    b_fd = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    r_fd = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.4, segment_count=4, radius=0.008)
+    SolverDiSMech.add_rod(b_fd, rod=r_fd, cfg=newton.ModelBuilder.ShapeConfig(density=500.0),
+                          stretch_stiffness=5.0e3, bend_stiffness=0.5, twist_stiffness=0.5, collide=False, proxies=False)
+    SolverDiSMech.fix_segment(b_fd, edge=0)
+    m_fd = b_fd.finalize()
+    dahl_fd = Dahl(eps_max=0.1, tau=0.05)
+    sol_fd = SolverDiSMech(m_fd, exact=True, iterations=30, self_contact=False, dahl=dahl_fd, tolerance=1.0e-5)
+    w_np = rng.normal(size=sol_fd.num_dofs).astype(np.float32)
+    w_wp = wp.array(w_np, dtype=float)
+    s_init = [m_fd.state(requires_grad=True) for _ in range(3)]
+    for s in s_init:
+        flatten_state(s)
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+        sol_fd.step(s_init[0], s_init[1], None, None, 0.01)
+        sol_fd.step(s_init[1], s_init[2], None, None, 0.01)
+        wp.launch(_dahl_loss_kernel, dim=w_np.size, inputs=[s_init[2].dismech.q, w_wp], outputs=[loss])
+    tape.backward(loss)
+    adj_grads = np.array([float(dahl_fd.eps_max_arr.grad.numpy()[0]), float(dahl_fd.tau_arr.grad.numpy()[0])])
+
+    def eval_dahl_params(X):
+        out = []
+        for de, dt_v in X:
+            dahl_fd.eps_max_arr.assign([float(0.1 + de)])
+            dahl_fd.tau_arr.assign([float(0.05 + dt_v)])
+            a, b_s, c_s = m_fd.state(), m_fd.state(), m_fd.state()
+            for s in (a, b_s, c_s):
+                flatten_state(s)
+            sol_fd.step(a, b_s, None, None, 0.01)
+            sol_fd.step(b_s, c_s, None, None, 0.01)
+            out.append([float(c_s.dismech.q.numpy().astype(np.float64) @ w_np.astype(np.float64))])
+        return np.array(out)
+
+    fd_j, est_j = jacobian(eval_dahl_params, np.zeros(2), np.array([1.0e-4, 1.0e-4]), error=True)
+    for k, name in enumerate(("dahl.eps_max", "dahl.tau")):
+        assert_derivative(float(adj_grads[k]), float(fd_j[0, k]), float(est_j[0, k]), 5.0e-3, name=name)
+
+
+def test_rod_geometric_hessian_and_taut_string():
+    """1) ``rod_geometric=True`` matches exact stretch geometric stiffness on tensioned edges (zero under compression)
+    and stays PSD; 2) converges cleanly on a clamped-clamped taut string matching ``-F L / (4 T)``."""
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    pts = np.array([[0.0, 0.0, 0.0], [0.1, 0.02, -0.01], [0.22, -0.01, 0.03]], dtype=np.float32)
+    SolverDiSMech.add_rod(b, rod=newton.Rod(pts, radius=0.005), stretch_stiffness=1.0e4, bend_stiffness=1.0e-2,
+                          twist_stiffness=1.0e-2, collide=False, proxies=False)
+    m = b.finalize()
+    sol0 = SolverDiSMech(m, exact=True, self_contact=False, rod_geometric=False)
+    sol1 = SolverDiSMech(m, exact=True, self_contact=False, rod_geometric=True)
+
+    def assemble_blk(sol, state):
+        bind_dofs(sol.dofs, m, sol.mass, sol.fixed, sol._no_force, state, 1.0)
+        for e in sol.elements:
+            e.begin_step(state, 1.0, True)
+        sol.A.vals.zero_()
+        sol._anchor.zero_()
+        sol.elements[0].assemble(state.dismech.q, sol.A)
+        M = csr_matrix((sol.A.vals.numpy(), sol.A.indices.numpy(), sol.A.indptr.numpy()), shape=(sol.A.n, sol.A.n))
+        A = M.toarray()
+        return A + np.triu(A, 1).T
+
+    s_ten = m.state()
+    flatten_state(s_ten)
+    qt = s_ten.dismech.q.numpy()
+    qt[3] += 0.01
+    qt[6] += 0.025
+    s_ten.dismech.q.assign(qt)
+    G_num = assemble_blk(sol1, s_ten) - assemble_blk(sol0, s_ten)
+    assert np.linalg.eigvalsh(G_num).min() >= -1.0e-2
+
+    l0e, l0f = m.dismech.edge_length.numpy().astype(np.float64)
+    p = m.dismech.triplet_params.numpy()[0].astype(np.float64)
+
+    def g_stretch(qv):
+        e, f = qv[3:6] - qv[0:3], qv[6:9] - qv[3:6]
+        ne, nf = np.linalg.norm(e), np.linalg.norm(f)
+        ge = p[0] * (ne / l0e - 1.0) * e / (l0e * ne)
+        gf = p[1] * (nf / l0f - 1.0) * f / (l0f * nf)
+        out = np.zeros(11)
+        out[0:3], out[3:6], out[6:9] = -ge, ge - gf, gf
+        return out
+
+    q64, h_fd = qt.astype(np.float64), 1.0e-6
+    H_full = np.column_stack([(g_stretch(q64 + d) - g_stretch(q64 - d)) / (2.0 * h_fd) for d in h_fd * np.eye(11)])
+    e, f = q64[3:6] - q64[0:3], q64[6:9] - q64[3:6]
+    je, jf = np.zeros(11), np.zeros(11)
+    je[0:3], je[3:6] = -e / (l0e * np.linalg.norm(e)), e / (l0e * np.linalg.norm(e))
+    jf[3:6], jf[6:9] = -f / (l0f * np.linalg.norm(f)), f / (l0f * np.linalg.norm(f))
+    G_ref = H_full - p[0] * np.outer(je, je) - p[1] * np.outer(jf, jf)
+    assert np.abs(G_num - G_ref).max() < 1.0e-4 * np.linalg.norm(G_ref)
+
+    s_cmp = m.state()
+    flatten_state(s_cmp)
+    qc = s_cmp.dismech.q.numpy()
+    qc[3] -= 0.01
+    qc[6] -= 0.025
+    s_cmp.dismech.q.assign(qc)
+    np.testing.assert_allclose(assemble_blk(sol1, s_cmp), assemble_blk(sol0, s_cmp), atol=1.0e-6)
+
+    # Taut clamped-clamped string under midpoint load: rod_geometric=True converges vs Gauss-Newton stall
+    L, n, EA, eps0, F = 1.0, 20, 1.0e4, 0.02, 5.0
+    h = L / n
+    b2 = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    pts2 = np.column_stack([np.linspace(0.0, L, n + 1), np.zeros(n + 1), np.zeros(n + 1)])
+    bodies, _ = SolverDiSMech.add_rod(b2, rod=newton.Rod(pts2, radius=0.005), stretch_stiffness=EA / h,
+                                      bend_stiffness=1.0e-5 / h, twist_stiffness=1.0e-5 / h,
+                                      collide=False, proxies=False, cfg=newton.ModelBuilder.ShapeConfig(density=1000.0))
+    SolverDiSMech.fix_segment(b2, edge=0)
+    SolverDiSMech.fix_segment(b2, edge=n - 1)
+    m2 = b2.finalize()
+    f_load = np.zeros((n + 1, 3), dtype=np.float32)
+    f_load[n // 2, 2] = -F
+    T = EA * eps0
+    z_exact = -F * (L - 2.0 * h) * (1.0 + eps0) / (4.0 * T)
+
+    def run_taut(geom):
+        sol = SolverDiSMech(m2, exact=True, iterations=60, self_contact=False, rod_geometric=geom, tolerance=1.0e-5)
+        sa, sb = m2.state(), m2.state()
+        flatten_state(sa)
+        flatten_state(sb)
+        q_t = sa.dismech.q.numpy()
+        q_t[0 : 3 * (n + 1) : 3] *= 1.0 + eps0
+        sa.dismech.q.assign(q_t)
+        sa.particle_f.assign(f_load)
+        orig, n_it = sol._iterate, [0]
+
+        def count_it(*a, **kw):
+            n_it[0] += 1
+            return orig(*a, **kw)
+
+        sol._iterate = count_it
+        sol.step(sa, sb, None, None, 10.0)
+        return sb.particle_q.numpy()[n // 2, 2], sol.counts.numpy().tolist(), n_it[0]
+
+    z_on, cnt_on, it_on = run_taut(True)
+    z_off, cnt_off, _ = run_taut(False)
+    assert cnt_on == [0, 0, 0] and it_on <= 5, (cnt_on, it_on)
+    assert abs(z_on / z_exact - 1.0) < 0.02, (z_on, z_exact)
+    assert cnt_off[1] > 0 and abs(z_off) < 1.0e-6, (cnt_off, z_off)

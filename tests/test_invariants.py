@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from dismech_newton import SolverDiSMech, flatten_state
 from dismech_newton import solver as solver_module
+from dismech_newton.constants import OBJECTIVE_NOISE
 from dismech_newton.contact import CURVATURE, Slots, _majorizer, _slots
 from dismech_newton.dofs import dof_constants
 
@@ -453,3 +454,98 @@ def test_pad_majorizer_curvature_cap():
         wp.launch(_eval_majorizer_kernel, dim=1, inputs=[wp.vec3(0.0, 0.0, d), s, 1.0e-4], outputs=[out])
         H = out.numpy()[0]
         assert np.isclose(H[2, 2], float(CURVATURE) * 1.0e3, rtol=1.0e-6), (d, H[2, 2])
+
+
+def test_contact_free_convergence_telemetry_and_early_exit():
+    """With ``cap == 0.0``, force-balance checks run unconditionally: budget exhaustion reports ``counts[0]``,
+    converged solves exit early before ``iterations`` with reduced ``residual_norm``, and NaN steps report ``counts[2]``."""
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.4, segment_count=6, radius=0.006)
+    SolverDiSMech.add_rod(b, rod=rod, stretch_stiffness=5.0e3, bend_stiffness=0.2, twist_stiffness=0.2,
+                          collide=False, proxies=False)
+    SolverDiSMech.fix_segment(b, edge=0)
+    m = b.finalize()
+
+    sol1 = SolverDiSMech(m, exact=True, iterations=1, self_contact=False)
+    assert sol1.cap == 0.0
+    s0, s1 = m.state(), m.state()
+    flatten_state(s0)
+    flatten_state(s1)
+    sol1.step(s0, s1, None, None, 0.05)
+    assert sol1.counts.numpy().tolist() == [1, 0, 0]
+    r_one = float(sol1.residual_norm.numpy()[0])
+    assert r_one > 1.0e-2
+
+    sol30 = SolverDiSMech(m, exact=True, iterations=30, self_contact=False, tolerance=1.0e-4)
+    orig, iters = sol30._iterate, [0]
+
+    def count_it(*a, **kw):
+        iters[0] += 1
+        return orig(*a, **kw)
+
+    sol30._iterate = count_it
+    sa, sb = m.state(), m.state()
+    flatten_state(sa)
+    flatten_state(sb)
+    sol30.step(sa, sb, None, None, 0.05)
+    assert sol30.counts.numpy().tolist() == [0, 0, 0]
+    assert iters[0] < 15, iters[0]
+    assert float(sol30.residual_norm.numpy()[0]) < 1.0e-2 * r_one
+
+    sa_nan = m.state()
+    flatten_state(sa_nan)
+    f_nan = sa_nan.particle_f.numpy()
+    f_nan[-1, 2] = np.nan
+    sa_nan.particle_f.assign(f_nan)
+    sol30.counts.zero_()
+    sol30.step(sa_nan, sb, None, None, 0.05)
+    c_nan = sol30.counts.numpy().tolist()
+    assert c_nan[2] == 1 and c_nan[0] == 0, c_nan
+
+
+def test_objective_noise_configuration():
+    """``SolverDiSMech(..., objective_noise=...)`` validates non-negative tolerances, defaults to ``OBJECTIVE_NOISE``,
+    and strictly enforces backtracking energy decrease when tightened to ``0.0``."""
+    m = _free("rod")
+    with pytest.raises(ValueError, match="objective_noise"):
+        SolverDiSMech(m, self_contact=False, objective_noise=-1.0e-6)
+    assert SolverDiSMech(m, self_contact=False).objective_noise == pytest.approx(OBJECTIVE_NOISE)
+    sol_zero = SolverDiSMech(m, self_contact=False, objective_noise=0.0)
+    assert sol_zero.objective_noise == 0.0
+
+    # With EA >> EI on a pre-stretched cantilever under small lateral force and chord assembly (exact=False),
+    # loose noise accepts an energy-rising full step whereas objective_noise=0.0 enforces monotone backtracking.
+    b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    rod = newton.Rod.create_straight((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.5, segment_count=6, radius=0.005)
+    SolverDiSMech.add_rod(b, rod=rod, stretch_stiffness=1.0e6, bend_stiffness=0.05, twist_stiffness=0.05,
+                          collide=False, proxies=False)
+    SolverDiSMech.fix_segment(b, edge=0)
+    mc = b.finalize()
+    f_tip = np.zeros((7, 3), dtype=np.float32)
+    f_tip[-1, 2] = -0.2
+
+    def first_step_energies(noise: float):
+        sol = SolverDiSMech(mc, exact=False, iterations=1, self_contact=False, objective_noise=noise)
+        sa, sb = mc.state(), mc.state()
+        flatten_state(sa)
+        flatten_state(sb)
+        q_s = sa.dismech.q.numpy()
+        q_s[0:21:3] *= 1.01
+        sa.dismech.q.assign(q_s)
+        sa.particle_f.assign(f_tip)
+        seen = []
+        orig = sol._search
+
+        def cap(*a, **kw):
+            orig(*a, **kw)
+            en = sol._energy.numpy()
+            seen.append((int(sol._pick.numpy()[0]), float(en[0]), float(en[int(sol._pick.numpy()[0])])))
+
+        sol._search = cap
+        sol.step(sa, sb, None, None, 0.05)
+        return seen[0]
+
+    pick_tight, e0_t, ep_t = first_step_energies(0.0)
+    pick_loose, e0_l, ep_l = first_step_energies(0.5)
+    assert ep_t <= e0_t, (pick_tight, e0_t, ep_t)
+    assert pick_tight >= pick_loose, (pick_tight, pick_loose, e0_l, ep_l)

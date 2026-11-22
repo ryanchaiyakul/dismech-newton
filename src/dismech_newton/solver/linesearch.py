@@ -6,7 +6,6 @@ import warp as wp
 
 from ..constants import ARMIJO_C1 as _C1
 from ..constants import FWD_MODULE_OPTS
-from ..constants import OBJECTIVE_NOISE as _NOISE
 from ..coupling import _turn
 from ..dofs import Dofs, inertia_energy, inertia_grad, node
 from ..worlds import Worlds, world_sum
@@ -31,14 +30,15 @@ def _copy_if_kernel(valid: wp.array[wp.int32], src: wp.array(dtype=Any), dst: wp
 
 
 @wp.func
-def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, num_candidates: int) -> int:
+def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, num_candidates: int,
+            noise_tol: float) -> int:
     """World ``w``'s: Newton's full step if its expected decrease is below the objective's float32 rounding (no
     candidate can be told apart). Else the longest step with sufficient decrease; else the candidate with the lowest
     objective if it rises by no more than that rounding, or ``0``: no step (a stall)."""
     o = w * num_candidates
     f0 = energy[o]
     s = slope[w]
-    noise = wp.float64(_NOISE) * wp.abs(f0)
+    noise = wp.float64(noise_tol) * wp.abs(f0)
     if s >= wp.float64(0.0) and wp.float64(0.5) * s <= noise and energy[o + 1] <= f0 + noise and wp.isfinite(
             energy[o + 1]):
         return 1  # the Newton step's decrease is below the objective's rounding: its full step is taken
@@ -48,7 +48,7 @@ def _armijo(energy: wp.array[wp.float64], slope: wp.array[wp.float64], w: int, n
             return k
         if wp.isfinite(energy[o + k]) and (best == 0 or energy[o + k] < energy[o + best]):
             best = k
-    if best > 0 and energy[o + best] <= f0 + wp.float64(_NOISE) * wp.abs(f0):
+    if best > 0 and energy[o + best] <= f0 + noise:
         return best
     return 0
 
@@ -226,15 +226,18 @@ def _pick_kernel(
     slope: wp.array[wp.float64],
     wd: Worlds,
     q_cand: wp.array2d[float],
+    noise_tol: float,
     q: wp.array[float],
     pick: wp.array[wp.int32],
 ):
-    """Each iterating world's candidate (``pick[w]``, written alike by its DOFs' threads); the others keep ``q``."""
+    """Each iterating world's candidate (``pick[w]``, written only if at least one DOF moves in float32, else ``0``
+    so a no-op candidate stalls instead of spinning); the others keep ``q``."""
     i = wp.tid()
     w = wd.of[i]
     if wd.active[w] == 0:
-        pick[w] = 0
         return
-    k = _armijo(energy, slope, w, wd.stride)
-    pick[w] = k
-    q[i] = q_cand[k, i]
+    k = _armijo(energy, slope, w, wd.stride, noise_tol)
+    qk = q_cand[k, i]
+    if k > 0 and qk != q[i]:
+        pick[w] = k
+        q[i] = qk

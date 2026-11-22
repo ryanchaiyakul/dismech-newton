@@ -1,4 +1,4 @@
-"""Newton's Dahl rate-independent hysteresis residual (mirrors ``vbd:dahl_*`` / ``dismech:triplet_dahl``)."""
+"""Newton's Dahl rate-independent hysteresis (mirrors ``vbd:dahl_*`` / ``dismech:triplet_dahl``)."""
 
 from dataclasses import dataclass, field
 from functools import cache
@@ -8,8 +8,8 @@ import numpy as np
 import warp as wp
 from newton import Model
 
-from ...constants import ADJ_MODULE_OPTS, DAHL_DEADBAND, vec5f, vec6f, vec10f, vec12f
-from ...worlds import elem_worlds, model_world_info
+from ..constants import ADJ_MODULE_OPTS, DAHL_DEADBAND, vec5f, vec6f, vec10f, vec12f
+from ..worlds import elem_worlds, model_world_info
 
 
 @wp.func
@@ -23,7 +23,7 @@ def dahl_advance(d: float, sigma: float, sigma_max: float, tau: float) -> float:
 
 @cache
 def _dahl_ops(dim: int):
-    """Build dimension-specialized Dahl struct, step term, and carry kernel (``dim`` in ``{5, 6}``)."""
+    """Build dimension-specialized Dahl struct, step kernel, and carry kernel (``dim`` in ``{5, 6}``)."""
     vt = vec5f if dim == 5 else vec6f
     pt = vec10f if dim == 5 else vec12f
 
@@ -38,42 +38,40 @@ def _dahl_ops(dim: int):
     DahlData.__name__ = f"DahlData{dim}"
     DahlData.__qualname__ = f"DahlData{dim}"
 
-    @wp.func(name=f"_dahl_step_{dim}")
-    def step_term(
-        t: int,
-        pb_i: pt,
-        r0: vt,
-        er: vt,
-        mem_i: vt,
+    @wp.kernel(name=f"_dahl_step_{dim}", module="unique", module_options=ADJ_MODULE_OPTS)
+    def step_kernel(
+        pb: wp.array[pt],
+        mem: wp.array[vt],
         ew: wp.array[wp.int32],
-        chi: float,
-        dt: float,
         data: DahlData,
+        dt: float,
+        pout: wp.array[pt],
+        sout: wp.array[vt],
     ):
+        t = wp.tid()
         ie = t if data.eps_per_elem != 0 else (ew[t] if data.eps_max.shape[0] > 1 else 0)
         it = t if data.tau_per_elem != 0 else (ew[t] if data.tau.shape[0] > 1 else 0)
         eps_max, tau = data.eps_max[ie], data.tau[it]
         on = wp.where(eps_max > 0.0 and tau > 0.0, 1.0, 0.0)
         rate = on * dt * eps_max / wp.max(tau, 1.0e-30)
-        dk_m, dc_m, sig_m = vt(0.0), vt(0.0), vt(0.0)
+        pb_i, m_i = pb[t], mem[t]
+        po, so = pt(), vt()
         for j in range(dim):
             mk = data.mask[j]
-            dc_m[j] = mk * rate * pb_i[j]
-            sig_m[j] = mk * on * mem_i[j]
-        return dk_m, dc_m, sig_m
+            po[j] = pb_i[j]
+            po[dim + j] = pb_i[dim + j] + mk * rate * pb_i[j]
+            so[j] = mk * on * m_i[j]
+        pout[t] = po
+        sout[t] = so
 
     @wp.kernel(name=f"_dahl_carry_{dim}", module="unique", module_options=ADJ_MODULE_OPTS)
     def carry_kernel(
         prev: wp.array[vt],
         strain: wp.array[vt],
         params: wp.array[pt],
-        rest: wp.array[vt],
-        dr: wp.array[vt],
-        hdr: int,
         mem: wp.array[vt],
         ew: wp.array[wp.int32],
         data: DahlData,
-        dt: float,
         mem_out: wp.array[vt],
     ):
         t = wp.tid()
@@ -92,7 +90,7 @@ def _dahl_ops(dim: int):
             out = m
         mem_out[t] = out
 
-    return DahlData, step_term, carry_kernel
+    return DahlData, step_kernel, carry_kernel
 
 
 def _as_dahl_param(val, n_worlds: int, n_elems: int, device, name: str, *, grad: bool) -> tuple[wp.array, int]:
@@ -139,11 +137,10 @@ class Dahl:
     eps_max_arr: wp.array | None = field(default=None, init=False, repr=False)
     tau_arr: wp.array | None = field(default=None, init=False, repr=False)
     _elem_world: wp.array | None = field(default=None, init=False, repr=False)
+    _step_kernel: Any = field(default=None, init=False, repr=False)
     _carry_kernel: Any = field(default=None, init=False, repr=False)
-    _step_fn: Any = field(default=None, init=False, repr=False)
     _device: Any = field(default=None, init=False, repr=False)
     _dim: int = field(default=5, init=False, repr=False)
-    _src: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _bound: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -171,6 +168,14 @@ class Dahl:
 
     def bind(self, model: Model, elem, device=None) -> "Dahl":
         """Allocate/bind Dahl buffers for ``model`` and ``elem`` on ``device``."""
+        if self._bound:
+            return Dahl(
+                eps_max=self.eps_max,
+                tau=self.tau,
+                enabled_dims=self.enabled_dims,
+                _from_model=self._from_model,
+            ).bind(model, elem, device=device)
+
         dev = wp.get_device(model.device if device is None else device)
         dim = 5 if elem.stored == "triplet_strain_q" else 6
         default_dims = (2, 3, 4) if dim == 5 else (3, 4, 5)
@@ -183,7 +188,7 @@ class Dahl:
         eps_arr, eps_mode = _as_dahl_param(self.eps_max, nw, int(elem.count), dev, "eps_max", grad=grad)
         tau_arr, tau_mode = _as_dahl_param(self.tau, nw, int(elem.count), dev, "tau", grad=grad)
 
-        data_cls, step_fn, carry_kernel = _dahl_ops(dim)
+        data_cls, step_kernel, carry_kernel = _dahl_ops(dim)
         vt = vec5f if dim == 5 else vec6f
         d = data_cls()
         d.eps_max = eps_arr
@@ -198,20 +203,28 @@ class Dahl:
         self.eps_max_arr = eps_arr
         self.tau_arr = tau_arr
         self.data = d
-        self._step_fn = step_fn
+        self._step_kernel = step_kernel
         self._carry_kernel = carry_kernel
         self.params = (eps_arr, tau_arr) if grad else ()
         self._bound = True
         return self
 
-    def step_term(self, dim: int):
-        """Return the ``@wp.func`` computing ``(dk_mem, dc_mem, sig_mem)`` for strain dimension ``dim``."""
-        if dim != self._dim:
-            raise ValueError(f"Dahl bound for dim={self._dim}, got dim={dim}")
-        return self._step_fn
+    def step(self, elem, s, dt: float, params_out: wp.array, stress_out: wp.array) -> None:
+        """Compute effective ``(params_out, stress_out)`` with tangent damping and carried Dahl stress."""
+        if not elem.count:
+            return
+        bd = 1 if self._device.is_cpu else 128
+        wp.launch(
+            self._step_kernel,
+            elem.count,
+            block_dim=bd,
+            device=self._device,
+            inputs=[elem.params, getattr(s, elem.memory), self._elem_world, self.data, dt],
+            outputs=[params_out, stress_out],
+        )
 
-    def carry(self, elem, prev_state, next_state, dt: float, d_rest: wp.array, has_d_rest: int) -> None:
-        """Advance Dahl stresses from ``prev_state`` into ``next_state`` (independent of ``dt``)."""
+    def carry(self, elem, prev_state, next_state) -> None:
+        """Advance Dahl stresses from ``prev_state`` into ``next_state`` (rate-independent)."""
         if not elem.count:
             return
         bd = 1 if self._device.is_cpu else 128
@@ -224,13 +237,9 @@ class Dahl:
                 getattr(prev_state, elem.stored),
                 getattr(next_state, elem.stored),
                 elem.params,
-                elem.rest,
-                d_rest,
-                has_d_rest,
                 getattr(prev_state, elem.memory),
                 self._elem_world,
                 self.data,
-                dt,
             ],
             outputs=[getattr(next_state, elem.memory)],
         )

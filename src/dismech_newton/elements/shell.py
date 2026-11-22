@@ -40,7 +40,7 @@ class Shells:
     stored = "face_strain_q"
     memory = "face_mem_q"
 
-    def __init__(self, model: Model, hinge_offset: int):
+    def __init__(self, model: Model, hinge_offset: int, *, material=None):
         d, dev = model.dismech, wp.get_device(model.device)
         self.count = model.custom_frequency_counts.get(_P + "face", 0)
         self.params = d.face_params
@@ -52,7 +52,9 @@ class Shells:
         v.conn = wp.array(conn.reshape(-1, 9), dtype=vec9i, device=dev)
         v.sign, v.flap, v.strain_map, v.bend_map = d.face_sign, d.face_flap, d.face_strain_map, d.face_bend_map
         v.hinge_offset = hinge_offset
-        self.kernels = element_kernels(Shell, shell_strain, shell_jacobian, shell_dofs, 6, 21, shell_geometric)
+        self.kernels = element_kernels(
+            Shell, shell_strain, shell_jacobian, shell_dofs, 6, 21, (shell_geometric, shell_geometric_entry), material
+        )
         self.rest = rest_strains(self, model, vec6f)
         if self.count:
             p = model.particle_q.numpy().astype(np.float64)[conn[:, :3]]
@@ -60,28 +62,54 @@ class Shells:
             self.area = wp.array(area.astype(np.float32), dtype=float, device=dev)
         else:
             self.area = wp.zeros(0, dtype=float, device=dev)
+        self._dahl = None
         self._residual = None
         self.effective = None
 
+    def bind_dahl(self, dahl) -> None:
+        """Bind classical Dahl hysteresis so :meth:`effective` evaluates it."""
+        self._dahl = dahl
+        if self.count:
+            if not hasattr(self, "params_step"):
+                self.params_step = wp.empty_like(self.params)
+            if not hasattr(self, "stress_step"):
+                self.stress_step = wp.zeros(self.count, dtype=vec6f, device=self.params.device)
+            self._params_dahl = wp.empty_like(self.params)
+            self.effective = self._effective
+
     def bind_residual(self, res) -> None:
-        """Bind a constitutive or memory residual so :meth:`effective` evaluates it."""
+        """Bind an external constitutive or memory residual hook so :meth:`effective` evaluates it."""
         self._residual = res
         res._shells = self
         if self.count:
-            self.params_step = wp.empty_like(self.params)
+            if not hasattr(self, "params_step"):
+                self.params_step = wp.empty_like(self.params)
             self.rest_step = wp.empty_like(self.rest)
+            if not hasattr(self, "stress_step"):
+                self.stress_step = wp.zeros(self.count, dtype=vec6f, device=self.params.device)
             self.effective = self._effective
 
-    def _effective(self, s, dt: float, params=None, rest=None):
-        """The step's ``(params, rest)`` with constitutive/memory residual from ``s`` (into ``params``, ``rest``)."""
+    def _effective(self, s, dt: float, params=None, rest=None, stress=None):
+        """The step's ``(params, rest, stress)`` from Dahl hysteresis and/or external residual hook."""
         params = self.params_step if params is None else params
+        stress = self.stress_step if stress is None else stress
+        if self._residual is None:
+            self._dahl.step(self, s, dt, params, stress)
+            return params, self.rest, stress
         rest = self.rest_step if rest is None else rest
-        self._residual.eval_shell(self, s, dt, self.params, self.rest, params, rest)
-        return params, rest
+        if self._dahl is None:
+            self._residual.eval_shell(self, s, dt, self.params, self.rest, params, rest)
+            return params, rest, self.stress_step
+        mid = wp.empty_like(params, requires_grad=True) if params.requires_grad else self._params_dahl
+        self._dahl.step(self, s, dt, mid, stress)
+        self._residual.eval_shell(self, s, dt, mid, self.rest, params, rest)
+        return params, rest, stress
 
     def carry(self, p, s, dt: float = 0.0) -> None:
         """``s``'s carried face memory as the step from ``p`` leaves it."""
-        if self.count and self._residual is not None and self._residual.has_shell_memory:
+        if self.count and self._dahl is not None:
+            self._dahl.carry(self, p, s)
+        if self.count and self._residual is not None and getattr(self._residual, "has_shell_memory", False):
             self._residual.carry_shell(self, p, s, dt)
 
     def bind(self, s) -> Shell:
@@ -148,7 +176,7 @@ def shell_strain_rate(x: vec21f, xd: vec21f, v: Shell, f: int):
 
 
 @wp.func
-def shell_geometric(v: Shell, i: int, sigma: vec6f) -> wp.mat33:
+def shell_geometric(x: vec21f, v: Shell, i: int, sigma: vec6f) -> wp.mat33:
     """The membrane's geometric stiffness: the first form is quadratic in the vertices, so ``sum sigma d^2 eps =
     (D^T S D) (x) I3``, ``S`` the stress in the edge basis (its tensile part), ``D = [[-1, 1, 0], [-1, 0, 1]]``."""
     w = wp.transpose(v.strain_map[i]) * wp.vec3(float(sigma[0]), float(sigma[1]), float(sigma[2]))
@@ -161,6 +189,14 @@ def shell_geometric(v: Shell, i: int, sigma: vec6f) -> wp.mat33:
         T = 0.5 * (S + (S * S + a * wp.identity(2, float)) / r)
     Dm = mat23f(-1.0, 1.0, 0.0, -1.0, 0.0, 1.0)
     return wp.transpose(Dm) * T * Dm
+
+
+@wp.func
+def shell_geometric_entry(G: wp.mat33, a: int, c: int) -> float:
+    """Entry ``(a, c)`` (``a <= c``) of ``G (x) I3`` on the face's three vertices."""
+    if c < 9 and a % 3 == c % 3:
+        return G[a // 3, c // 3]
+    return 0.0
 
 
 # -- geometry ---------------------------------------------------------------------------------------------

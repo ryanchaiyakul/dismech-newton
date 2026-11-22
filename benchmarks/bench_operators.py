@@ -8,17 +8,7 @@ from conftest import bench_framegraph
 from newton.solvers import SolverSemiImplicit
 from utils.common import FrameGraph, grid
 
-from dismech_newton import (
-    ContactResidual,
-    JointResidual,
-    RodResidual,
-    ShellResidual,
-    SolverDiSMech,
-    add_cloth_mesh,
-    add_rod,
-    fix_segment,
-    register_custom_attributes,
-)
+from dismech_newton import SolverDiSMech, add_cloth_mesh, add_rod, fix_segment, register_custom_attributes
 from dismech_newton.contact import Slots
 from dismech_newton.coupling import SolverCoupledProxy
 
@@ -40,9 +30,9 @@ def _tile_worlds(sub: newton.ModelBuilder, worlds: int, device, gravity=(0.0, 0.
 
 
 @pytest.mark.parametrize("worlds", [1, 256], ids=["W1", "W256"])
-@pytest.mark.parametrize("variant", ["base", "dahl", "rff"])
+@pytest.mark.parametrize("variant", ["base", "dahl"])
 def test_bench_rod(benchmark, device, needs_cuda, worlds: int, variant: str):
-    """25-segment cantilever rod: baseline vs Dahl hysteresis vs 64-feature RFF residual."""
+    """25-segment cantilever rod: baseline vs Dahl hysteresis."""
     sub = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     register_custom_attributes(sub)
     n_pts = 25
@@ -62,12 +52,7 @@ def test_bench_rod(benchmark, device, needs_cuda, worlds: int, variant: str):
     fix_segment(sub, edge=0)
     m = _tile_worlds(sub, worlds, device)
 
-    res = None
-    if variant == "rff":
-        rng = np.random.default_rng(5)
-        w = rng.normal(0.0, 0.05, size=(64, 5)).astype(np.float32)
-        res = RodResidual(rff_dim=64, w_rod=w, seed=5)
-    sim = SolverDiSMech(m, self_contact=False, residual=res)
+    sim = SolverDiSMech(m, self_contact=False)
     s0, s1 = m.state(), m.state()
     dt = 0.01
 
@@ -80,9 +65,9 @@ def test_bench_rod(benchmark, device, needs_cuda, worlds: int, variant: str):
 
 
 @pytest.mark.parametrize("worlds", [1, 256], ids=["W1", "W256"])
-@pytest.mark.parametrize("variant", ["base", "rff"])
+@pytest.mark.parametrize("variant", ["base"])
 def test_bench_shell(benchmark, device, needs_cuda, worlds: int, variant: str):
-    """5x5 grid (32 triangles) cantilever shell: baseline vs 64-feature RFF residual."""
+    """5x5 grid (32 triangles) cantilever shell."""
     sub = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=(0.0, 0.0, -9.81))
     register_custom_attributes(sub)
     v, f = grid(5, 5, 0.4, 0.4)
@@ -101,13 +86,7 @@ def test_bench_shell(benchmark, device, needs_cuda, worlds: int, variant: str):
         sub.particle_flags[int(ids[k])] &= ~newton.ParticleFlags.ACTIVE
     m = _tile_worlds(sub, worlds, device)
 
-    res = None
-    if variant == "rff":
-        rng = np.random.default_rng(5)
-        scale = np.array([0.25, 0.25, 0.25, 0.002, 0.002, 0.002], dtype=np.float32)
-        w = (rng.normal(0.0, 1.0, size=(64, 6)) * scale).astype(np.float32)
-        res = ShellResidual(rff_dim=64, w_shell=w, seed=6)
-    sim = SolverDiSMech(m, self_contact=False, residual=res)
+    sim = SolverDiSMech(m, self_contact=False)
     s0, s1 = m.state(), m.state()
     dt = 0.01
 
@@ -127,9 +106,9 @@ def _set_aniso(val: wp.vec4, s: Slots):
 
 
 @pytest.mark.parametrize("worlds", [1, 256], ids=["W1", "W256"])
-@pytest.mark.parametrize("variant", ["base", "aniso", "rff"])
+@pytest.mark.parametrize("variant", ["base", "aniso"])
 def test_bench_contact(benchmark, device, needs_cuda, worlds: int, variant: str):
-    """4-segment rod sliding on ground: baseline vs elliptic anisotropy vs ContactResidual(R=32, M=4)."""
+    """4-segment rod sliding on ground: baseline vs elliptic anisotropy."""
 
     sub = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
     rod = newton.Rod.create_straight((-0.08, 0.0, 1.015 * RADIUS), (1.0, 0.0, 0.0), 0.16, segment_count=4,
@@ -150,15 +129,7 @@ def test_bench_contact(benchmark, device, needs_cuda, worlds: int, variant: str)
     su[0] = np.array([0.8, 0.6, 0.0], dtype=np.float32)
     m.dismech.shape_surface_u.assign(su)
 
-    res = None
-    if variant == "rff":
-        rng = np.random.default_rng(9)
-        R, M = 32, 4
-        emb = rng.normal(0.0, 0.5, (1, M, 8)).astype(np.float32)
-        emb[:, :, 7] = np.array([[0.5, -0.3, 0.2, -0.4]], dtype=np.float32)
-        wc = rng.normal(0.0, 0.4, (1, R, 2)).astype(np.float32)
-        res = ContactResidual(rff_dim=R, num_materials=M, embeddings=emb, w_contact=wc, seed=9)
-    sim = SolverDiSMech(m, self_contact=False, residual=res)
+    sim = SolverDiSMech(m, self_contact=False)
     if variant == "aniso":
         orig_fill = sim.contact.source.fill
         val = wp.vec4(0.8, 0.6, 0.0, 0.4)
@@ -185,10 +156,9 @@ def test_bench_contact(benchmark, device, needs_cuda, worlds: int, variant: str)
 
 
 @pytest.mark.parametrize("worlds", [1, 256], ids=["W1", "W256"])
-@pytest.mark.parametrize("variant", ["base", "joint_rff"])
+@pytest.mark.parametrize("variant", ["base"])
 def test_bench_coupled(benchmark, device, needs_cuda, worlds: int, variant: str):
-    """Coupled 1-DOF arm + 16-node rod via ``SolverCoupledProxy``: baseline vs JointResidual(R=32)."""
-    rng = np.random.default_rng(31)
+    """Coupled 1-DOF arm + 16-node rod via ``SolverCoupledProxy``."""
     b = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     register_custom_attributes(b)
     rigid_b, rigid_j, rigid_sh, soft_p, soft_b, soft_sh, arm_b, prox_b = ([] for _ in range(8))
@@ -220,19 +190,10 @@ def test_bench_coupled(benchmark, device, needs_cuda, worlds: int, variant: str)
         prox_b.append(ap)
 
     m = b.finalize(device=device)
-    D = m.joint_dof_count // worlds
-    spec = None
-    if variant == "joint_rff":
-        spec = JointResidual(
-            rff_dim=32,
-            coulomb=0.2,
-            stribeck=0.1,
-            w_joint=rng.normal(0.0, 0.2, (1, D, 32)).astype(np.float32),
-        )
     entries = [
         SolverCoupledProxy.Entry(name="rigid", solver=lambda mv: SolverSemiImplicit(mv), bodies=rigid_b,
                                  joints=rigid_j, shapes=rigid_sh),
-        SolverCoupledProxy.Entry(name="soft", solver=lambda mv: SolverDiSMech(mv, residual=spec),
+        SolverCoupledProxy.Entry(name="soft", solver=lambda mv: SolverDiSMech(mv),
                                  particles=soft_p, bodies=soft_b, shapes=soft_sh),
     ]
     proxies = [SolverCoupledProxy.Proxy(source="rigid", destination="soft", bodies=arm_b, proxy_bodies=prox_b)]
